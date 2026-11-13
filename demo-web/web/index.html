@@ -29,8 +29,12 @@
         <button type="button" id="pick">Choose files</button>
         <input type="file" id="file" multiple hidden>
       </span>
-      <span class="row samples" id="samples" hidden>Or try a sample:</span>
-      <small class="credit" id="samples-credit" hidden>CC0 models from the
+    </section>
+
+    <section id="samples" hidden>
+      <h2>Samples</h2>
+      <div class="cards" id="sample-cards"></div>
+      <small class="credit">CC0 models from the
         <a href="https://github.com/KhronosGroup/glTF-Sample-Assets" target="_blank" rel="noopener">Khronos glTF Sample Assets</a>.</small>
     </section>
 
@@ -84,15 +88,29 @@
   <main>
     <section id="view">
       <canvas id="gl"></canvas>
-      <div id="empty">Drop a .glb, .gltf or .zip anywhere</div>
+      <div id="empty">
+        <div>
+          <p>Drop a .glb, .gltf or .zip anywhere, or pick a sample</p>
+          <div class="cards" id="gallery"></div>
+        </div>
+      </div>
       <div id="hud"></div>
+      <figure id="mag" hidden>
+        <canvas></canvas>
+        <figcaption></figcaption>
+      </figure>
       <div id="viewbar">
+        <label class="dist" id="dist-wrap" hidden title="Camera distance. Ticks mark where the next level switches in.">
+          <span>Distance</span>
+          <span class="track"><input type="range" id="dist" min="0" max="1000" value="0"><span id="ticks"></span></span>
+        </label>
         <div class="seg" role="radiogroup" aria-label="View mode">
           <button type="button" data-mode="single" aria-pressed="true" title="Show the selected level">Level</button>
           <button type="button" data-mode="compare" aria-pressed="false" title="Original on the left, selected level on the right">Compare</button>
-          <button type="button" data-mode="auto" aria-pressed="false" title="Switch levels by camera distance (zoom out)">Auto LOD</button>
+          <button type="button" data-mode="auto" aria-pressed="false" title="Switch levels by camera distance: zoom out, or drag the distance slider">Auto LOD</button>
         </div>
         <label class="check"><input type="checkbox" id="wire"> Wireframe</label>
+        <button type="button" id="home" title="Reset the view (F, or double-click the model)">Reset view</button>
       </div>
       <div id="status" aria-live="polite"></div>
     </section>

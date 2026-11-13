@@ -15,7 +15,10 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 - **Error** is the measured deviation from LOD0: a sampled two-way Hausdorff distance,
   relative to the scene's bounding-box diagonal. *Switch at* is the camera distance where that
   error drops below one pixel (1080p, 60° FOV). **Auto LOD** mode switches levels using those
-  distances, scaled to your window. Zoom out to watch it change.
+  distances, scaled to your window. Zoom out, or drag the distance slider (its ticks mark the
+  switches), to watch it change. Auto mode orbits the model's center, and once the model is
+  small a magnifier shows its rendered pixels up close.
+- **Reset view** (or F, or double-click) re-frames the model. Panning can't drift away from it.
 - **Compare** shows the original next to the selected level. Each level downloads as a
   self-contained `.glb`.
 - Changing an option restarts the run. A wasm call can't be interrupted, so the page replaces
@@ -38,7 +41,8 @@ also optimizes the module for size.
 
 **Sample models.** `fetch_samples.py` downloads a few CC0 models from the
 [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets), pinned to
-one commit, into `web/samples/` with an `index.json`. The page offers them as buttons. They
+one commit, into `web/samples/` with an `index.json`, and each model's screenshot from that
+repo as its thumbnail. The page shows them as cards in the sidebar and the empty viewport. They
 aren't committed: CI fetches them when it builds the page, and `cargo test` runs the pipeline
 on each one when they're present. The script refuses any model whose metadata lists a license
 other than CC0. To change the set, edit `SAMPLES` in the script.

@@ -4,6 +4,9 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
+import { Wireframe } from "three/addons/lines/Wireframe.js";
+import { WireframeGeometry2 } from "three/addons/lines/WireframeGeometry2.js";
 
 const $ = (s) => document.querySelector(s);
 const form = $("#opts");
@@ -47,43 +50,74 @@ const lod = new THREE.LOD(); // auto mode: clones of the levels
 lod.visible = false;
 scene.add(root, lod);
 
+// Wireframe: screen-space "fat" lines (plain GL lines are 1 device pixel, too thin to read on a
+// high-DPI screen), drawn over surfaces that polygonOffset pushes back so the two don't z-fight.
+// Its resolution must match the viewport, so render() sets it for each one.
 const dark = matchMedia("(prefers-color-scheme: dark)");
-const wireMat = new THREE.LineBasicMaterial({ transparent: true, depthWrite: false });
+const wireMat = new LineMaterial({ linewidth: 1.25, transparent: true, depthWrite: false });
 const setWireColor = () => {
-  wireMat.color.set(dark.matches ? 0xffffff : 0x000000);
-  wireMat.opacity = dark.matches ? 0.22 : 0.3;
+  wireMat.color.set(dark.matches ? 0x8fbcff : 0x1453c4);
+  wireMat.opacity = dark.matches ? 0.75 : 0.7;
 };
 setWireColor();
 dark.addEventListener("change", setWireColor);
 
 const loader = new GLTFLoader();
 
+/** The camera distance that fits a sphere of `radius` in view. */
+const homeDistance = (radius) => (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.05;
+
 function frame(object) {
   const box = new THREE.Box3().setFromObject(object);
   const center = box.getCenter(new THREE.Vector3());
   const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-6);
-  const dist = (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.05;
-  camera.near = radius / 200;
-  camera.far = radius * 4000;
-  camera.position.copy(center).add(new THREE.Vector3(0.6, 0.35, 1).normalize().multiplyScalar(dist));
-  camera.updateProjectionMatrix();
-  controls.target.copy(center);
   controls.maxDistance = radius * 400;
-  controls.update();
+  home({ center, radius });
   return { center, radius };
+}
+
+/** Points the camera at the model from the default angle (also: F, double-click, Reset view). */
+function home(at = original) {
+  if (!at) return;
+  const dir = new THREE.Vector3(0.6, 0.35, 1).normalize();
+  camera.position.copy(at.center).addScaledVector(dir, homeDistance(at.radius));
+  controls.target.copy(at.center);
+  controls.update();
+}
+
+/**
+ * Per frame: keep the orbit target within reach of the model, so panning can't lose it, and fit
+ * near/far tightly around the model's bounding sphere for depth precision at any distance.
+ */
+function constrainCamera() {
+  const { center, radius } = original;
+  const off = controls.target.clone().sub(center);
+  if (off.length() > radius * 1.5) {
+    const shift = off.clone().setLength(radius * 1.5).sub(off);
+    controls.target.add(shift);
+    camera.position.add(shift);
+  }
+  const dist = camera.position.distanceTo(center);
+  camera.near = Math.max(radius / 500, (dist - radius) * 0.5);
+  camera.far = dist + radius * 2;
 }
 
 function setWire(object) {
   object.traverse((o) => {
-    if (!o.isMesh) return;
+    if (!o.isMesh || o.name === "__wire") return;
     let w = o.children.find((c) => c.name === "__wire");
     if (!w && wireOn) {
-      w = new THREE.LineSegments(new THREE.WireframeGeometry(o.geometry), wireMat);
+      w = new Wireframe(new WireframeGeometry2(o.geometry), wireMat);
       w.name = "__wire";
       w.renderOrder = 1;
       o.add(w);
     }
     if (w) w.visible = wireOn;
+    for (const m of [o.material].flat()) {
+      m.polygonOffset = wireOn;
+      m.polygonOffsetFactor = 1;
+      m.polygonOffsetUnits = 1;
+    }
   });
 }
 
@@ -171,10 +205,67 @@ function syncLod() {
     d = Math.max(d, (l.info.switch_distance_1px * h) / 1080);
     const g = new THREE.Group();
     g.position.copy(original.center).negate();
-    g.add(l.object.clone());
+    // The level may be hidden in root (show() hides all but one); the clone copies that flag.
+    const copy = l.object.clone();
+    copy.visible = true;
+    g.add(copy);
     g.userData.level = l.info.level;
     lod.addLevel(g, d);
   }
+  // Room to zoom out past the last switch, wherever it is.
+  controls.maxDistance = Math.max(original.radius * 400, d * 2);
+  drawTicks();
+}
+
+// Auto mode's distance slider: logarithmic, from close up to the zoom limit.
+const distEl = $("#dist");
+function distRange() {
+  return [homeDistance(original.radius) * 0.5, controls.maxDistance];
+}
+function distToSlider(d) {
+  const [lo, hi] = distRange();
+  return (1000 * Math.log(Math.max(d, lo) / lo)) / Math.log(hi / lo);
+}
+function drawTicks() {
+  $("#ticks").innerHTML = lod.levels
+    .slice(1)
+    .map((l) => {
+      const t = Math.min(distToSlider(l.distance) / 1000, 1);
+      return `<i style="--t:${t}" title="LOD${l.object.userData.level} from ${l.distance.toPrecision(3)}"></i>`;
+    })
+    .join("");
+}
+distEl.addEventListener("input", () => {
+  if (!original) return;
+  const [lo, hi] = distRange();
+  const d = lo * (hi / lo) ** (+distEl.value / 1000);
+  const dir = camera.position.clone().sub(controls.target).normalize();
+  camera.position.copy(controls.target).addScaledVector(dir, d);
+});
+
+// Auto mode's magnifier: far away the model is a few pixels, so this crops the frame just drawn
+// around it and scales it up without smoothing, to show the rendered pixels themselves.
+const magEl = $("#mag");
+const magCanvas = magEl.querySelector("canvas");
+const magCtx = magCanvas.getContext("2d");
+function magnify() {
+  const size = Math.round(160 * renderer.getPixelRatio());
+  const buf = renderer.getDrawingBufferSize(new THREE.Vector2());
+  const p = original.center.clone().project(camera);
+  const dist = camera.position.distanceTo(original.center);
+  const rpx = (original.radius / (dist * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * (buf.y / 2);
+  const zoom = Math.floor(size / Math.max(2 * rpx * 1.15, 4));
+  const onScreen = Math.abs(p.x) < 1.2 && Math.abs(p.y) < 1.2 && p.z < 1;
+  magEl.hidden = zoom < 2 || !onScreen;
+  if (magEl.hidden) return;
+  if (magCanvas.width !== size) magCanvas.width = magCanvas.height = size;
+  const src = size / zoom;
+  const x = ((p.x + 1) / 2) * buf.x - src / 2;
+  const y = ((1 - p.y) / 2) * buf.y - src / 2;
+  magCtx.imageSmoothingEnabled = false;
+  magCtx.clearRect(0, 0, size, size);
+  magCtx.drawImage(canvas, x, y, src, src, 0, 0, size, size);
+  magEl.querySelector("figcaption").textContent = `${zoom}× · rendered pixels`;
 }
 
 function displayed(level) {
@@ -214,15 +305,19 @@ function render() {
   const [w, h] = resize();
   if (!original) {
     hud("");
+    magEl.hidden = true;
     renderer.clear();
     return;
   }
+  constrainCamera();
   root.visible = mode !== "auto";
   lod.visible = mode === "auto";
+  if (mode !== "auto") magEl.hidden = true;
   if (mode === "compare") {
     const half = Math.floor(w / 2);
     camera.aspect = half / h;
     camera.updateProjectionMatrix();
+    wireMat.resolution.set(half, h);
     renderer.setScissorTest(true);
     show(displayed(0));
     renderer.setViewport(0, 0, half, h);
@@ -238,12 +333,18 @@ function render() {
   } else {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
+    wireMat.resolution.set(w, h);
     if (mode === "auto") {
       syncLod();
       renderer.render(scene, camera);
-      const cur = lod.levels[lod.getCurrentLevel()]?.object.userData.level ?? 0;
+      magnify();
+      const i = lod.getCurrentLevel();
+      const cur = lod.levels[i]?.object.userData.level ?? 0;
+      const next = lod.levels[i + 1];
       const dist = camera.position.distanceTo(original.center);
-      hud(`Auto: ${label(cur)}`, `distance ${dist.toPrecision(3)}`);
+      if (document.activeElement !== distEl) distEl.value = String(distToSlider(dist));
+      const ahead = next ? ` · LOD${next.object.userData.level} at ${next.distance.toPrecision(3)}` : "";
+      hud(`Auto: ${label(cur)}`, `distance ${dist.toPrecision(3)}${ahead}`);
     } else {
       show(displayed(selected));
       renderer.render(scene, camera);
@@ -504,17 +605,30 @@ document.addEventListener("keydown", (e) => {
   const n = levels.length - 1;
   if (e.key === "ArrowDown" || e.key === "]") select(Math.min(n, selected + 1));
   else if (e.key === "ArrowUp" || e.key === "[") select(Math.max(0, selected - 1));
+  else if (e.key === "f" || e.key === "F") home();
   else return;
   e.preventDefault();
 });
 
-for (const b of document.querySelectorAll("[data-mode]")) {
-  b.addEventListener("click", () => {
-    mode = b.dataset.mode;
-    for (const o of document.querySelectorAll("[data-mode]"))
-      o.setAttribute("aria-pressed", String(o === b));
-  });
+$("#home").addEventListener("click", () => home());
+canvas.addEventListener("dblclick", () => home());
+
+function setMode(m) {
+  mode = m;
+  for (const o of document.querySelectorAll("[data-mode]"))
+    o.setAttribute("aria-pressed", String(o.dataset.mode === m));
+  // Auto mode orbits the model's center: switch distances are measured from there, and zooming
+  // out around a panned-away target would leave the model behind.
+  const auto = m === "auto";
+  controls.enablePan = !auto;
+  if (auto && original) {
+    const shift = original.center.clone().sub(controls.target);
+    controls.target.add(shift);
+    camera.position.add(shift);
+  }
+  $("#dist-wrap").hidden = !auto;
 }
+for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("click", () => setMode(b.dataset.mode));
 
 $("#wire").addEventListener("change", (e) => {
   wireOn = e.target.checked;
@@ -650,17 +764,78 @@ picker.addEventListener("change", async () => {
   picker.value = "";
 });
 
-// Sample models: CC0 assets that fetch_samples.py downloads into samples/ at build time, listed
-// in samples/index.json. Without it (a local build that skipped the script) the row stays hidden.
-async function loadSample(s) {
-  setStatus(`Downloading ${s.name} (${(s.bytes / 1e6).toFixed(0)} MB)…`, "busy");
-  try {
-    const r = await fetch(`samples/${s.file}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    await load([{ name: s.file, bytes: await r.arrayBuffer() }]);
-  } catch (err) {
-    setStatus(`Could not download ${s.name}: ${err.message ?? err}`, "error");
+const mb = (bytes) => `${(bytes / 1e6).toFixed(bytes < 1e7 ? 1 : 0)} MB`;
+
+/** Fetches `url`, calling `progress(received, total)` as it streams in. */
+async function download(url, signal, progress, expected = 0) {
+  const r = await fetch(url, { signal });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const total = +r.headers.get("content-length") || expected;
+  if (!r.body || !total) return r.arrayBuffer();
+  const reader = r.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    progress(got, Math.max(total, got));
   }
+  const out = new Uint8Array(got);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.length;
+  }
+  return out.buffer;
+}
+
+// Only one download at a time: picking another model cancels the one in flight.
+let fetching = null;
+async function loadUrl(url, name, expected, onProgress = () => {}) {
+  fetching?.abort();
+  const ctl = (fetching = new AbortController());
+  setStatus(`Downloading ${name}…`, "busy");
+  try {
+    const bytes = await download(url, ctl.signal, (got, total) => {
+      setStatus(`Downloading ${name}… ${mb(got)} of ${mb(total)}`, "busy");
+      onProgress(got / total);
+    }, expected);
+    if (ctl.signal.aborted) return;
+    await load([{ name: decodeURIComponent(new URL(url, location.href).pathname.split("/").pop()), bytes }]);
+  } catch (err) {
+    if (!ctl.signal.aborted) setStatus(`Could not download ${name}: ${err.message ?? err}`, "error");
+  } finally {
+    if (fetching === ctl) fetching = null;
+    onProgress(null);
+  }
+}
+
+// Sample models: CC0 assets that fetch_samples.py downloads into samples/ at build time, listed
+// in samples/index.json. Each one gets a card in the sidebar and in the empty viewport's gallery.
+// Without the index (a local build that skipped the script) neither shows.
+const cards = new Map(); // sample file -> its card buttons
+function card(s) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "card";
+  b.title = `${s.name} · ${mb(s.bytes)} · by ${s.credit} · ${s.license}`;
+  b.innerHTML =
+    (s.thumb ? `<img src="samples/${esc(s.thumb)}" alt="" loading="lazy">` : `<span class="noimg"></span>`) +
+    `<span class="name">${esc(s.name)}</span><span class="size">${mb(s.bytes)}</span><span class="bar"></span>`;
+  b.addEventListener("click", () => loadSample(s));
+  return b;
+}
+
+function loadSample(s) {
+  for (const [file, list] of cards) for (const b of list) b.setAttribute("aria-current", String(file === s.file));
+  loadUrl(`samples/${s.file}`, s.name, s.bytes, (p) => {
+    for (const b of cards.get(s.file)) {
+      b.classList.toggle("loading", p !== null);
+      b.style.setProperty("--p", p ?? 0);
+    }
+  });
 }
 
 fetch("samples/index.json")
@@ -668,25 +843,23 @@ fetch("samples/index.json")
   .catch(() => [])
   .then((samples) => {
     if (!samples.length) return;
-    const row = $("#samples");
     for (const s of samples) {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = s.name;
-      b.title = `${(s.bytes / 1e6).toFixed(0)} MB · ${s.credit} · ${s.license}`;
-      b.addEventListener("click", () => loadSample(s));
-      row.append(b);
+      const pair = [card(s), card(s)];
+      $("#sample-cards").append(pair[0]);
+      $("#gallery").append(pair[1]);
+      cards.set(s.file, pair);
     }
-    row.hidden = false;
-    $("#samples-credit").hidden = false;
+    $("#samples").hidden = false;
   });
+
+// Choosing or dropping a file of your own cancels a sample download and clears its highlight.
+const clearCurrent = () => {
+  fetching?.abort();
+  for (const list of cards.values()) for (const b of list) b.removeAttribute("aria-current");
+};
+picker.addEventListener("change", clearCurrent);
+addEventListener("drop", clearCurrent);
 
 // ?model=<url> loads a .glb (or .zip) on start, e.g. index.html?model=samples/Lantern.glb
 const startUrl = new URLSearchParams(location.search).get("model");
-if (startUrl) {
-  setStatus(`Downloading ${startUrl}…`, "busy");
-  fetch(startUrl)
-    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then((bytes) => load([{ name: decodeURIComponent(new URL(startUrl, location.href).pathname.split("/").pop()), bytes }]))
-    .catch((err) => setStatus(`Could not download ${startUrl}: ${err.message ?? err}`, "error"));
-}
+if (startUrl) loadUrl(startUrl, startUrl, 0);

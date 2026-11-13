@@ -74,10 +74,33 @@ header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
 }
 #drop strong { color: var(--ink); }
 #drop .row { display: flex; gap: 6px; justify-content: center; align-items: center; flex-wrap: wrap; }
-#drop .samples { font-size: 13px; }
-#drop .credit { font-size: 11px; }
-#drop .credit a { color: inherit; }
 body.dragging #drop { border-color: var(--accent); background: var(--sel); }
+
+/* Sample cards: in the sidebar, and larger in the empty viewport's gallery */
+#samples { display: flex; flex-direction: column; gap: 8px; }
+#samples h2 { margin: 0; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+#samples .credit { font-size: 11px; color: var(--muted); }
+#samples .credit a { color: inherit; }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.card {
+  position: relative; overflow: hidden;
+  display: flex; flex-direction: column; align-items: stretch; gap: 0;
+  padding: 0; border-radius: 8px; text-align: left; background: var(--panel);
+}
+.card img, .card .noimg {
+  display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: var(--view);
+}
+.card .name { padding: 4px 6px 0; font-size: 12px; font-weight: 600; line-height: 1.25; }
+.card .size { padding: 0 6px 5px; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.card:hover { border-color: var(--accent); }
+.card:hover img { filter: brightness(1.06); }
+.card[aria-current="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.card .bar {
+  position: absolute; left: 0; bottom: 0; height: 3px; width: calc(var(--p, 0) * 100%);
+  background: var(--accent); transition: width 0.15s; visibility: hidden;
+}
+.card.loading .bar { visibility: visible; }
+.card.loading img { opacity: 0.7; }
 
 #asset h2 { margin: 0 0 6px; font-size: 15px; word-break: break-all; }
 #asset dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; margin: 0; font-size: 13px; }
@@ -100,8 +123,35 @@ main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0;
 #view { position: relative; background: var(--view); min-height: 0; overflow: hidden; }
 #gl { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
 #empty {
-  position: absolute; inset: 0; display: grid; place-items: center;
-  color: var(--muted); font-size: 16px; pointer-events: none;
+  position: absolute; inset: 0; display: grid; place-items: center; padding: 24px;
+  color: var(--muted); font-size: 16px; pointer-events: none; text-align: center; overflow: auto;
+}
+#empty > div { width: min(100%, 620px); }
+#empty p { margin: 0 0 16px; }
+#empty .cards { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 12px; pointer-events: auto; }
+#empty .card .name { font-size: 13px; padding: 6px 8px 0; }
+#empty .card .size { padding: 0 8px 7px; }
+#empty .cards:empty { display: none; }
+
+/* Auto mode's magnifier */
+#mag {
+  position: absolute; right: 12px; top: 40px; margin: 0; pointer-events: none;
+  background: var(--view); border: 1px solid var(--line); border-radius: 6px; overflow: hidden;
+}
+#mag canvas { display: block; width: 160px; height: 160px; image-rendering: pixelated; }
+#mag figcaption {
+  font-family: var(--mono); font-size: 11px; color: var(--muted); text-align: center;
+  padding: 2px 6px; border-top: 1px solid var(--line); background: var(--panel);
+}
+
+/* Auto mode's distance slider; ticks mark each level's switch distance */
+.dist { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.dist .track { position: relative; display: block; width: 180px; }
+.dist input { width: 100%; display: block; accent-color: var(--accent); margin: 0; }
+#ticks { position: absolute; inset: 0; pointer-events: none; }
+#ticks i {
+  position: absolute; top: -5px; width: 1px; height: 5px; background: var(--muted);
+  left: calc(8px + var(--t) * (100% - 16px));
 }
 #hud {
   position: absolute; left: 12px; top: 10px; right: 12px;
@@ -111,6 +161,7 @@ main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0;
 #hud span { background: color-mix(in srgb, var(--panel) 80%, transparent); padding: 2px 8px; border-radius: 4px; }
 #viewbar {
   position: absolute; right: 12px; bottom: 10px; display: flex; gap: 12px; align-items: center;
+  flex-wrap: wrap; justify-content: flex-end; max-width: calc(100% - 24px);
   background: color-mix(in srgb, var(--panel) 85%, transparent); padding: 4px 8px; border-radius: 8px;
 }
 .seg { display: flex; }

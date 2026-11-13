@@ -4,8 +4,9 @@
 The models are CC0 assets from the Khronos glTF Sample Assets, pinned to one commit. They're
 fetched at build time and served with the page, not committed. A model whose metadata lists
 any license other than CC0-1.0 is refused. A .glb is copied as is; a multi-file .gltf is packed
-into a .zip with its buffers and textures (the demo loads both). Files already downloaded are
-kept, so a rerun only fetches what's missing.
+into a .zip with its buffers and textures (the demo loads both). Each model's screenshot is saved
+next to it as its thumbnail. Files already downloaded are kept, so a rerun only fetches what's
+missing.
 
     python fetch_samples.py          # then serve web/ as usual
 """
@@ -72,6 +73,13 @@ def fetch(name: str, variant: str) -> dict:
                     z.writestr(f"{name}/{urllib.parse.unquote(uri)}", get(f"{base}/{uri}"))
             dest.write_bytes(buf.getvalue())
 
+    # The sample repo's own screenshot (about 130 px square, a few KB) is the page's thumbnail.
+    thumb = None
+    if shot := meta.get("screenshot"):
+        thumb = f"{name}{pathlib.PurePosixPath(shot).suffix}"
+        if not (OUT / thumb).exists():
+            (OUT / thumb).write_bytes(get(f"{RAW}/{name}/{shot}"))
+
     names = [x for e in meta["legal"] for x in (e.get("artist"), e.get("owner"))]
     credit = ", ".join(dict.fromkeys(x for x in names if x and x != "Public")) or "Khronos"
     size = dest.stat().st_size
@@ -80,6 +88,7 @@ def fetch(name: str, variant: str) -> dict:
         "name": meta.get("name", name),
         "file": file,
         "bytes": size,
+        "thumb": thumb,
         "credit": credit,
         "license": "CC0-1.0",
         "source": f"{BROWSE}/{name}",
