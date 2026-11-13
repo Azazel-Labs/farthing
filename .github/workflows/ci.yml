@@ -1,0 +1,227 @@
+# CI for farthing. Every push and pull request runs the checks. On a push to main, once every
+# check passes:
+#   - the web demo (demo-web/) is deployed to GitHub Pages;
+#   - if the version in Cargo.toml isn't on crates.io yet, farthing and farthing-cli are published
+#     there, and the version is tagged vX.Y.Z with a GitHub release carrying CLI binaries.
+# To release: bump `version` in [workspace.package] and merge to main. Release notes are generated
+# from the commits and PRs since the previous tag. Needs the secret CARGO_REGISTRY_TOKEN, and
+# Settings -> Pages -> Source: GitHub Actions.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded PR runs are cancelled; runs on main always finish, so a release isn't cut short.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo fmt --all --check
+      - run: cargo fmt --check
+        working-directory: demo-web
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The library only: the CLI is a binary named `farthing` too, and docs.rs skips it anyway.
+      - run: cargo doc -p farthing --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo test --workspace --locked
+
+  # The minimum supported Rust (rust-version in Cargo.toml) still builds everything. `+1.88`
+  # overrides the `stable` channel in rust-toolchain.toml.
+  msrv:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo +1.88 check --workspace --all-targets --locked
+      - run: cargo +1.88 check -p farthing --no-default-features --locked
+
+  # The browser demo: its native tests, then the WebAssembly build that Pages serves.
+  demo:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: demo-web
+          cache-on-failure: true
+      # Must match the `wasm-bindgen = "=…"` pin in demo-web/Cargo.toml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      - run: cargo test --locked
+        working-directory: demo-web
+      - run: sh demo-web/build.sh
+      - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: demo-web/web
+
+  pages:
+    needs: [lint, test, msrv, demo]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    permissions:
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v6
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # Decides whether this push releases: it does when the Cargo.toml version is missing from
+  # crates.io (either crate) or has no GitHub release yet. Each later step skips what's done, so a
+  # rerun after a partial failure picks up where it stopped.
+  release-check:
+    needs: [lint, test, msrv, demo]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-26.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "farthing") | .version')"
+          ua="farthing-release (https://github.com/$GH_REPO)"
+          release=false
+          for crate in farthing farthing-cli; do
+            status="$(curl -s -o /dev/null -w '%{http_code}' -A "$ua" "https://crates.io/api/v1/crates/$crate/$version")"
+            echo "$crate $version on crates.io: HTTP $status"
+            [ "$status" = "200" ] || release=true
+          done
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "release v$version exists"
+          else
+            echo "release v$version missing"
+            release=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "version $version: release=$release"
+
+  binaries:
+    needs: release-check
+    if: needs.release-check.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          # Oldest supported runner: the binary needs the glibc it was built against or newer.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: ".exe" }
+          - { os: macos-latest, target: aarch64-apple-darwin, ext: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, ext: "" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+      - run: cargo build --release --locked -p farthing-cli --bin farthing --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=farthing-${{ needs.release-check.outputs.version }}-${{ matrix.target }}
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/farthing${{ matrix.ext }}" README.md LICENSE-MIT0 "$name/"
+          if [ "${{ runner.os }}" = Windows ]; then 7z a -bd "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: farthing-${{ matrix.target }}
+          path: farthing-*-${{ matrix.target }}.*
+
+  release:
+    needs: [release-check, binaries]
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.release-check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # farthing first: farthing-cli depends on it, and cargo waits until it's in the index.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ua="farthing-release (https://github.com/$GH_REPO)"
+          for crate in farthing farthing-cli; do
+            status="$(curl -s -o /dev/null -w '%{http_code}' -A "$ua" "https://crates.io/api/v1/crates/$crate/$VERSION")"
+            if [ "$status" = "200" ]; then
+              echo "$crate $VERSION is already on crates.io; skipping."
+            else
+              cargo publish --locked -p "$crate"
+            fi
+          done
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Tag and create GitHub release
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "release v$VERSION exists; nothing to do."
+            exit 0
+          fi
+          (cd dist && sha256sum farthing-* > SHA256SUMS)
+          notes="On crates.io: [farthing $VERSION](https://crates.io/crates/farthing/$VERSION) (library, \`cargo add farthing\`) and [farthing-cli $VERSION](https://crates.io/crates/farthing-cli/$VERSION) (\`cargo install farthing-cli\`). Prebuilt CLI binaries are attached below."
+          gh release create "v$VERSION" dist/* --target "$GITHUB_SHA" --title "farthing $VERSION" --notes "$notes" --generate-notes

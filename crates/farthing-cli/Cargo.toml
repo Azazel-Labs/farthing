@@ -5,6 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["lod", "mesh", "simplification", "gltf", "cli"]
+categories = ["graphics", "game-development", "command-line-utilities"]
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "farthing"

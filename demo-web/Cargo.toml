@@ -3,7 +3,7 @@ name = "farthing-demo-web"
 description = "Browser demo: drop a glTF, tune LOD options, watch the chain build and bake."
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.99"
+rust-version = "1.88"
 license = "MIT-0"
 publish = false
 

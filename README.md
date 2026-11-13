@@ -3,6 +3,13 @@
   <img alt="farthing: small change for far things. A little goes a long way: a flight helmet's LOD chain, each level a quarter of the last, at 94,722, 23,679, 5,916 and 1,480 triangles (baked). The last helmet is 1/64 of the first, and looks the same from where it's used." src="docs/images/hero-light.png">
 </picture>
 
+[![CI](https://github.com/Azazel-Labs/farthing/actions/workflows/ci.yml/badge.svg)](https://github.com/Azazel-Labs/farthing/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/farthing.svg)](https://crates.io/crates/farthing)
+[![docs.rs](https://img.shields.io/docsrs/farthing)](https://docs.rs/farthing)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![License: MIT-0](https://img.shields.io/badge/license-MIT--0-blue)](LICENSE-MIT0)
+[![Live demo](https://img.shields.io/badge/demo-try_it_in_your_browser-8a2be2)](https://azazel-labs.github.io/farthing/)
+
 **farthing makes far things small.** It builds the LODs, proxies and impostors that stand in
 for what's in the distance, and it keeps them looking like the original from where they're
 seen. A farthing was the smallest coin. *A little goes a long way.*
@@ -97,14 +104,16 @@ with procedural materials farthing never sees.
 
 ## Try it
 
-**In the browser.** [`demo-web/`](demo-web/) runs the whole pipeline in WebAssembly. Drop a
+**In the browser.** [Open the live demo](https://azazel-labs.github.io/farthing/) (source in
+[`demo-web/`](demo-web/)). It runs the whole pipeline in WebAssembly. Drop a
 glTF, watch the LOD chain build and bake, and fly out to see the levels switch. Nothing is
 uploaded.
 
-**From the command line:**
+**From the command line.** Grab a prebuilt binary from
+[Releases](https://github.com/Azazel-Labs/farthing/releases), or build it:
 
 ```sh
-cargo install --path crates/farthing-cli
+cargo install farthing-cli
 
 farthing lods model.glb -o lods/ --levels 4 --far-from 3   # LOD chain, far levels baked
 farthing reduce model.glb -o lod.glb --ratio 0.25           # one level

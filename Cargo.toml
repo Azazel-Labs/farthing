@@ -9,7 +9,14 @@ exclude = ["engine-poc", "bench-compare", "demo-web"]
 version = "0.15.0"
 edition = "2021"
 license = "MIT-0"
-rust-version = "1.99"
+rust-version = "1.88"
+repository = "https://github.com/Azazel-Labs/farthing"
+homepage = "https://azazel-labs.github.io/farthing/"
+
+[workspace.lints.clippy]
+# New in clippy 1.100: a style suggestion (`as_chunks`) for fixed-size `chunks_exact`. The
+# sites include fixed-order numeric kernels; they stay as written.
+chunks_exact_to_as_chunks = "allow"
 
 [workspace.dependencies]
 glam = { version = "0.34", features = ["serde"] }
@@ -25,7 +32,7 @@ mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 naga = { version = "30", features = ["wgsl-in"] }
-snugly = { version = "0.1.1", features = ["serde"] }
+snugly = { version = "0.1.2", features = ["serde"] }
 farthing = { path = "crates/farthing", version = "0.15.0" }
 
 [profile.dev]

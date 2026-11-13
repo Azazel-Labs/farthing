@@ -5,9 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 readme = "../../README.md"
 keywords = ["lod", "mesh", "simplification", "gltf", "gamedev"]
 categories = ["graphics", "game-development", "rendering"]
+
+[lints]
+workspace = true
 
 [features]
 default = ["io"]
