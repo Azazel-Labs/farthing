@@ -149,3 +149,51 @@ fn reports_missing_files() {
         .unwrap();
     assert!(e.contains("no .glb or .gltf"), "{e}");
 }
+
+/// The sample models the page offers (`python fetch_samples.py` downloads them into
+/// web/samples/): each loads and runs through reduced and baked levels with the page's
+/// default options. Skipped when they haven't been downloaded; CI fetches them first.
+#[test]
+fn samples_reduce_and_bake() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/samples");
+    let Ok(index) = std::fs::read(dir.join("index.json")) else {
+        eprintln!("no web/samples/index.json; run fetch_samples.py to test the samples");
+        return;
+    };
+    let index: Vec<serde_json::Value> = serde_json::from_slice(&index).unwrap();
+    assert!(!index.is_empty());
+    for sample in &index {
+        let file = sample["file"].as_str().unwrap();
+        let t0 = std::time::Instant::now();
+        let bytes = std::fs::read(dir.join(file)).unwrap();
+        let mut demo =
+            Demo::load(vec![(file.into(), bytes)]).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let info = demo.info();
+        assert!(info.triangles > 1000, "{file}: {info:?}");
+        let opts = LodOptions {
+            bake_from: 3,
+            atlas: 256,
+            ..Default::default()
+        };
+        let mut levels = vec![];
+        demo.run(&opts, &|| 0.0, &mut |e| {
+            if let Event::Level { info, .. } = e {
+                levels.push(info.clone());
+            }
+        })
+        .unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(levels.len(), opts.levels + 1, "{file}");
+        for w in levels.windows(2) {
+            assert!(w[1].triangles < w[0].triangles, "{file}: {:?}", w[1]);
+        }
+        let baked = &levels[opts.bake_from];
+        assert!(baked.coverage.unwrap() > 0.2, "{file}: {baked:?}");
+        eprintln!(
+            "{file}: {} tris, LOD{} {} tris, {:.1}s",
+            info.triangles,
+            opts.levels,
+            levels[opts.levels].triangles,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+}

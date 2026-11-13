@@ -27,6 +27,7 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129   # must match the pin in Cargo.toml
 ./build.sh                                         # → web/pkg/
+python fetch_samples.py                            # optional: sample models → web/samples/
 python -m http.server -d web 8000                  # then open http://localhost:8000
 ```
 
@@ -35,8 +36,14 @@ Any static file server works if it serves `.js` as JavaScript. Opening `index.ht
 [binaryen](https://github.com/WebAssembly/binaryen)'s `wasm-opt` is on `PATH`, `build.sh`
 also optimizes the module for size.
 
-`index.html?model=<url>` loads a model on start, for example
-`?model=https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Assets@main/Models/Duck/glTF-Binary/Duck.glb`.
+**Sample models.** `fetch_samples.py` downloads a few CC0 models from the
+[Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets), pinned to
+one commit, into `web/samples/` with an `index.json`. The page offers them as buttons. They
+aren't committed: CI fetches them when it builds the page, and `cargo test` runs the pipeline
+on each one when they're present. The script refuses any model whose metadata lists a license
+other than CC0. To change the set, edit `SAMPLES` in the script.
+
+`index.html?model=<url>` loads a model on start, for example `?model=samples/Lantern.glb`.
 
 The pipeline itself (`src/pipeline.rs`) has no browser dependencies. `cargo test` runs it
 natively on a zipped `.gltf`.

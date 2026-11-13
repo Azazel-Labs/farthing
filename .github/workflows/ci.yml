@@ -88,6 +88,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen@0.2.129
+      # CC0 sample models for the page (not committed). Cached on the script, which pins the
+      # source commit and lists the models; the tests below run the pipeline on each one.
+      - uses: actions/cache@v6
+        with:
+          path: demo-web/web/samples
+          key: demo-samples-${{ hashFiles('demo-web/fetch_samples.py') }}
+      - run: python3 demo-web/fetch_samples.py
       - run: cargo test --locked
         working-directory: demo-web
       - run: sh demo-web/build.sh

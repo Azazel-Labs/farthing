@@ -75,6 +75,8 @@ header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
 #drop strong { color: var(--ink); }
 #drop .row { display: flex; gap: 6px; justify-content: center; align-items: center; flex-wrap: wrap; }
 #drop .samples { font-size: 13px; }
+#drop .credit { font-size: 11px; }
+#drop .credit a { color: inherit; }
 body.dragging #drop { border-color: var(--accent); background: var(--sel); }
 
 #asset h2 { margin: 0 0 6px; font-size: 15px; word-break: break-all; }

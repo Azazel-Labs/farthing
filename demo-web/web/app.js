@@ -10,8 +10,6 @@ const form = $("#opts");
 const statusEl = $("#status");
 const rowsEl = $("#level-rows");
 
-const SAMPLE_URL = (name) =>
-  `https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Assets@main/Models/${name}/glTF-Binary/${name}.glb`;
 const STORE_KEY = "farthing-demo-options";
 
 // ---------------------------------------------------------------- state
@@ -652,21 +650,38 @@ picker.addEventListener("change", async () => {
   picker.value = "";
 });
 
-for (const b of document.querySelectorAll("[data-sample]")) {
-  b.addEventListener("click", async () => {
-    const name = b.dataset.sample;
-    setStatus(`Downloading ${name}…`, "busy");
-    try {
-      const r = await fetch(SAMPLE_URL(name));
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      await load([{ name: `${name}.glb`, bytes: await r.arrayBuffer() }]);
-    } catch (err) {
-      setStatus(`Could not download ${name}: ${err.message ?? err}`, "error");
-    }
-  });
+// Sample models: CC0 assets that fetch_samples.py downloads into samples/ at build time, listed
+// in samples/index.json. Without it (a local build that skipped the script) the row stays hidden.
+async function loadSample(s) {
+  setStatus(`Downloading ${s.name} (${(s.bytes / 1e6).toFixed(0)} MB)…`, "busy");
+  try {
+    const r = await fetch(`samples/${s.file}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    await load([{ name: s.file, bytes: await r.arrayBuffer() }]);
+  } catch (err) {
+    setStatus(`Could not download ${s.name}: ${err.message ?? err}`, "error");
+  }
 }
 
-// ?model=<url> loads a .glb (or .zip) on start, e.g. index.html?model=assets/Duck.glb
+fetch("samples/index.json")
+  .then((r) => (r.ok ? r.json() : []))
+  .catch(() => [])
+  .then((samples) => {
+    if (!samples.length) return;
+    const row = $("#samples");
+    for (const s of samples) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = s.name;
+      b.title = `${(s.bytes / 1e6).toFixed(0)} MB · ${s.credit} · ${s.license}`;
+      b.addEventListener("click", () => loadSample(s));
+      row.append(b);
+    }
+    row.hidden = false;
+    $("#samples-credit").hidden = false;
+  });
+
+// ?model=<url> loads a .glb (or .zip) on start, e.g. index.html?model=samples/Lantern.glb
 const startUrl = new URLSearchParams(location.search).get("model");
 if (startUrl) {
   setStatus(`Downloading ${startUrl}…`, "busy");
