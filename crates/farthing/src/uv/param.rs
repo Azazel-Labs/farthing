@@ -61,9 +61,10 @@ pub struct ParamOptions {
     pub padding: u32,
     /// Fixed texel density; None = as large as fits in the atlas.
     pub texels_per_unit: Option<f32>,
-    /// With few charts (`snugly::HOLE_FILL_AUTO_MAX`), also pack with free intervals per column, which can nest
-    /// charts under the overhangs of others, and keep the lower atlas. Costs time on atlases
-    /// with few large charts (Duck, Fox, WaterBottle: 3–5% more texel area).
+    /// Also pack with free intervals per column, which nests charts under the overhangs of
+    /// others, and keep the lower atlas. More texel area for the same atlas (DamagedHelmet
+    /// 0.610 → 0.697 utilization, Lantern 0.744 → 0.792) for about 2.5× the packing time on
+    /// atlases with hundreds of charts. Off: the skyline packer alone.
     #[serde(default = "default_true")]
     pub fill_holes: bool,
     /// Split charts that fill less than 45% of their bounding rectangle (star-like unwraps)
@@ -807,7 +808,7 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
         let frames = masks.iter().map(|m| (m.w, m.h)).collect();
         let popts = PackOptions {
             fill_holes: if opts.fill_holes {
-                HoleFill::Auto
+                HoleFill::Always
             } else {
                 HoleFill::Never
             },

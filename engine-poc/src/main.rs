@@ -132,6 +132,70 @@ fn load_gltf_into_engine(engine: &mut Engine, path: &str) -> Result<Scene> {
     Ok(scene)
 }
 
+/// `impostor_shot <asset.glb> <out-dir> [diameter-px...]`: for each on-screen diameter, builds an
+/// octahedral impostor sized for it ([`farthing::impostor::frame_size_for_screen`]) and renders
+/// the mesh and the impostor at exactly that size from views between capture directions. Writes
+/// `d{px}_{mesh|impostor}_view{i}.png` and `impostor_shot.json` (sizes, bytes, PSNR, silhouette).
+fn impostor_shot_mode(args: &[String]) -> Result<()> {
+    let path = args.first().ok_or_else(|| anyhow::anyhow!("usage: impostor_shot <asset.glb> <out-dir> [diameter-px...]"))?;
+    let out = PathBuf::from(args.get(1).map_or("impostor-shot", String::as_str));
+    let diameters: Vec<u32> = if args.len() > 2 { args[2..].iter().filter_map(|a| a.parse().ok()).collect() } else { vec![160, 96, 48] };
+    std::fs::create_dir_all(&out)?;
+    let mut engine = Engine::new()?;
+    // Like `load_gltf_into_engine`, plus the asset's tangent-space normal map.
+    let (mut scene, mats) = farthing::io::load_gltf(path)?;
+    for (slot, m) in mats.iter().enumerate() {
+        let base = m.base_color_texture.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| Image::new(1, 1, Vec4::ONE));
+        let normal = m.normal_texture.as_ref().map(|t| t.0.clone());
+        let cutoff = match m.info.class {
+            MaterialClass::Masked { cutoff } => cutoff,
+            _ => 0.0,
+        };
+        let id = engine.add_material(MaterialDef::Textured { base, normal, factor: m.base_color_factor, cutoff }, m.info);
+        scene.materials[slot].id = id;
+    }
+    let b = scene.bounds();
+    let (c, r) = (b.center(), b.radius());
+    // Directions chosen to fall between the 12x12 capture directions, not on them.
+    let dirs = [Vec3::new(0.55, 0.22, 1.0), Vec3::new(-0.9, 0.35, 0.5), Vec3::new(0.15, 0.6, -1.0)];
+    let fov = 20f32.to_radians();
+    let mut rows = Vec::new();
+    for &dpx in &diameters {
+        let frame = farthing::impostor::frame_size_for_screen(dpx as f32);
+        let kind = farthing::impostor::ImpostorKind::Octahedral { frames_per_side: 12, hemisphere: false };
+        let t = Instant::now();
+        let imp = farthing::impostor::build_impostor(&mut engine, &scene, &kind, frame, true)?;
+        let secs = t.elapsed().as_secs_f32();
+        let mat = imp.material.unwrap();
+        // Image a little larger than the sphere; distance puts the sphere at `dpx` pixels across.
+        let size = (dpx as f32 * 1.15).ceil() as u32;
+        let dist = size as f32 * r / (dpx as f32 * (fov * 0.5).tan());
+        let mut diffs = Vec::new();
+        for (i, d) in dirs.iter().enumerate() {
+            let v = View::perspective(c + d.normalize() * dist, c, fov, size, size, (dist - r * 1.5).max(r * 0.01), dist + r * 1.5);
+            // Reference rendered at 4x and box-filtered, like an anti-aliased engine would show it
+            // (the impostor's frames are supersampled too).
+            let v4 = View::perspective(c + d.normalize() * dist, c, fov, size * 4, size * 4, (dist - r * 1.5).max(r * 0.01), dist + r * 1.5);
+            let mesh = engine.render(&scene, &v4, true).0.downsample_coverage(4);
+            let got = engine.render_impostor(mat, imp.params.center, imp.params.radius, &v)?;
+            mesh.save_png(out.join(format!("d{dpx}_mesh_view{i}.png")), true)?;
+            got.save_png(out.join(format!("d{dpx}_impostor_view{i}.png")), true)?;
+            diffs.push(image_difference(&mesh, &got));
+        }
+        let atlas = &imp.atlas[channels::BASE_COLOR].image;
+        atlas.save_png(out.join(format!("d{dpx}_atlas.png")), true)?;
+        // Colour + normal atlases, RGBA8 each, uncompressed.
+        let bytes = atlas.width as usize * atlas.height as usize * 4 * 2;
+        let row = json!({"diameter_px": dpx, "frame_px": frame, "atlas_px": atlas.width, "atlas_bytes_rgba8_color_normal": bytes,
+            "triangles": scene.triangle_count(), "psnr_db": diffs.iter().map(|d| d.psnr).collect::<Vec<_>>(),
+            "silhouette_mismatch": diffs.iter().map(|d| d.coverage_mismatch).collect::<Vec<_>>(), "seconds": secs});
+        println!("{row}");
+        rows.push(row);
+    }
+    std::fs::write(out.join("impostor_shot.json"), serde_json::to_string_pretty(&json!({"asset": path, "frames_per_side": 12, "fov_deg": 20, "rows": rows}))?)?;
+    Ok(())
+}
+
 /// `score <original.glb> <lod.glb>...`: renders each LOD with the original's materials (matched
 /// by slot index) from the standard views and prints PSNR / silhouette mismatch per file.
 /// Progressive surfels as continuous LOD on the bush: each prefix of one progressive cloud
@@ -345,6 +409,9 @@ fn main() -> Result<()> {
     }
     if args.first().is_some_and(|a| a == "surfel_lod") {
         return surfel_lod_mode();
+    }
+    if args.first().is_some_and(|a| a == "impostor_shot") {
+        return impostor_shot_mode(&args[1..]);
     }
     let out = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)).map_or_else(|| PathBuf::from("poc-out"), PathBuf::from);
     let input = args.first().filter(|a| !a.starts_with("--")).cloned();

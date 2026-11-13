@@ -3,333 +3,492 @@
   <img alt="farthing: small change for far things. A little goes a long way: a flight helmet's LOD chain, each level a quarter of the last, at 94,722, 23,679, 5,916 and 1,480 triangles (baked). The last helmet is 1/64 of the first, and looks the same from where it's used." src="docs/images/hero-light.png">
 </picture>
 
-*Small change for far things.* A farthing was the smallest coin; the toolkit makes far things
-small: LODs, proxies and impostors for what's in the distance. (Formerly lodforge.)
+**farthing makes far things small.** It builds the LODs, proxies and impostors that stand in
+for what's in the distance, and it keeps them looking like the original from where they're
+seen. A farthing was the smallest coin. *A little goes a long way.*
 
-A clean-room, pure-Rust asset optimization toolkit: LOD chains, quad-preserving and
-symmetry-aware reduction, remeshed proxies, material baking, aggregation, impostors,
-visibility culling, occluders and bone reduction. It is engine-agnostic middleware, built from
-published techniques (see [PROVENANCE.md](PROVENANCE.md)).
+It's a pure-Rust, engine-agnostic asset optimizer. It has no `unsafe` code, gives the same
+output on any machine and any thread count, and is MIT-0 licensed. Use it as a library, a CLI
+or a build step.
 
-**v15 (0.15.0).** The UV atlas now beats xatlas on utilization on all eight test assets (Fox 0.634 vs 0.547), by splitting sprawling charts and also packing chart bounding boxes with MaxRects. `snugly` 0.1.0 is ready to release as its own crate: error types, an optional `parallel` feature (WASM builds), a verified MSRV, CI and an export script. Aggressive targets: junction branch points collapse, and fast mode shares the default's part and junction handling. Impostors get a half-resolution second layer and automatic layer choice; surfels get a reference splat shader and optional per-surfel radii. Everything is MIT-0. The toolkit is renamed **Farthing** (one library crate `farthing`, CLI `farthing`) and the packer **snugly**.
-**v14 (0.14.0):** A fast reducer mode (4–5× faster than the default, still ahead of
-meshoptimizer on worst-case and mean error). `snugly` is product-ready: it now has the
-highest rectangle-packing density of the Rust packers tested, and shapes can nest inside each
-other's holes. Aggressive targets are fixed: part removal respects the target and what can be
-seen, junctions slide, duplicated double-sided faces reduce, and visible parts are protected.
-Also two-layer impostors for concave props, and progressive surfels with a streaming format.
-**v13 (0.13.0):** No `unsafe` code in any farthing crate (enforced with `forbid(unsafe_code)`), the atlas packer is now its own crate (`snugly`), the hole-filling packer is 25% faster on few-chart atlases, and `scripts/scaling.sh` measures thread scaling on your machines. **v12 (0.12.0):** Voxel proxies now sit on the source surface instead of up to a cell outside it: boundary cells take the sign of a robust signed distance, guarded so thin sheets survive. Worst-case distance drops on all seven test assets, by up to 53%, and farthing now beats baby_shark on the Duck and the Fox on both metrics. The reducer's commit loop runs in parallel on 8+ threads with no `unsafe`, bit-identical to the serial loop. **v11 (0.11.0):** Scales with cores, with output that stays bit-identical at any thread count (now tested for the reducer, quad reduction, UVs and the BVH). Quad reduction is linear-time: 240k quads in 2.4 s on one thread (v10: 8.8 s). A hole-filling packer for atlases with few large charts ties xatlas on the water bottle. **v10 (0.10.0):** Octahedral impostors relit and fixed (+3.5 dB close up), quad reduction 5–20× faster at scale. **v9 (0.9.0):** Surfel proxies for relightable distant foliage, per-pocket gap sealing for voxel proxies, a silhouette-aware reduction cost, and a [patent shame list](#patent-shame-list). Earlier, **v8 (0.8.0):** The reducer now reaches 100% of triangle targets. Edge collapses cannot remove
-a part, so multi-part assets used to stall at aggressive targets, and their budget went to small
-parts that could not shrink. farthing now deletes whole parts whose removal moves the surface
-least. Over 8 assets × 4 ratios that cut mean error 14% and Hausdorff 9% (v9's silhouette weight
-adds a little more). At 1% the Lantern went from 76.8% to 9.6% Hausdorff. Against
-meshoptimizer's attribute-aware mode at matched triangle counts (v9): 0.69× Hausdorff, 0.41× mean,
-0.27× UV and 0.89× normal error. LOD images beat meshoptimizer in 21 of 24 cases (+1.51 dB). The UV atlas beats xatlas on 22 of 24 quality
-comparisons (v11 gave back its small speed lead for tighter packing of few-chart atlases). Voxel proxies are closed on every test asset (v7).
-Output is deterministic across thread counts and CPUs. Full data:
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md). Ideas from other sciences:
-[docs/research/](docs/research/README.md). Pure Rust, no `unsafe`, 122 tests.
+## Closer to the original at the same triangle count
 
-The one design rule: **farthing never decides what anything looks like.** It does geometry,
-UVs, correspondence and packing. Anything that needs real materials goes through a small
-`RenderHost` trait, or the two-phase bake API, that the host implements. Baking,
-impostor captures, alpha-aware visibility and image checks all fall in that category.
-`engine-poc/` is a minimal wgpu engine that proves the boundary, with procedural materials
-farthing never sees.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/h2h-dark.png">
+  <img alt="DamagedHelmet reduced from 15,452 to 3,349 triangles by meshoptimizer and by farthing, with pixel-error maps against the original. meshoptimizer: 18.4 dB PSNR, silhouette off 1.86%. farthing: 22.1 dB, silhouette off 0.33%." src="docs/images/h2h-light.png">
+</picture>
 
-![PoC contact sheet](docs/poc/contact_sheet.png)
+farthing's reducer protects what you actually see: silhouettes, UV seams, shading normals and
+texture layout. This is the widest gap of the 24 image comparisons. Across all 24, farthing is
+ahead in 21, by +1.5 dB on average
+([every case](docs/benchmarks/image-space-vs-meshopt.txt)).
 
-*Rows, top to bottom: original (46.9k tris) · near LOD 25% · far LOD 5% re-baked · remeshed
-proxy 3k tris · per-object octahedral impostor (knot) · aggregated into one draw call. All
-rendered by the PoC engine. The marble and checker are procedural world-space materials.*
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-dark.png">
+  <img alt="Bar charts of farthing's error as a share of meshoptimizer's at matched triangle counts. Against attribute-aware meshoptimizer: worst-case distance 0.69x, mean distance 0.41x, UV error 0.27x, normal error 0.89x. Against permissive seams: 0.80x, 0.57x, 0.33x, 0.99x. Against positions-only: 1.17x (a loss), 0.62x, 0.29x, 0.40x. Also +1.5 dB in image space, 100% of triangle targets reached, and 5 to 9 times slower." src="docs/images/bench-light.png">
+</picture>
 
-## What's new in v15
+Measured over 8 assets at 50%, 20%, 5% and 1% of their triangles. The price is speed:
+farthing is 5–9× slower than meshoptimizer because it measures error much more carefully.
+That's meant for a build step, not for every frame. A fast mode gets within 2× of
+meshoptimizer's speed and still has lower distance and UV error (normals are slightly worse). Methodology and per-asset tables are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#triangle-reduction).
 
-| Area | v14 | v15 |
+## Every level comes with the distance to use it
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/switch-dark.png">
+  <img alt="FlightHelmet LOD1, LOD2 and LOD3 (a quarter, a sixteenth and a sixty-fourth of the triangles) rendered at their reported switch distances on a 1080p screen next to the original, magnified, with difference maps. 1%, 5% and 16% of pixels differ by more than 10%." src="docs/images/switch-light.png">
+</picture>
+
+farthing measures each level's worst-case deviation from the original and turns it into a
+switch distance: the point where that error is one pixel on a 1080p screen. You don't have to
+tune distances by eye. The farthest level here is a baked proxy, one new mesh with a new UV
+atlas and colour, normal and roughness/metal textures baked from the original. Most of its
+difference is the glass visor, which an opaque proxy can't reproduce.
+
+## UV atlases with fewer seams and less wasted texture
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/atlas-dark.png">
+  <img alt="DamagedHelmet unwrapped into a 1024 by 1024 atlas by farthing and by xatlas tuned for its best result, with unused texture shown in blue and a bar of each atlas's pieces pushed together. farthing: 69.7% of the texture used, 277 charts, 13.6% seams, stretch 1.0034. xatlas: 45.7%, 848 charts, 25.7%, 1.0064." src="docs/images/atlas-light.png">
+</picture>
+
+Far levels need a fresh UV atlas to bake into. Against xatlas at its best settings, with
+both packed into the same 1024² atlas, farthing makes fewer charts with shorter seams on
+all 8 benchmark assets and uses more of the texture on 7 (67% on average, against 59%).
+Stretch is a near tie: farthing is lower on 5 assets, and every result is within 1% of
+isometric ([data](docs/BENCHMARKS.md#uv-atlases)). The packer is available on its own as
+[`snugly`](https://crates.io/crates/snugly).
+
+## Impostors for the far distance
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/impostor-dark.png">
+  <img alt="An octahedral impostor atlas of DamagedHelmet (12 by 12 views), and the 15,452-triangle mesh next to its 2-triangle impostor at 160, 96 and 48 pixels on screen, magnified, with difference maps. 27.5, 28.5 and 25.1 dB." src="docs/images/impostor-light.png">
+</picture>
+
+Past a hundred pixels or so, a whole model becomes one card. farthing plans the views, your
+engine renders them with its real materials, and farthing assembles a relightable atlas sized
+for one texel per screen pixel. It ships with a reference shader that blends between views
+and marches depth for parallax.
+
+## What's in the box
+
+| | What it does | How |
 |---|---|---|
-| UV utilization vs xatlas | Ahead on 6 of 8 (Fox 0.526 vs 0.547, water bottle 0.639 vs 0.640) | **Ahead on 8 of 8**: Fox **0.634**, water bottle **0.659**, BoomBox 0.671, DamagedHelmet 0.610, Lantern 0.744 (xatlas 0.547 / 0.640 / 0.168 / 0.470 / 0.626). Charts filling under 45% of their rectangle are split where the pieces' rectangles shrink ≥ 15% (`split_sprawling`); `pack()` also tries the charts' bounding rectangles with MaxRects. Stretch unchanged, seams still shorter than xatlas on 8/8. The UV stage is 25% slower than xatlas (was 8%) |
-| `snugly` | A crate in the workspace | **Ready to release on its own (0.1.0)**: `PackError`, builder options, `#[non_exhaustive]` outputs, `pub use glam`, `parallel` (default) and `serde` features, no-rayon WASM build, golden-output test (identical with/without `parallel`, at 1 thread, on Rust 1.85 and stable), `missing_docs`, doctested README, CHANGELOG, versioning policy, CI workflow, `scripts/export-snugly.sh` (standalone repo + `cargo package`) |
-| Aggressive targets | Junction ends and branch points locked | **They collapse onto a junction neighbour**: the watch at 1% reaches 1,175 tris (was 1,937). Geomean Hausdorff 12.85% (meshoptimizer 13.04%) |
-| Fast mode | Locked junctions, deleted smallest parts by area | **Twins, junction sliding, visible-error part removal with floor and protection**: normal ratios 2.34% / 0.163% (v14 2.47% / 0.178%), aggressive 16.1% (17.2%) |
-| Layered impostors | Full-resolution second layer, manual | **Half-resolution second layer** (vase: same +1.0 dB at 1.25× memory instead of 2×), **automatic choice** by `layer_benefit` (keeps it for the vase, drops it for the knot and bush), single-layer fallback for hosts that can't peel |
-| Surfels | Disc meshes only, one radius | **Reference splat shader** (`SURFEL_SHADER`, dithered fade, G-buffer; validated with naga and matched to the disc meshes in the PoC), per-surfel radii in `lod()` and the stream, opt-in `adaptive_density` |
-| MSRV | Declared 1.80 (wrong) | **Verified**: 1.88 for the workspace (`image`), 1.85 for `snugly` (`glam`) |
-| License | MIT OR Apache-2.0 declared, MIT file only | **MIT-0** (`LICENSE-MIT0`) for every crate, the PoC and the harness |
+| **Reduction** | LODs by ratio, triangle count, error bound or screen size, with a switch distance for each level | Attribute-aware quadric edge collapse (UVs, colours, normals, skin weights, morph targets), silhouette-weighted, with batched parallel rounds. UV seams are permissive or strict. Whole parts are removed when they stop being visible. Symmetry is detected and preserved. Includes a fast mode |
+| **Quad reduction** | Lowers quad meshes and keeps them all quads | Removes edge rings, ranked by quadric error, in linear time |
+| **Proxies** | Rebuilds a messy kitbash or scene as one closed, manifold mesh | Voxelization with sub-voxel signed boundaries, leak-aware gap sealing, surface nets, then reduction |
+| **UV atlases** | Fresh atlases for proxies and far LODs | LSCM + ARAP charts with exact overlap tests, split and merge under stretch limits, packed by `snugly` |
+| **Baking** | Moves colour, normal, roughness/metal and any custom channel onto the new mesh | farthing finds where each texel comes from on the source surface, and your engine shades it. Supersampled, dilated, MikkTSpace normals. Has a two-phase API for async GPUs |
+| **Aggregation** | Merges many objects into one draw call | Material classes, island repacking by texel density, texel copy |
+| **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds. Reference WGSL included |
+| **Visibility & occluders** | Removes what can't be seen and builds occlusion geometry | Camera-sampled ID renders (alpha-aware through your engine), plus conservative self-tuning occluder meshes and boxes |
+| **Bones** | Fewer joints and influences for far LODs | Leaf-first removal by skinned error, influence limiting |
+| **I/O** | glTF/GLB (skins, morphs, embedded textures) and OBJ | Optional `io` feature |
 
-## What was new in v14
+**farthing never decides what anything looks like.** It handles geometry, UVs,
+correspondence and packing. Anything that needs real materials goes through a small
+`RenderHost` trait that your engine implements. That covers baking, impostor captures and
+alpha-aware visibility. So world-space, procedural and engine-specific materials all bake
+correctly. [`engine-poc/`](engine-poc/) is a minimal wgpu engine that proves the boundary
+with procedural materials farthing never sees.
 
-| Area | v13 | v14 |
-|---|---|---|
-| Reducer speed | One quality level (about 7× slower than meshoptimizer on small assets) | **`Quality::Fast`** (`--fast`): f32 quadrics in the unit-diagonal frame, cost-sorted passes over every edge, link and flip checks, border sliding, part deletion on stall. 8 assets × 4 ratios: **4.5 ms** vs 18.3 ms default vs 2.5 ms meshoptimizer; Hausdorff 2.47% / mean 0.178% vs meshoptimizer 2.56% / 0.304%; reaches 100% of targets |
-| Aggressive targets (1%, 0.3%, 0.1%, 11 assets incl. 3 large) | Geomean Hausdorff 17.7%; ABeautifulGame at 0.1%: 28% (overshot to 792 of 1,499 tris); ChronographWatch at 1%: 58.7% | **12.9%** (meshoptimizer 13.0%), mean 1.96% (2.14%), UV p90 0.46 (0.57), normals 47.5° (53.2°). ABeautifulGame **3.0%** at 1,498 tris; watch **16.0%**. See below |
-| Part removal | Distance to same-facing surface; could overshoot the target | **Respects the target** (a floor), **counts only visible surface** (rays from each sample must escape the other parts; `transparent_materials` lets glass through), small parts capped at gap + own size, **visible-part protection** on stall (`part_protection`, 5% of the diagonal) |
-| Topology locks | Every non-manifold edge locked both ends | **Junction vertices slide** along junction curves like border vertices; **duplicated (double-sided) faces count once**, so twin patches reduce and their open edges act as borders; many-wedge vertices become collapse sources once collapses stall |
-| `snugly` rectangles | Skyline only: 0.926 / 0.920 / 0.901 / 0.885 / 0.955 on five sets (crunch ahead on three) | **MaxRects, 5 rules × 5 orders × rotation in parallel + skyline, best kept, deterministic**: **0.981 / 0.980 / 0.965 / 0.921 / 0.978**, highest on all five (crunch 0.962 / 0.966 / 0.899 / 0.873 / 0.974; rectangle-pack, guillotiere, etagere lower). `pack_rects_strip` for lowest atlas height |
-| `snugly` shapes | Holes inside a shape invisible | **`nest_in_holes`**: shapes can go inside other shapes' holes (off by default: UV charts' sliver holes only fragment free space). Crate README, `pack_shapes` example, `bench-compare pack` |
-| Impostors | One height layer per frame | **`build_layered_impostor`**: a depth-peeled second layer (nearest front face behind the first) through the new `RenderHost::render_views_behind`; the reference shader marches both. Concave vase: **+1.0 dB far, −30% silhouette error**, better than spending the memory on larger frames; no gain on the knot or foliage |
-| Surfels | Prototype | **Progressive order** (every prefix is an even covering: one cloud for all LODs, 0.1–0.3 dB below dedicated clouds, **7× less change per LOD step**), `lod(k)` fades, `count_for_screen`, **LFSF stream**: 10 bytes per surfel (+ host channels), any prefix decodes |
-| Remesh (dragon) | Worst case unexplained after v12 | Diagnosed: unreduced proxy at resolution 512 is within 0.31%; the 3,000-triangle reduction adds the error (backdrop corners). Adaptive contouring wouldn't help, so it wasn't built. `RemeshOptions.simplify` exposes the final reduction's options (`error_normalization: 0.5`: 1.38% → 1.24%) |
+## Try it
 
-## What was new in v13
+**In the browser.** [`demo-web/`](demo-web/) runs the whole pipeline in WebAssembly. Drop a
+glTF, watch the LOD chain build and bake, and fly out to see the levels switch. Nothing is
+uploaded.
 
-| Area | v12 | v13 |
-|---|---|---|
-| `unsafe` | Two AVX2 kernels and a thread-local scratch reference | **None in any crate**, enforced by `#![forbid(unsafe_code)]`. The AVX2 builds measured no faster than the plain code (reducer 5.39 vs 5.38 s, UV 2.51 vs 2.44 s) and were deleted; per-thread scratch now uses the `thread_local` crate. Output unchanged |
-| Atlas packer | Module inside `farthing::uv` | **`snugly` crate** with no mesh dependencies: `pack(shapes, PackOptions)` for irregular shapes (from triangles, raster masks or rectangles; rotations on/off; height cap; hole filling auto/always/never) and `pack_rects` for rectangles. `farthing::uv::pack` re-exports it |
-| Hole-filling packer speed | Exact check of every refined position | **Branch and bound** on the cheap lower bound, same placements: Fox 147 → 112 ms, Duck 325 → 282 ms, water bottle 186 → 167 ms (1 thread) |
-| Scaling on your hardware | Projections from a 2-core box | **`scripts/scaling.sh [ASSET_DIR]`**: every workload at 1, 2, 4, … threads, output hashes checked against 1 thread, speedups, parallel share, and the thread count from which parallel commits pay off (`FARTHING_PAR_COMMIT_THREADS`) |
-| Single-thread reducer | — | Profiled (see limitations); a single-wedge fast path in wedge mapping saves 2% of instructions, output unchanged |
-
-## What was new in v12
-
-| Area | v11 | v12 |
-|---|---|---|
-| Voxel proxy accuracy | Every cell the surface touches is solid: the shell sits up to a cell outside the source, slots narrower than a cell fill up | **Sub-voxel signed boundary** (`subvoxel`, on by default). Boundary cells take the sign of the signed distance at their centre: angle-weighted pseudo-normals, confirmed by ray winding numbers (robust to nested pieces and holes). Guards keep sheets thinner than a cell and lone open sheets. Matched-count Hausdorff / mean %: Duck 0.942 / 0.0190 → **0.447** / 0.0208, Fox 0.760 / 0.0156 → **0.451 / 0.0152**, BoomBox 2.314 / 0.0284 → 2.297 / **0.0239**, dragon 1.480 / 0.0436 → 1.391 / 0.0430, DamagedHelmet 3.509 / 0.1759 → **3.162 / 0.1706** |
-| vs baby_shark | Ahead on mean error on 3 of 6 assets; behind on worst case on Duck, BoomBox, dragon | **Ahead on both metrics on Duck and Fox**, on mean error on BoomBox (worst case within 3%), even on the Lantern; still behind on the dragon (whose baby_shark proxies have 6–10% open edges). Still closed and manifold everywhere, 2–6× faster |
-| Reducer commits | Serial (about 12% of runtime) | **Deterministic reservations without `unsafe`**: `AtomicU32::fetch_min` claims over a 256-candidate prefix, plans in parallel from a shared borrow, writes in list order. Bit-identical to the serial loop (tests and 18-run hash sweeps at 1/2/8 threads). On by default from 8 threads, where it is projected to pay off |
-
-## What was new in v11
-
-| Area | v10 | v11 |
-|---|---|---|
-| Multi-core scaling | Reducer about 84% parallel; quad reduction nearly serial (1.10× on 2 threads) | **Reducer about 88% parallel (1.79× on 2 threads)**. Parallel stages: quadric setup (a gather in triangle order, so the sums are unchanged), silhouette weights, candidate lists, orphan remap, BVH build (same tree for any thread count) and speculative evaluation of each round's candidates. Projected 4.4× on 8 cores |
-| Determinism | Checked by benchmark hashes | **Tests run the reducer, quad reduction, UV atlas and BVH build in a 1-thread and a 4-thread pool and require identical output**; the multi-core changes all kept the v10 output hashes (only the new packer changes output, on purpose) |
-| Quad reduction | Quadratic ring finding: 240k quads in 8.8 s | **Linear:** edges numbered without a global sort, rings from union-find classes and walked in parallel, array-based validity checks. 240k quads in 2.4 s on 1 thread and 2.0 s on 2, with the same output |
-| UV packing, few large charts | Skyline only: water bottle 0.617, Fox 0.500, Duck 0.650 utilization | **Also a hole-filling packer** (free intervals per column, so charts nest under each other's overhangs), run alongside the skyline when there are at most 32 charts: **0.639 / 0.526 / 0.677** (xatlas 0.640 / 0.547 / 0.575). Costs time on those assets; `fill_holes: false` turns it off |
-| Voxel proxies | Dragon worst case unexplained | Diagnosed: 99% of source samples more than half a cell from the proxy are *buried*, inside slots narrower than a cell that conservative voxelization fills. A guarded crevice-carving pass was tried and reverted (see limitations) |
-
-## What was new in v10
-
-| Area | v9 | v10 |
-|---|---|---|
-| Octahedral impostors | Fixed-point parallax (gaps at occlusion boundaries), aliased captures | **Relief-marched parallax with a shell height field, 2× supersampled captures, G-buffer outputs**: close 18.3 → 21.8 dB, far 21.2 → 23.2 dB, silhouette error halved close up |
-| Impostor frame size | Chosen by hand | `frame_size_for_screen`: one texel per screen pixel at the switch distance |
-| Surfels vs impostors | — | Relit comparison on the bush: surfels match an impostor's quality with about 4× less memory and a better silhouette |
-| Quad reduction | One ring per rebuild: 21.6k quads in 1.9 s, quadratic | **Batched passes of non-interacting rings**: 21.6k quads in 0.4 s, 240k in 8.8 s, equal or lower error above 1k quads |
-| Voxel proxies at equal time | — | At resolution 192 in baby_shark's time (res 128): 12–56% lower mean error, all closed |
-
-## What was new in v9
-
-| Area | v8 | v9 |
-|---|---|---|
-| Relightable distant LODs | — | **Surfel proxies** (`farthing::impostor::surfels`): blue-noise oriented discs with normals and source barycentrics, optionally visibility-weighted. On a 3000-leaf bush under four moving lights: +1.7 to +2.9 dB over the triangle LOD at equal budget, level with or ahead of the voxel proxy from 1500 primitives up, and they keep the leafy look. See BENCHMARKS, "Surfel proxies" |
-| Proxy gap sealing | All-or-nothing closing when the flood leaks | **Per pocket**: only cavities behind leaks are sealed; crevices stay open (DamagedHelmet proxy mean error −7%) |
-| Silhouette weight | — | Face quadrics scaled by the expected silhouette fraction of their edges (dihedral angle / π), weight 0.5: Hausdorff −3%, UV −3%, image space vs meshoptimizer +1.41 → +1.51 dB |
-| Patents | — | A patent shame list (below): what farthing avoids, who owns it, and how it stays clear |
-
-## What was new in v8
-
-| Area | v7 | v8 |
-|---|---|---|
-| Triangle targets reached (8 assets × 4 ratios) | 97% | **100%** |
-| Multi-part assets | Collapses cannot remove parts: small parts hold their minimum, the main body is crushed, aggressive targets stall | **Part removal** (`remove_parts`, default): parts are deleted once that moves the surface (to same-facing geometry) less than a quarter of the accepted deviation, or cheapest-first when collapses stall |
-| Reduction quality, geometric mean (8 assets × 4 ratios) | Hausdorff 2.49%, mean 0.220% | **2.26%, 0.190%** (2.19% / 0.188% with v9's silhouette weight) |
-| Lantern at 1% | 148 tris, 76.8% Hausdorff | **52 tris, 9.6%** |
-| UV atlas time (8 assets) vs xatlas | 1.5 s vs 1.26 s | **1.14 s vs 1.28 s** (outlines from triangle edges instead of pixel masks; linear-time sparse structure; small-key hashing; output bit-identical except one packing order) |
-| Research | — | Five reports on ideas from physics, biology, perception, optimization and HPC, in `docs/research/` |
-
-## What was new in v7
-
-| Area | v6 | v7 |
-|---|---|---|
-| Image-space check vs meshoptimizer (6 assets × 25%/10% × attr/permissive, same triangle count, real textures) | — | **21/24 better, +1.41 dB** mean PSNR; 12/12 vs attribute-aware |
-| Remesh: gap sealing | Always closes 1-cell gaps (also fills real crevices) | **`adaptive_gaps`**: closes only when the unsealed flood leaks inside |
-| Remesh: topology | Surface nets could emit non-manifold edges; deleting degenerate faces after projection opened holes | **Manifold solid** before extraction, **fold-safe projection** (revert instead of delete), coincident snaps backed off instead of welded, surface-nets border fix. Closed on every test asset |
-| Remesh accuracy (mean error, 5 assets, 3k tris) | 0.017 / 0.021 / 0.039 / 0.107 / 0.089 % | **0.015 / 0.015 / 0.025 / 0.092 / 0.039 %** |
-| Batched reducer | A candidate validated rounds earlier could skip re-validation after its target's neighbourhood changed: rarely, one non-manifold edge | **Validity tracked per round**; regression test on random kitbash proxies |
-
-## What was new in v6
-
-| Area | v5 | v6 |
-|---|---|---|
-| UV vs xatlas (8 assets × charts/stretch/util/seams) | stretch 8/8, util 4/8, seams 5/8, charts 5/8 | **stretch 8/8, util 6/8, seams 8/8, charts 8/8** |
-| UV time (8 assets) | 4.2 s | **1.5 s** |
-| Overlap test | 256² hash-grid rasterization (approximate) | **Exact, linear-time**: folds, vertex angle sums, boundary self-intersection |
-| Chart solves | Conjugate gradients every ARAP iteration | **Envelope Cholesky** (RCM order) factored once per chart for ARAP and LSCM |
-| Chart layout | Split-only | **+ merging** (stretch ≤ 1.005, packability guard), minimum-area-rectangle alignment |
-| Packer | Scalar placement test | **Branch-free**: AVX2 `i32` resting height, prefix-sum waste, partial selection (bit-identical) |
-
-## What was new in v5
-
-| Area | v4 | v5 |
-|---|---|---|
-| Collapse order | Exact greedy (priority queue) | **Batched rounds** (`collapse_order`, default): parallel ranking, cost-ordered execution of non-conflicting collapses, re-evaluation only where a round touched the neighbourhood. Quality equal or better than greedy on every metric |
-| Thread scaling, 1 → 2 threads | 1.41× | **1.73×** (≈ 84% parallel; ≈ 3.8× projected on 8 cores) |
-| Large meshes (6 cases) | 1.37 s clustered, 13% worse worst-case distance than single-pass | **1.13 s** at single-pass quality |
-| Targets reached (8 assets × 4 ratios) | 94% | **97%** |
-
-## What was new in v4
-
-| Area | v3 | v4 |
-|---|---|---|
-| Large meshes (≥ 120k tris) | One sequential pass | **Cluster-parallel**: 32k-tri Morton clusters reduced concurrently with locked borders, then one exact border pass. 262k-tri sphere 2.5 s → 1.15 s on 2 cores. `cluster_threshold = 0` for exact |
-| Reducer data layout | `Vec` of triangles per vertex, wedge→position lookups per corner | **Arena adjacency**, position ids stored per triangle, eager dead-triangle removal (bit-identical output) |
-| Cost kernels | Scalar quadric evaluation | **Padded 12-wide dot products** over precomputed monomials, AVX2 build picked at runtime, fixed association order (identical results on every ISA) |
-| Initial ranking | Sequential | **Parallel**, per-thread scratch, identical output on any thread count |
-| Benchmarks | 4–15k-tri assets | + **135k–1.5M-tri** assets (DragonAttenuation, CarConcept, ABeautifulGame) |
-
-## What was new in v3
-
-| Area | v2 | v3 |
-|---|---|---|
-| Error ranking | Mean-normalized quadric (dilutes as a vertex absorbs area) | **Area-weighted** (`error_normalization = 0`): 2× lower mean and UV error |
-| Open borders | Constraint planes added to the normalization weight (border collapses looked ~10× cheaper) | **Weightless constraint planes** |
-| Normals | Off (fought geometry) | **On, scaled by region size** (weight 5e-5, chosen in image space) |
-| Seams | Strict by default | **Permissive by default** (reaches 94% of targets vs 62% for strict meshoptimizer); `--strict-seams` keeps UV islands exact |
-| Skinned meshes | Skin weight 1.0 made rigs nearly irreducible | **Calibrated** (0.003): 2× lower joint-weight error than meshoptimizer |
-| Reducer speed | 127k tris/s (262k → 10%) | **198k tris/s**: incremental neighbour re-rank, lazy survivor re-rank, sort-based setup, per-vertex border lists |
-| Image quality (real assets, 25%) | — | **+0.9 to +3.1 dB PSNR** over v2-like settings on all 6 textured assets |
-| UV stretch | LSCM, chart scale uncorrected | **Area-normalized LSCM + ARAP**; overlapping/stretched charts split and re-flattened |
-| UV packing | Bounding-box skyline | **Shape-aware**: rasterized chart outlines, 4 rotations, per-column skyline (helmet: 0.33 → 0.48 utilization) |
-| Determinism | UV charts depended on HashMap order | **Bit-identical output** run to run (reduction and UV are tested) |
-
-## What was new in v2
-
-| Area | v1 | v2 |
-|---|---|---|
-| Reduction speed (262k-tri mesh → 10%) | 28k input tris/s | 127k tris/s: indexed heap, lazy validation, corner caching |
-| Attribute error | Deviation at the removed vertex (not accumulated) | Accumulated attribute quadrics per wedge (Hoppe-style, compact form) |
-| Symmetry | — | Mirror-plane detection + mirrored collapses (`--symmetry`) |
-| Quads | — | Quad reduction by edge-ring removal, quad OBJ I/O, triangle→quad pairing |
-| UV charts | Planar only | LSCM (pure-Rust CG solver) with overlap checks and planar fallback |
-| Impostors | Virtual-plane reprojection | + depth parallax from a height channel |
-| Integration | `RenderHost` only | + two-phase bake API (`prepare_bake` / `finish_bake`) |
-
-## Capabilities
-
-| Capability | Module | Implementation |
-|---|---|---|
-| Data model, BVH, host boundary, metrics | `farthing` (root) | Wedge meshes, quad meshes, scenes, skeletons, opaque material handles; binned-SAH BVH; `RenderHost`; surface distance; image diff |
-| I/O (feature `io`, default) | `farthing::io` | glTF/GLB import + export (skins, morphs, embedded textures), OBJ, quad OBJ |
-| Triangle reduction | `farthing::reduce` | QEM half-edge collapse ranked by area-weighted error; cluster-parallel for large meshes; a fast f32 mode; wedge-mapped seams (permissive by default, strict on request); weightless border planes; attribute quadrics (UVs, colors, area-scaled normals) + skin/morph deviation; importance; locks; symmetry; ratio / count / max-error / screen-size targets; part removal by visible error with protection; junction sliding; LOD chains; geomorph and source-vertex maps; parallel scene reduction; deterministic |
-| Quad reduction | `farthing::reduce` | Edge-ring (quad strip) removal ranked by rung quadric error, border constraints, flip/manifold checks |
-| Repair + GPU ordering | `farthing::reduce` | Weld, degenerate/duplicate/small-part removal, `geometry_only`; Forsyth vertex cache, ACMR |
-| Parameterization | `farthing::uv` | LSCM + ARAP charts with once-factored envelope Cholesky (normal-cone growth, split on overlap/stretch, merge under stretch and packability limits), exact overlap test, min-area-rectangle alignment, planar fallback, L2 stretch metric, packing with `snugly`; deterministic |
-| Atlas packing | `snugly` (dependency) | Rectangles (MaxRects variants + skyline, fixed atlas or lowest strip) and irregular shapes (outline skyline + hole-filling packer, quarter turns, nesting in holes); padding; deterministic |
-| Material casting | `farthing::bake` | Correspondence by ray cast, point-evaluation and flattened modes, two-phase API, MikkTSpace normals, supersampling, dilation, displacement |
-| Aggregation | `farthing::aggregate` | Merge, per-class slots, island repack by texel density, texel copy, tangent-normal fix-up |
-| Remeshing / occluders | `farthing::voxel` | Voxelize, flood fill, gap closing, clip planes, surface nets, projection; conservative self-tuning occluders; box occluders |
-| Visibility | `farthing::visibility` | Sphere / hemisphere / point cameras, host ID renders, culling, importance weights |
-| Impostors | `farthing::impostor` | Octahedral / hemi-octahedral / flipbook / single view, optionally two depth layers; billboard clouds; height channel; reference WGSL with reprojection + relief parallax; progressive surfel clouds with a streaming format |
-| Bones | `farthing::bones` | Influence limiting; leaf-first removal by skinned error; locks; remap or compact |
-| CLI | `farthing-cli` crate | `info reduce lods quad-reduce remesh occluder visibility uv aggregate bones impostor-plan billboard optimize compare shader` |
-| PoC engine | `engine-poc/` | Headless wgpu `RenderHost` with procedural materials; renders and scores every processor |
-
-All Rust crates are pure Rust: `glam`, `gltf`, `tobj`, `image`, `mikktspace` (glam backend),
-`rayon`, `serde`, `thiserror`; the CLI adds `clap`/`anyhow`, the PoC `wgpu`.
-
-## Quick start
+**From the command line:**
 
 ```sh
-cargo test --workspace                                   # 107 tests
-cargo run --release -p farthing --example bench_assets -- model.glb   # timing + output hashes
-cargo build --release -p farthing-cli
+cargo install --path crates/farthing-cli
 
-farthing reduce model.glb -o lod.glb --ratio 0.25 --symmetry
-farthing reduce model.glb -o lod.glb --ratio 0.25 --strict-seams    # keep UV island borders exact
-farthing reduce model.glb -o far.glb --ratio 0.05 --ignore-seams    # far LOD, re-bake after
-farthing lods model.glb -o lods/ --levels 4 --far-from 3
-farthing quad-reduce character.obj -o character_lod.obj --ratio 0.25
-farthing uv far.glb -o far_uv.glb                        # LSCM + ARAP (add --planar for planar)
-farthing remesh scene.glb -o proxy.glb --resolution 128 --triangles 3000 --clip-below 0
+farthing lods model.glb -o lods/ --levels 4 --far-from 3   # LOD chain, far levels baked
+farthing reduce model.glb -o lod.glb --ratio 0.25           # one level
+farthing reduce model.glb -o lod.glb --ratio 0.25 --strict-seams --symmetry
+farthing remesh scene.glb -o proxy.glb --resolution 128 --triangles 3000
+farthing uv far.glb -o far_uv.glb
 farthing occluder scene.glb -o occ.glb --triangles 300 --boxes 8
-farthing visibility scene.glb -o culled.glb --hemisphere
 farthing bones character.glb -o char_lod.glb --ratio 0.5 --influences 2
-
-# End-to-end proof (GPU or a software Vulkan driver such as lavapipe)
-cd engine-poc && cargo run --release -- [optional.glb] --out poc-out
-
-# Head-to-head benchmark (separate workspace; links meshoptimizer, needs a C++ compiler;
-# add --features xatlas for the xatlas UV baseline, which also needs libclang)
-cd bench-compare && cargo run --release -- reduce <assets...> && python3 pairwise.py results-reduce.json
+farthing quad-reduce character.obj -o character_lod.obj --ratio 0.25
 ```
 
-## Results
-
-### PoC engine (lavapipe, 2 CPU cores, full run in about 21 s)
-
-Image scores compare lit 512² renders against the original from three views. Full data:
-[docs/poc/report.json](docs/poc/report.json).
-
-| Stage | Triangles | v2 PSNR | **v5 PSNR** | v5 silhouette mismatch |
-|---|---|---|---|---|
-| Near LOD (25%) | 11,714 | 29.9 dB | 29.7 dB | 0.07% |
-| Far LOD (geometry-only 5% + re-bake) | 2,354 | 24.7 dB | **25.0 dB** | 0.33% |
-| Remeshed proxy (bake uses the new UV atlas) | 3,000 | 24.1 dB | **25.1 dB** | 0.30% |
-| Aggregate (3 draw calls → 1) | 46,860 | 34.2 dB | 34.2 dB | — |
-| Octahedral impostor, far view | 2 | 21.2 dB | 21.2 dB | 0.99% |
-| Octahedral impostor, close view | 2 | 18.3 dB | 18.3 dB | 1.5% |
-
-The synthetic scene's normals are exactly geometric, so the new normal term only costs it a
-little geometry (−0.2 dB on the near LOD). On real assets, whose normals are baked or smoothed,
-the same defaults gain 0.9–3.1 dB (table below).
-
-Visibility from 48 hemisphere cameras saw 0 of the hidden cube's 12 triangles. The occluder has
-300 triangles with no samples outside the solid. The checker's hard edges make PSNR harsh.
-
-![Impostor vs reference](docs/poc/impostor_vs_reference.png)
-
-*Far view: reference (left) and the 2-triangle octahedral impostor (right), rendered with the
-reference shader's reprojection + parallax.*
-
-### Real assets (Khronos glTF samples + meshoptimizer's pirate, not bundled)
-
-Full methodology and per-asset tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-
-**Reduction, matched triangle counts** (farthing ÷ other; below 1 means farthing is better;
-8 assets × 50/20/5/1%):
-
-| vs | Hausdorff | mean | UV p90 | normal | time |
-|---|---|---|---|---|---|
-| meshoptimizer, attribute-aware | **0.76×** | **0.42×** | **0.27×** | **0.89×** | 4.7× slower |
-| meshoptimizer, attribute-aware + permissive | **0.89×** | **0.62×** | **0.36×** | 1.01× | 4.1× slower |
-| meshoptimizer, positions only | 1.27× | **0.63×** | **0.29×** | **0.40×** | 7.6× slower |
-
-**Image space, 25% LOD with real textures (PoC engine):**
-
-| asset | v2-like defaults | **v3** |
-|---|---|---|
-| DamagedHelmet | 20.2 dB | **23.2 dB** |
-| WaterBottle | 34.3 dB | **37.2 dB** |
-| Avocado | 31.6 dB | **33.9 dB** |
-| BoomBox | 26.3 dB | **27.9 dB** |
-| Duck | 26.1 dB | **27.4 dB** |
-| Lantern | 26.3 dB | **27.2 dB** |
-
-**UV atlas vs xatlas** (8 assets): lower L2 stretch, shorter seams and fewer charts on 8/8,
-better utilization on 6/8. DamagedHelmet: 245 vs 847 charts, stretch 1.0034 vs 1.0058,
-utilization 0.562 vs 0.470, seams 13.3% vs 25.8%.
-
-| Other | Result |
-|---|---|
-| Fox (skinned) symmetry detection | X mirror plane found |
-| Fox bone reduction 50% | 24 → 12 joints |
-| Generated quad torus 25% | 1,152 → 286 quads, all quads, 1.2% Hausdorff |
-
-## Integrating
-
-farthing is middleware: one Rust crate with no engine dependency. The data model sits at the
-crate root (`farthing::Mesh`, `farthing::Scene`, `farthing::host::RenderHost`) and each
-processor is a module (`farthing::reduce`, `farthing::uv`, `farthing::bake`, ...).
+**As a library:**
 
 ```toml
 [dependencies]
 farthing = "0.15"                                            # with glTF/OBJ I/O
-# farthing = { version = "0.15", default-features = false }  # geometry only, no file formats
+# farthing = { version = "0.15", default-features = false }  # geometry only
 ```
 
-A host integrates at whichever level suits it.
-
-| Level | How | Use when |
+| Integration level | How | Use when |
 |---|---|---|
-| Library, geometry only | Call `simplify`, `remesh`, `occluder`, `parameterize`, etc. on `Mesh`/`Scene` values | Offline tools, build steps, anything with no material needs |
-| Library + `RenderHost` | Implement the five-method trait (see `engine-poc/src/engine.rs`) | Baking, impostors, alpha-aware visibility with the engine's real materials |
-| Two-phase bake | `prepare_bake` → shade `request.samples` on the GPU (any thread, any timing) → `finish_bake` | Engines that render asynchronously or batch GPU work |
-| Files + CLI | glTF/OBJ in, glTF/OBJ + JSON reports out | Asset pipelines, CI, language-agnostic tooling |
+| Geometry only | Call `simplify`, `remesh`, `occluder`, `parameterize` and others on `Mesh`/`Scene` values | Offline tools and build steps with no material needs |
+| `RenderHost` | Implement the five-method trait (example: [`engine-poc/src/engine.rs`](engine-poc/src/engine.rs)) | Baking, impostors and visibility with your engine's real materials |
+| Two-phase bake | `prepare_bake` → shade the samples on your GPU, any thread, any timing → `finish_bake` | Engines that render asynchronously or batch GPU work |
+| Files + CLI | glTF/OBJ in, glTF/OBJ and JSON reports out | Asset pipelines, CI, non-Rust tooling |
 
-The material boundary is the same at every level. farthing says *where* each texel comes from
-on the source surface, and the host says *what it looks like*. So world-space, procedural and
-engine-specific materials all bake correctly.
+## Using the library
+
+farthing is a set of functions over two data types. Each function takes plain data, returns
+plain data and keeps no global state, so you can call them in any order, from any thread. This
+section goes through them in roughly the order an asset pipeline uses them. Every snippet runs
+inside a function that returns `farthing::Result<()>`.
+
+### Meshes and scenes
+
+A `Mesh` is an indexed triangle list. Its vertices are *wedges*: one vertex per unique set of
+attributes, so a UV seam is two vertices at the same position. GPUs use the same layout, so
+you can build a mesh straight from your vertex buffers:
+
+```rust
+use farthing::Mesh;
+
+let mut mesh = Mesh::new(positions, indices);       // Vec<Vec3>, Vec<u32>
+mesh.normals = Some(normals);                       // all optional: normals, tangents,
+mesh.uvs = vec![uv0];                               // any number of UV sets, colours,
+mesh.material_ids = vec![0; mesh.triangle_count()]; // skin weights, morph targets
+mesh.validate()?;
+```
+
+A `Scene` holds meshes, instances with world transforms, skeletons and material *slots*. A
+slot is just a name and an id. farthing never knows what a material looks like. The `io`
+feature reads and writes glTF, GLB and OBJ:
+
+```rust
+let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf or .obj
+let (scene, materials) = farthing::io::load_gltf("model.glb")?; // plus the decoded glTF materials
+let (scene, materials) = farthing::io::load_gltf_with(&bytes, |uri| files.get(uri).cloned())?; // no file system
+let scene = farthing::Scene::from_mesh(mesh);                   // one mesh at the origin
+```
+
+### Reduction
+
+`simplify` reduces one mesh. The result includes the largest deviation it introduced, in
+world units:
+
+```rust
+use farthing::reduce::{simplify, SimplifyOptions};
+
+let r = simplify(&mesh, &SimplifyOptions::ratio(0.25))?;
+println!("{} triangles, error {}", r.mesh.triangle_count(), r.error);
+```
+
+There are three ways to set a target: a share of the triangles (`target_ratio`), a count
+(`target_triangles`) or an error bound (`max_error`). With more than one target, `stop` decides
+whether reduction ends at the first one met (`StopWhen::Any`) or the last (`StopWhen::All`).
+For an object that is never larger than a known size on screen, convert pixels to an error
+bound:
+
+```rust
+use farthing::reduce::{screen_size_to_max_error, SimplifyOptions};
+
+// 300 px across on screen, allowed to be off by half a pixel.
+let max_error = screen_size_to_max_error(mesh.bounds().diagonal(), 300.0, 0.5);
+let opts = SimplifyOptions { max_error: Some(max_error), ..Default::default() };
+```
+
+The defaults are what scored best in the benchmarks. These are the options you're most
+likely to change:
+
+```rust
+use farthing::reduce::{Quality, SeamMode, SimplifyOptions, Symmetry};
+
+let opts = SimplifyOptions {
+    target_ratio: Some(0.1),
+    seams: SeamMode::Strict,   // UV islands keep their exact outlines (may stop short of the target)
+    symmetry: Symmetry::Auto,  // find a mirror plane and keep both halves identical
+    lock_border: true,         // open edges stay put, so tiles and modular pieces still line up
+    error_normalization: 1.0,  // classic QEM: protects small features, costs overall fidelity
+    quality: Quality::Fast,    // several times faster; skips symmetry and part removal
+    ..Default::default()
+};
+```
+
+A few more options:
+
+- `vertex_importance` scales the cost of collapsing each vertex.
+- `locked_vertices` pins vertices in place.
+- `transparent_materials` lists glass and visors, so parts behind them still count as visible.
+
+The result also maps vertices both ways:
+
+- `vertex_remap` gives, for each input vertex, the output vertex it collapsed into. Use it to
+  geomorph between levels.
+- `source_vertex` gives, for each output vertex, the input vertex it copies. Use it to carry
+  your own vertex data across.
+
+`simplify_scene` reduces every mesh of a scene in parallel.
+
+### LOD chains and switch distances
+
+`lod_chain` reduces each level from the one before and adds up the errors, so every level
+reports how far it is from the original:
+
+```rust
+use farthing::reduce::{lod_chain, SimplifyOptions};
+
+let levels = lod_chain(&mesh, &[0.25, 0.0625, 0.015625], &SimplifyOptions::default())?;
+let (screen_height, fov_y) = (1080.0, 60f32.to_radians());
+for (i, level) in levels.iter().enumerate() {
+    // The distance at which this level's error covers one pixel: switch to it from there out.
+    let switch = level.error * screen_height / (2.0 * (fov_y / 2.0).tan());
+    println!("LOD{i}: {} triangles, from {switch:.1} m", level.triangles);
+}
+```
+
+Errors are in the mesh's own units. For an instance drawn at a scale, multiply by the scale.
+
+### New UVs for far levels
+
+Far away, an original's UV layout wastes texture: every material keeps its own islands, and
+the seams between them keep the reducer from simplifying further. Drop the attributes, reduce
+the bare geometry, and give it one fresh atlas:
+
+```rust
+use farthing::reduce::{repair, simplify, SimplifyOptions};
+use farthing::uv::{parameterize, ParamOptions};
+
+let (flat, _) = scene.flatten();               // every instance in world space
+let mut far = repair::geometry_only(&flat);    // positions only: no seams to hold it back
+far.material_ids.iter_mut().for_each(|m| *m = 0);
+let opts = SimplifyOptions { target_triangles: Some(500), ..Default::default() };
+let mut far = simplify(&far, &opts)?.mesh;
+far.compute_normals(60.0);                     // hard edges above 60°
+
+let uv = parameterize(&far, &ParamOptions { atlas_size: 512, padding: 2, ..Default::default() })?;
+println!("{} charts, {:.0}% of the atlas used", uv.charts, uv.utilization * 100.0);
+```
+
+`parameterize` returns the mesh split along chart boundaries, with the new UVs in set 0. Every
+chart gets the same texel density. Set `texels_per_unit` to choose that density yourself.
+`ParamOptions::planar()` is a faster unwrap for boxy shapes.
+
+### Baking through your engine
+
+The new mesh needs textures made from the original's materials. farthing works out where each
+texel comes from on the source surface, and your engine decides what that point looks like,
+through the `RenderHost` trait:
+
+```rust
+use farthing::glam::Vec4;
+use farthing::host::*;
+use farthing::image::Image;
+use farthing::MaterialId;
+
+struct MyEngine { /* your materials */ }
+
+impl RenderHost for MyEngine {
+    fn material_info(&self, _material: MaterialId) -> MaterialInfo {
+        MaterialInfo::default() // opaque, one-sided
+    }
+    fn bake_surface(&mut self, req: &SurfaceBakeRequest) -> farthing::Result<ChannelImages> {
+        // One optional sample per texel: the source surface's world position, normal,
+        // tangent, both UV sets and vertex colour at that texel, and its material.
+        let mut color = Image::new(req.width, req.height, Vec4::ZERO);
+        for (i, s) in req.samples.iter().enumerate() {
+            if let Some(s) = s {
+                color.pixels[i] = self.shade(s.material, s.uv[0], s.position);
+            }
+        }
+        let mut out = ChannelImages::new();
+        let image = ChannelImage { image: color, encoding: ChannelEncoding::Color };
+        out.insert(channels::BASE_COLOR.into(), image);
+        Ok(out)
+    }
+    fn render_views(&mut self, _req: &ViewRenderRequest) -> farthing::Result<Vec<ViewImages>> {
+        todo!("only impostors need this")
+    }
+    fn create_material(&mut self, _desc: &BakedMaterialDesc) -> farthing::Result<MaterialId> {
+        todo!("only needed when you ask farthing to make the material")
+    }
+}
+```
+
+Your engine shades points instead of handing over textures. That's why world-space,
+triplanar and procedural materials bake correctly. `GeometryOnlyHost` is a host with no
+materials. It is enough for reduction, proxies, occluders, bones and visibility. With a host
+in hand, bake:
+
+```rust
+use farthing::bake::{bake_with_host, compute_tangents, BakeOptions};
+use farthing::glam::Mat4;
+use farthing::host::channels;
+
+let mut far = uv.mesh;
+compute_tangents(&mut far, 0)?;                // MikkTSpace, for the baked normal map
+let opts = BakeOptions {
+    width: 512,
+    height: 512,
+    channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into(), channels::ORM.into()],
+    ..Default::default()
+};
+let baked = bake_with_host(&mut engine, &far, Mat4::IDENTITY, &scene, &opts)?;
+let color = &baked.textures[channels::BASE_COLOR].image;
+```
+
+A few things the bake handles for you:
+
+- **Normals.** Return them as `ChannelEncoding::NormalWorld` and farthing converts them to
+  the new mesh's tangent space.
+- **Quality.** Each texel is supersampled (2×2 by default), and the edges are dilated into
+  the gutters.
+- **Re-baking.** `baked.correspondence` keeps the traced map from texels to the source
+  surface, so you can bake more channels later without tracing again.
+- **Textures you already have.** If your materials are already flat images in the source
+  UVs, `bake_flattened` copies texels and needs no host at all.
+
+If your engine shades on a GPU queue, on another thread or across an FFI boundary, split the
+bake in two:
+
+```rust
+use farthing::bake::{finish_bake, prepare_bake};
+
+let prepared = prepare_bake(&far, Mat4::IDENTITY, &scene, &opts)?;
+let shaded = gpu.shade(&prepared.request).await; // ChannelImages; any time, any thread
+let baked = finish_bake(prepared, shaded)?;
+```
+
+### Proxies and occluders
+
+`remesh` turns a whole scene into one closed, manifold mesh. It works on kitbashes, piles of
+intersecting parts and buildings with interiors you'll never see, and gives a clean stand-in
+for the far distance. Unwrap and bake it as above.
+
+```rust
+use farthing::voxel::{remesh, RemeshOptions};
+
+let proxy = remesh(&scene, &RemeshOptions {
+    resolution: 128,              // voxels along the longest side
+    close_gaps: 2,                // seal leaks up to two voxels wide
+    target_triangles: Some(3000),
+    ..Default::default()
+})?;
+```
+
+`occluder` builds a low-poly mesh that stays inside the original, for occlusion culling.
+`box_occluders` returns a few boxes instead:
+
+```rust
+use farthing::voxel::{box_occluders, occluder, OccluderOptions};
+
+let occ = occluder(&scene, &OccluderOptions { target_triangles: 300, ..Default::default() })?;
+let boxes = box_occluders(&scene, 64, 8)?;    // up to 8 boxes from a 64-voxel grid
+```
+
+### Impostors
+
+Once a model is a few dozen pixels on screen, a camera-facing card showing a picture of it
+costs less than any mesh. Give farthing the size on screen where the impostor takes over. It
+plans the cameras, has your engine render them, and packs the atlas:
+
+```rust
+use farthing::impostor::{build_impostor, frame_size_for_screen, ImpostorKind};
+
+let frame = frame_size_for_screen(96.0);       // 96 px across when the impostor takes over
+let kind = ImpostorKind::Octahedral { frames_per_side: 12, hemisphere: false };
+let imp = build_impostor(&mut engine, &scene, &kind, frame, false)?;
+// imp.atlas: colour, normal and height atlases. imp.quad: the card.
+// imp.params: serialize it next to the atlas for the shader.
+```
+
+Other kinds of impostor:
+
+- `hemisphere: true`, for objects never seen from below.
+- `ImpostorKind::Flipbook`, a ring of views around the object.
+- `ImpostorKind::SingleView`, one view from a fixed direction.
+- `build_layered_impostor`, which captures a second depth layer for concave props.
+- `billboard_cloud` and `progressive_surfel_cloud`, for shapes one card can't hold.
+
+The reference shader is
+[`shaders/octahedral_impostor.wgsl`](crates/farthing/shaders/octahedral_impostor.wgsl).
+
+### Merging objects
+
+`aggregate` merges a scene into one mesh with one atlas per material class, so a room full
+of props becomes one draw call. Then copy each texture into the atlas:
+
+```rust
+use farthing::aggregate::{aggregate, copy_texels, AggregateOptions};
+
+let infos: Vec<_> = scene.materials.iter().map(|m| engine.material_info(m.id)).collect();
+let merged = aggregate(&scene, &infos, &AggregateOptions { atlas_size: 2048, ..Default::default() })?;
+let color = copy_texels(&merged, &flattened, channels::BASE_COLOR)?; // flattened: FlattenedTextures
+```
+
+### Visibility
+
+Remove what no camera can see, such as the underside of a building or the inside of a closed
+box:
+
+```rust
+use farthing::visibility::{compute_visibility, cull_invisible, CameraSet, VisibilityOptions};
+
+let vis = compute_visibility(&mut engine, &scene, &VisibilityOptions {
+    cameras: CameraSet::Hemisphere { count: 64, distance_factor: 2.5 },
+    resolution: 256,
+})?;
+let (culled, removed) = cull_invisible(&scene, &vis, 1); // keep one ring around what was seen
+```
+
+The default `render_ids` is a CPU ray caster that treats alpha-tested materials as opaque.
+Override it in your host to let cutouts through. `CameraSet::Points` places cameras along a
+play path instead.
+
+### Skinned meshes
+
+A character's far levels need fewer bones and fewer influences per vertex:
+
+```rust
+use farthing::bones::*;
+
+let opts = BoneReductionOptions { ratio: Some(0.5), ..Default::default() };
+let plan = plan_bone_reduction(&skeleton, &[&mesh], None, &opts)?;
+apply_bone_reduction(&mut mesh, &plan);
+let (skeleton, remap) = compact_skeleton(&skeleton, &plan);
+remap_joint_indices(&mut mesh, &remap);
+limit_influences(&mut mesh, 2);
+```
+
+Pass animation poses as the third argument and each bone's removal error is measured in
+motion, not just from the bind pose.
+
+### Writing results
+
+```rust
+use farthing::io::{save_glb, ExportTextures};
+use farthing::reduce::optimize::optimize_mesh;
+
+optimize_mesh(&mut far);                       // vertex cache and vertex fetch order
+let out = farthing::Scene::from_mesh(far);
+let mut tex = ExportTextures::default();
+tex.base_color.insert(0, baked.textures[channels::BASE_COLOR].image.clone());
+tex.normal.insert(0, baked.textures[channels::NORMAL].image.clone());
+save_glb(&out, "far.glb", &tex)?;              // glb_bytes(&out, &tex) for memory
+```
+
+The option structs implement `serde`, so pipeline settings can live in your asset database.
+Work runs on rayon's thread pool, and the output is the same on any thread count.
+
+## Honest limits
+
+- **Speed.** The default reducer is 5–9× slower than meshoptimizer on small assets and 2–3×
+  on large ones. About 88% of the work runs in parallel. Fast mode closes most of the gap.
+- **Worst-case distance against positions-only reducers.** Ranking by area-weighted error
+  trades a little worst-case distance for much better mean, UV and normal fidelity. Set
+  `error_normalization = 1.0` for classic QEM when only the outline matters.
+- **Very aggressive targets** (1% and below). farthing leads on every quality average, but a
+  few cases are still worse, such as a watch's strap lugs at 1%.
+- **Proxies** can trail marching cubes on deep, narrow slots (the dragon: 1.39% vs 0.87% worst
+  case, though marching cubes leaves 6% of it open). farthing's proxies are always closed and manifold.
+- **Opaque proxies can't reproduce transmission or refraction**, as the visor above shows.
+
+The details, and what was tried and reverted, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Technique sources are in [PROVENANCE.md](PROVENANCE.md), and ideas borrowed from other sciences
+are in [docs/research/](docs/research/README.md).
 
 ## Patent shame list
 
@@ -354,90 +513,16 @@ not had a freedom-to-operate review. If you know of one that belongs here, open 
 | [US 8,860,723 B2](https://patents.google.com/patent/US8860723B2/en), *Bounded simplification of geometrical computer data* | Donya Labs AB (Simplygon), now Microsoft | Collapse-based reduction that projects removed geometry onto the reduced mesh and stops at an error bound | Lapsed 2022-11-21 for unpaid fees |
 | [US 8,698,809 B2](https://patents.google.com/patent/US8698809B2/en), *Creation and rendering of hierarchical digital multimedia data* | Donya Labs AB, now Microsoft | Repeatedly combining objects and simplifying each combination into a stand-in (hierarchical LOD) | Expired (fees) |
 
-## Known limitations and next steps
-
-- **Speed:** on a 2-core machine the reducer is still about 5× slower than meshoptimizer on
-  small assets and about 3× on large ones. The v13 profile has no single hotspot. On small
-  assets, one thread spends its time on candidate ranking (41%: attribute-quadric cost 20%,
-  wedge mapping 14%, validity 11%), setup (17%), part analysis (12%), incremental updates (10%)
-  and evaluation (5%). Turning off attributes, part removal and silhouette weighting together
-  makes it only 1.6× faster, so the gap is structural: f64 attribute quadrics, full link and
-  flip checks, and batched rounds. Closing it means a different, lighter mode, not tuning.
-  About 87% of the work is parallel. Parallel commits (v12, bit-identical, no `unsafe`) raise
-  that to 91% but add about 13% total work, so they start at 8 threads. Run
-  `scripts/scaling.sh` to find the right threshold on your machines.
-- **Worst-case distance vs positions-only reducers:** area-weighted ranking trades a little
-  Hausdorff for much better mean, UV and normal fidelity. Set `error_normalization = 1.0` to
-  rank by mean distance (classic QEM) when silhouettes matter most.
-- **UV packing:** v15 is ahead of xatlas on all eight assets. Before that, the hole-filling
-  packer tied xatlas on the water bottle (0.639 vs 0.640) and was 4% behind on the Fox (0.526
-  vs 0.547). The UV stage was about 8%
-  slower than xatlas over the eight assets (1.37 s vs 1.27 s). v14's interior holes didn't
-  close the Fox gap: its charts' holes are slivers, and honouring them fragments the free space
-  (water bottle 0.626 → 0.601 in `bench_uv`), so UV atlases leave `nest_in_holes` off. v15
-  closed it by splitting sprawling charts instead, at the price of speed: the UV stage is now
-  25% slower than xatlas (1.62 s vs 1.29 s), mostly the bounding-rectangle MaxRects search.
-  Rectangle packing with MaxRects variants costs up to 25–50 runs per call (3–190 ms for 24–500
-  rects on 4 threads).
-- **Remesh worst-case distance:** v12's signed boundary closed most of the gap to baby_shark's
-  signed-distance contouring and passed it on the Duck and the Fox. The dragon is still behind
-  (1.39% vs 0.87% Hausdorff). Its worst samples sit in slots about 0.15 cells wide and 2.8
-  cells deep between pieces. Resolution 192 doesn't resolve them (1.40%), and a v13 pass that
-  opened slot cells using a 2×2×2 sub-grid didn't help the dragon and hurt the Fox and the
-  Helmet, so it was reverted. v14 found the main cost elsewhere: at resolution 512 the
-  unreduced proxy is within 0.31%, but reducing it to 3,000 triangles takes it to 1.38%
-  (the backdrop slab's corners), so adaptive contouring wouldn't help. `RemeshOptions.simplify`
-  exposes the final reduction (`error_normalization: 0.5` gives 1.24% on the dragon but
-  costs other assets). baby_shark's dragon proxies also have 6–10% open edges.
-  The signed boundary needs a mostly consistent winding: the ray winding check catches
-  nested pieces and holes, but heavily inverted inputs should use `subvoxel: false`.
-- **Very aggressive targets:** farthing leads meshoptimizer on every quality geomean at 1%,
-  0.3% and 0.1%, but two cases stand out. The watch at 1% has 16% error (meshoptimizer: 4.7% at
-  979 triangles): collapses crush the strap lugs whether or not parts are removed, with
-  distance-normalized ranking or without attributes, and the cause is still open. The pirate at
-  1% loses a boot (19.6% vs 9.4%). Measuring removal error against the simplified surface fixed
-  it but broke the helmet (9.7% → 19.3%), and a measured-distance deletion threshold was worse
-  overall, so both were reverted. Protection means farthing reaches 73% of these targets
-  against meshoptimizer's 88%. Fast mode stops on the helmet at 1% (180 of 154 triangles).
-- **Quad reduction** needs pure-quad input (or ≥95% pairable triangles). UV seams act as
-  borders. Ring finding is linear since v11 (240k quads in about 2.4 s). Edges of more than two
-  quads are never rungs, and rings that cross themselves are dropped whole.
-- **Impostors** march a height field per frame (v10). v14's second layer recovers the surface
-  behind the front one for concave props; v15 stores it at half resolution (1.25× memory) and
-  picks it automatically. It needs a host that can depth-peel (`render_views_behind`), and
-  automatic mode always pays for the second capture pass, even when it drops the layer. On foliage the memory is better
-  spent on frame size. For foliage, surfel proxies need about 4× less memory for the same
-  quality.
-- **Surfels:** progressive prefixes leave up to 1% of probe points uncovered near open borders
-  at small counts (a dedicated cloud: up to 0.1%). Adaptive density (fewer, larger discs where
-  the weight is low) rendered worse for visibility weights on the bush (−0.3 to −0.9 dB), so it
-  is opt-in. The splat shader was checked against disc meshes for coverage and normals, not
-  yet in a production renderer.
-
 ## Layout
 
 ```
-crates/
-  farthing/            the library (published as one crate)
-    src/               data model at the root: meshes, quad meshes, scenes, BVH, RenderHost,
-                       images, metrics
-      io/              glTF / OBJ / quad OBJ (feature `io`)
-      reduce/          reduction (triangle, quad, symmetric), repair, vertex-cache optimization
-      uv/              LSCM + ARAP + planar parameterization (packs with snugly)
-      bake/            correspondence, point-eval + flattened baking, two-phase API
-      aggregate/       merge + atlas repack
-      voxel/           remeshing, occluders
-      visibility/      camera-sampled visibility
-      impostor/        impostors, billboard clouds, surfels
-      bones/           bone reduction
-    shaders/           reference WGSL (impostor, surfel splat)
-    examples/          benchmarks (bench_assets, bench_uv, ...)
-  farthing-cli/        `farthing` binary
-demo-web/              separate workspace: WebAssembly browser demo
-engine-poc/            separate workspace: wgpu engine implementing RenderHost
-bench-compare/         separate workspace: head-to-head vs meshoptimizer, xatlas, baby_shark
-docs/                  PoC outputs, BENCHMARKS.md, raw benchmark data
-scripts/scaling.sh     thread-scaling benchmark with output checks
+crates/farthing/       the library: data model at the root, then io/ reduce/ uv/ bake/
+                       aggregate/ voxel/ visibility/ impostor/ bones/, reference WGSL in shaders/
+crates/farthing-cli/   the `farthing` binary
+demo-web/              WebAssembly browser demo (separate workspace)
+engine-poc/            wgpu engine implementing RenderHost (separate workspace)
+bench-compare/         head-to-head vs meshoptimizer, xatlas, baby_shark (separate workspace)
+docs/                  BENCHMARKS.md, raw benchmark data, figures
 ```
 
 License: [MIT-0](LICENSE-MIT0) (MIT No Attribution).

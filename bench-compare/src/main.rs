@@ -327,6 +327,16 @@ fn uv_mode(assets: &[String]) {
         let r = parameterize(&m, &ParamOptions { atlas_size: 1024, padding: 2, ..Default::default() }).unwrap();
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let s = uv_stats(&r.mesh.positions, &r.mesh.uvs[0], &r.mesh.indices, r.charts);
+        // UV_DUMP=<dir>: also write each atlas (UVs + indices) as JSON, for figures.
+        let dump = |label: &str, uv: &[Vec2], idx: &[u32], s: &UvStats| {
+            if let Ok(dir) = std::env::var("UV_DUMP") {
+                let v = json!({"asset": name, "method": label, "charts": s.charts, "stretch": s.stretch,
+                    "utilization": s.utilization, "seam_ratio": s.seam_ratio,
+                    "uv": uv.iter().flat_map(|p| p.to_array()).collect::<Vec<f32>>(), "indices": idx});
+                std::fs::write(format!("{dir}/{name}_{label}.json"), v.to_string()).unwrap();
+            }
+        };
+        dump("farthing", &r.mesh.uvs[0], &r.mesh.indices, &s);
         let mut emit = |label: &str, s: UvStats, ms: f64| {
             println!(
                 "{:<16} {:<12} {:>7} {:>9.4} {:>8.3} {:>8.2} {:>9.0}",
@@ -364,7 +374,53 @@ fn uv_mode(assets: &[String]) {
             let xp: Vec<Vec3> = xm.vertex_array.iter().map(|v| m.positions[v.xref as usize]).collect();
             let xu: Vec<Vec2> = xm.vertex_array.iter().map(|v| Vec2::new(v.uv[0] / w, v.uv[1] / h)).collect();
             let s = uv_stats(&xp, &xu, xm.index_array, charts);
+            dump("xatlas", &xu, xm.index_array, &s);
             emit("xatlas", s, ms);
+
+            // xatlas at its best: more chart-growing iterations and the largest texel density that
+            // still fits one 1024² atlas (farthing searches the same way). With default options
+            // xatlas picks its own density, which can overflow the requested resolution (a 1319²
+            // atlas on DamagedHelmet), so the row above is rescaled. Brute-force and bilinear
+            // packing are off by default: neither raised utilization (XATLAS_BRUTE=1 /
+            // XATLAS_BILINEAR=1 to try them; brute force takes ~90 s per asset). XATLAS_PAD sets
+            // the padding, to match farthing's measured chart spacing.
+            let pad: u32 = std::env::var("XATLAS_PAD").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            let t = Instant::now();
+            let mut atlas = xatlas_rs_v2::Xatlas::new();
+            atlas.add_mesh(&decl).expect("xatlas add_mesh");
+            let env = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+            let (iters, brute) = (env("XATLAS_ITERS", 4), env("XATLAS_BRUTE", 0) == 1);
+            atlas.compute_charts(&xatlas_rs_v2::ChartOptions { max_iterations: iters, ..Default::default() });
+            let popts = |tpu: f32| xatlas_rs_v2::PackOptions {
+                resolution: 1024, padding: pad, brute_force: brute, texels_per_unit: tpu, bilinear: env("XATLAS_BILINEAR", 0) == 1, ..Default::default()
+            };
+            atlas.pack_charts(&popts(0.0));
+            let fits = |atlas: &mut xatlas_rs_v2::Xatlas, tpu: f32| { atlas.pack_charts(&popts(tpu)); atlas.atlas_count() == 1 };
+            // A verified lower bound, then grow to a failing upper bound, then bisect.
+            let mut lo = atlas.texels_per_unit();
+            while !fits(&mut atlas, lo) { lo *= 0.9; }
+            let mut hi = lo * 1.1;
+            while fits(&mut atlas, hi) { lo = hi; hi *= 1.1; }
+            while hi / lo > 1.003 {
+                let mid = 0.5 * (lo + hi);
+                if fits(&mut atlas, mid) { lo = mid } else { hi = mid }
+            }
+            // Packing is not monotonic in density: also try a range above the bisection result.
+            for k in 1..=25 {
+                let tpu = lo * (1.0 + 0.01 * k as f32);
+                if fits(&mut atlas, tpu) { lo = tpu; }
+            }
+            assert!(fits(&mut atlas, lo), "xatlas: final density does not fit one atlas");
+            let (w, h) = (atlas.width() as f32, atlas.height() as f32);
+            let charts = atlas.chart_count() as usize;
+            let meshes = atlas.meshes();
+            let xm = &meshes[0];
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            let xp: Vec<Vec3> = xm.vertex_array.iter().map(|v| m.positions[v.xref as usize]).collect();
+            let xu: Vec<Vec2> = xm.vertex_array.iter().map(|v| Vec2::new(v.uv[0] / w, v.uv[1] / h)).collect();
+            let s = uv_stats(&xp, &xu, xm.index_array, charts);
+            dump("xatlas_best", &xu, xm.index_array, &s);
+            emit("xatlas_best", s, ms);
         }
     }
     std::fs::write("results-uv.json", serde_json::to_string_pretty(&rows).unwrap()).unwrap();

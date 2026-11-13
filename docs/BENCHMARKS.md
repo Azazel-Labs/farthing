@@ -459,6 +459,75 @@ collapse-ordering problem, not part removal.
 
 ## UV atlases
 
+### Best against best (v16)
+
+`bench-compare uv`, both tools tuned for their best result in one 1024² atlas with 2 px
+padding. Both DamagedHelmet atlases were checked for overlap by rasterizing each chart at
+2048²: 0 overlapping pixels. Raw rows:
+[`benchmarks/v16-results-uv.json`](benchmarks/v16-results-uv.json). Its `ms` values are noisy
+because other work was running; the timing table below comes from quiet runs.
+
+- **farthing:** default options. Hole filling now runs on every atlas (`HoleFill::Always`).
+  Before, it ran only when there were 32 charts or fewer.
+- **xatlas** (`xatlas-rs-v2`): `max_iterations` 4 for chart growing. The texel density is
+  searched for the largest value that still fits one 1024² atlas: a verified lower bound,
+  then grow until it fails, bisect to 0.3%, then try 25 steps above (packing isn't monotonic
+  in density). The final density is asserted to fit. Brute-force placement was worse on
+  DamagedHelmet (0.414 against 0.446) and takes about 90 s per asset. Bilinear packing didn't
+  help either, so both are off.
+
+| asset | charts (lf / xa) | L2 stretch (lf / xa) | utilization (lf / xa) | seams % (lf / xa) | xa util, 1 px pad |
+|---|---|---|---|---|---|
+| DamagedHelmet | **277** / 848 | **1.0034** / 1.0064 | **0.697** / 0.457 | **13.6** / 25.7 | 0.527 |
+| Duck | **12** / 42 | **1.0037** / 1.0061 | **0.677** / 0.593 | **4.9** / 8.0 | 0.603 |
+| pirate | **110** / 194 | **1.0013** / 1.0026 | **0.630** / 0.560 | **20.3** / 23.8 | 0.574 |
+| WaterBottle | **23** / 47 | **1.0030** / 1.0034 | 0.659 / **0.690** | **7.8** / 9.2 | 0.676 |
+| Avocado | **5** / 9 | 1.0019 / **1.0016** | **0.624** / 0.586 | **9.1** / 10.4 | 0.584 |
+| Fox | **29** / 42 | **1.0017** / 1.0081 | **0.634** / 0.591 | **19.8** / 21.7 | 0.596 |
+| BoomBox | **62** / 66 | 1.0063 / **1.0031** | **0.669** / 0.593 | **5.6** / 9.4 | 0.613 |
+| Lantern | **163** / 286 | 1.0013 / **1.0009** | **0.792** / 0.639 | **11.3** / 22.0 | 0.672 |
+
+farthing has fewer charts on 8/8, shorter seams on 8/8, higher utilization on 7/8 (mean 0.673
+against 0.589) and lower stretch on 5/8. xatlas packs the water bottle 3 points tighter.
+Where it has lower stretch, the margin is at most 0.003. Every result is within 1% of
+isometric.
+
+**Padding is compared by measured spacing, not by the setting.** The two tools apply padding
+differently. The closest gap between any two charts was measured at 4096²:
+
+- farthing at 2 px: 3.75 texels (4.25 on the Duck, 4.75 on the Avocado).
+- xatlas at 2 px: 4.25–5.25 texels, except DamagedHelmet at 2.75.
+- xatlas at 1 px: 1.75–2.75 texels, tighter than farthing. Even then, farthing has the higher
+  utilization on every asset except the water bottle (last column).
+
+**Time.** xatlas's 3–9 s per asset is mostly the density search packing many times over. One
+pack at a fixed density takes about 90–350 ms. Always running the hole filler roughly doubles
+farthing's UV time on atlases with hundreds of charts:
+
+| asset | hole filling ≤ 32 charts (v15) | hole filling always (v16) |
+|---|---|---|
+| DamagedHelmet | 0.610, ~230 ms | 0.697, ~540 ms |
+| pirate | 0.587, ~150 ms | 0.630, ~500 ms |
+| Lantern | 0.744, ~110 ms | 0.792, ~400 ms |
+| BoomBox | 0.671, ~104 ms | 0.669, ~210 ms |
+
+The eight assets take about 2.0 s, up from 1.1 s. Assets with 32 charts or fewer are
+unchanged. `ParamOptions::fill_holes = false` keeps only the skyline packer.
+
+**A correction to the older rows.** With default options, xatlas picks its own density. On
+DamagedHelmet that made a 1319² atlas, which the v11–v15 rows below rescale to 1024². Tuned
+xatlas with a density that fits 1024² scores lower there (0.457 against 0.470), so the old
+row slightly flattered xatlas.
+
+**Holes inside charts.** On DamagedHelmet, one 137-triangle chart has a one-triangle hole.
+The missing triangle is its own chart. Merging it back would raise that chart's L2 stretch to
+1.0088, past the 1.005 merge limit. Allowing merges of fully enclosed charts up to 1.01 or 1.02
+stretch closes such holes. It removes 3–8 charts on the helmet and 6 on the Lantern, and cuts
+seams by up to 0.2 points. But the reshaped charts pack worse on the Lantern (0.792 →
+0.772), so the limit stays at 1.005 for every merge.
+
+### Default options (v6–v15)
+
 Competitor: **xatlas** (via `xatlas-rs-v2`), default chart and pack options, 1024² atlas,
 2 px padding.
 
