@@ -42,7 +42,7 @@ also optimizes the module for size.
 **Sample models.** `fetch_samples.py` downloads a few CC0 models from the
 [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets), pinned to
 one commit, into `web/samples/` with an `index.json`, and each model's screenshot from that
-repo as its thumbnail. The page shows them as cards in the sidebar and the empty viewport. They
+repo as its thumbnail. The page shows them as cards in the sidebar. They
 aren't committed: CI fetches them when it builds the page, and `cargo test` runs the pipeline
 on each one when they're present. The script refuses any model whose metadata lists a license
 other than CC0. To change the set, edit `SAMPLES` in the script.

@@ -813,9 +813,9 @@ async function loadUrl(url, name, expected, onProgress = () => {}) {
 }
 
 // Sample models: CC0 assets that fetch_samples.py downloads into samples/ at build time, listed
-// in samples/index.json. Each one gets a card in the sidebar and in the empty viewport's gallery.
-// Without the index (a local build that skipped the script) neither shows.
-const cards = new Map(); // sample file -> its card buttons
+// in samples/index.json, each shown as a card in the sidebar. Without the index (a local build
+// that skipped the script) the section stays hidden.
+const cards = new Map(); // sample file -> its card button
 function card(s) {
   const b = document.createElement("button");
   b.type = "button";
@@ -829,12 +829,11 @@ function card(s) {
 }
 
 function loadSample(s) {
-  for (const [file, list] of cards) for (const b of list) b.setAttribute("aria-current", String(file === s.file));
+  for (const [file, b] of cards) b.setAttribute("aria-current", String(file === s.file));
+  const b = cards.get(s.file);
   loadUrl(`samples/${s.file}`, s.name, s.bytes, (p) => {
-    for (const b of cards.get(s.file)) {
-      b.classList.toggle("loading", p !== null);
-      b.style.setProperty("--p", p ?? 0);
-    }
+    b.classList.toggle("loading", p !== null);
+    b.style.setProperty("--p", p ?? 0);
   });
 }
 
@@ -844,10 +843,9 @@ fetch("samples/index.json")
   .then((samples) => {
     if (!samples.length) return;
     for (const s of samples) {
-      const pair = [card(s), card(s)];
-      $("#sample-cards").append(pair[0]);
-      $("#gallery").append(pair[1]);
-      cards.set(s.file, pair);
+      const b = card(s);
+      $("#sample-cards").append(b);
+      cards.set(s.file, b);
     }
     $("#samples").hidden = false;
   });
@@ -855,7 +853,7 @@ fetch("samples/index.json")
 // Choosing or dropping a file of your own cancels a sample download and clears its highlight.
 const clearCurrent = () => {
   fetching?.abort();
-  for (const list of cards.values()) for (const b of list) b.removeAttribute("aria-current");
+  for (const b of cards.values()) b.removeAttribute("aria-current");
 };
 picker.addEventListener("change", clearCurrent);
 addEventListener("drop", clearCurrent);
