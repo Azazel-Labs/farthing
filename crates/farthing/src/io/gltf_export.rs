@@ -17,6 +17,12 @@ pub struct ExportTextures {
     /// slot index → base color factor (linear RGBA; multiplies the base color texture).
     /// Default white.
     pub base_color_factor: BTreeMap<u32, glam::Vec4>,
+    /// slot index → glTF metallic-roughness texture (linear data: G = roughness,
+    /// B = metalness), sampled with UV set 0.
+    pub metallic_roughness: BTreeMap<u32, Image>,
+    /// slot index → (metallic, roughness) factors. Default (0, 0.8) without a texture,
+    /// (1, 1) with one.
+    pub metallic_roughness_factor: BTreeMap<u32, glam::Vec2>,
 }
 
 struct Bin {
@@ -138,10 +144,22 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
                 .get(&(slot as u32))
                 .copied()
                 .unwrap_or(glam::Vec4::ONE);
+            let mr_tex = textures.metallic_roughness.get(&(slot as u32));
+            let mr = textures
+                .metallic_roughness_factor
+                .get(&(slot as u32))
+                .copied()
+                .unwrap_or(if mr_tex.is_some() { glam::Vec2::ONE } else { glam::Vec2::new(0.0, 0.8) });
             let mut mat = json!({
                 "name": m.name,
-                "pbrMetallicRoughness": { "baseColorFactor": factor.to_array(), "metallicFactor": 0.0, "roughnessFactor": 0.8 }
+                "pbrMetallicRoughness": { "baseColorFactor": factor.to_array(), "metallicFactor": mr.x, "roughnessFactor": mr.y }
             });
+            if let Some(img) = mr_tex {
+                let view = bin.view(&png_bytes(img, false)?, None);
+                images.push(json!({ "bufferView": view, "mimeType": "image/png" }));
+                gl_textures.push(json!({ "source": images.len() - 1 }));
+                mat["pbrMetallicRoughness"]["metallicRoughnessTexture"] = json!({ "index": gl_textures.len() - 1 });
+            }
             if let Some(img) = textures.base_color.get(&(slot as u32)) {
                 let view = bin.view(&png_bytes(img, true)?, None);
                 images.push(json!({ "bufferView": view, "mimeType": "image/png" }));

@@ -17,6 +17,13 @@ pub struct GltfMaterial {
     pub base_color_factor: Vec4,
     /// Decoded base color texture (linear RGB, sRGB-decoded) and its UV set.
     pub base_color_texture: Option<(Image, u32)>,
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    /// Metallic-roughness texture as stored (linear data: G = roughness, B = metalness) and
+    /// its UV set.
+    pub metallic_roughness_texture: Option<(Image, u32)>,
+    /// Tangent-space normal map as stored (linear data, xyz in 0..1), its UV set and scale.
+    pub normal_texture: Option<(Image, u32, f32)>,
 }
 
 /// Loads a glTF / GLB file. Each glTF mesh becomes one [`Mesh`] (primitives merged, material
@@ -24,7 +31,7 @@ pub struct GltfMaterial {
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<(Scene, Vec<GltfMaterial>)> {
     let (doc, buffers, images) =
         gltf::import(path.as_ref()).map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
-    build(&doc, &buffers, &|i| images.get(i).map(decode_image))
+    build(&doc, &buffers, &|i, srgb| images.get(i).map(|d| decode_image(d, srgb)))
 }
 
 /// Loads a GLB, or a `.gltf` whose buffers and images are embedded (`data:` URIs), from memory.
@@ -73,7 +80,7 @@ pub fn load_gltf_with(
         }
         buffers.push(gltf::buffer::Data(data));
     }
-    // Images are decoded on demand (only base color textures are read).
+    // Images are decoded on demand (only the material textures farthing reads).
     let mut encoded: Vec<Option<Vec<u8>>> = Vec::new();
     for img in document.images() {
         encoded.push(match img.source() {
@@ -85,10 +92,10 @@ pub fn load_gltf_with(
             gltf::image::Source::Uri { uri, .. } => fetch(uri).ok(),
         });
     }
-    build(&document, &buffers, &|i| {
+    build(&document, &buffers, &|i, srgb| {
         let bytes = encoded.get(i)?.as_ref()?;
         let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
-        Some(Image::from_rgba8(rgba.width(), rgba.height(), rgba.as_raw(), true))
+        Some(Image::from_rgba8(rgba.width(), rgba.height(), rgba.as_raw(), srgb))
     })
 }
 
@@ -146,7 +153,8 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 fn build(
     doc: &gltf::Document,
     buffers: &[gltf::buffer::Data],
-    image: &dyn Fn(usize) -> Option<Image>,
+    // Image index, sRGB-decode → decoded image.
+    image: &dyn Fn(usize, bool) -> Option<Image>,
 ) -> Result<(Scene, Vec<GltfMaterial>)> {
     // Material slots: one per glTF material, plus a default slot for primitives without one.
     let mut materials: Vec<MaterialSlot> = doc
@@ -173,7 +181,13 @@ fn build(
             let pbr = m.pbr_metallic_roughness();
             let tex = pbr
                 .base_color_texture()
-                .and_then(|t| Some((image(t.texture().source().index())?, t.tex_coord())));
+                .and_then(|t| Some((image(t.texture().source().index(), true)?, t.tex_coord())));
+            let mr = pbr
+                .metallic_roughness_texture()
+                .and_then(|t| Some((image(t.texture().source().index(), false)?, t.tex_coord())));
+            let normal = m.normal_texture().and_then(|t| {
+                Some((image(t.texture().source().index(), false)?, t.tex_coord(), t.scale()))
+            });
             GltfMaterial {
                 name: materials[i].name.clone(),
                 info: MaterialInfo {
@@ -182,6 +196,10 @@ fn build(
                 },
                 base_color_factor: Vec4::from_array(pbr.base_color_factor()),
                 base_color_texture: tex,
+                metallic_factor: pbr.metallic_factor(),
+                roughness_factor: pbr.roughness_factor(),
+                metallic_roughness_texture: mr,
+                normal_texture: normal,
             }
         })
         .collect();
@@ -272,6 +290,10 @@ fn build(
             info: MaterialInfo::default(),
             base_color_factor: Vec4::ONE,
             base_color_texture: None,
+            metallic_factor: 1.0,
+            roughness_factor: 1.0,
+            metallic_roughness_texture: None,
+            normal_texture: None,
         });
     }
 
@@ -377,7 +399,7 @@ fn build(
     ))
 }
 
-fn decode_image(img: &gltf::image::Data) -> Image {
+fn decode_image(img: &gltf::image::Data, srgb: bool) -> Image {
     use gltf::image::Format;
     let px = &img.pixels;
     let rgba: Vec<u8> = match img.format {
@@ -402,5 +424,5 @@ fn decode_image(img: &gltf::image::Data) -> Image {
             .collect(),
         _ => vec![255; (img.width * img.height * 4) as usize],
     };
-    Image::from_rgba8(img.width, img.height, &rgba, true)
+    Image::from_rgba8(img.width, img.height, &rgba, srgb)
 }

@@ -539,9 +539,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "snugly"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dfe5213889b032e8e8064ae47e6c0ec32bb49827d43c577548536fa63f66933f"
+checksum = "3e97a0ff51db7fd2f19df2bd5366d35c0e2aad66eb9d2d5dd369023954423b09"
 dependencies = [
  "glam 0.34.3",
  "rayon",

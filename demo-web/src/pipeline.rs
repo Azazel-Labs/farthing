@@ -4,7 +4,7 @@
 //!   resolved by relative path).
 //! * [`Demo::run`]: a LOD chain. Near levels are reduced per mesh and keep the original
 //!   materials; far levels (from `bake_from`) are geometry-only proxies of the whole scene with
-//!   fresh UVs and base color + normal maps baked from the original. Every finished level and
+//!   fresh UVs and base color, normal and roughness/metalness maps baked from the original. Every finished level and
 //!   baked texture is reported through an [`Event`] as soon as it exists.
 
 use farthing::bake::{bake_with_host, compute_tangents, BakeOptions};
@@ -138,7 +138,8 @@ pub enum Event<'a> {
     /// A level is done. `glb` is empty for level 0 (the page already has the original).
     /// Reduced levels carry no textures; their materials are the original's, by index.
     Level { info: &'a LevelInfo, glb: &'a [u8] },
-    /// A baked texture (sRGB base color, or tangent-space normal as 0..1), RGBA8 rows.
+    /// A baked texture (sRGB base color, tangent-space normal as 0..1, or glTF ORM data),
+    /// RGBA8 rows.
     Texture {
         level: usize,
         channel: &'a str,
@@ -237,8 +238,9 @@ impl Demo {
         }
     }
 
-    /// The original as GLB with base color textures and factors (what farthing reads of the
-    /// materials), so every level is shown with the same material model.
+    /// The original as GLB with base color, metallic-roughness and normal textures and factors
+    /// (what farthing reads of the materials), so every level is shown with the same material
+    /// model.
     pub fn original_glb(&self) -> Result<Vec<u8>, String> {
         glb_bytes(&self.scene, &self.textures).map_err(|e| e.to_string())
     }
@@ -401,7 +403,7 @@ impl Demo {
                     height: opts.atlas,
                     supersample: opts.supersample.clamp(1, 4),
                     gutter: 4,
-                    channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into()],
+                    channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into(), channels::ORM.into()],
                     ..Default::default()
                 },
             )
@@ -422,6 +424,9 @@ impl Demo {
                     }
                     channels::NORMAL => {
                         tex.normal.insert(0, ch.image.clone());
+                    }
+                    channels::ORM => {
+                        tex.metallic_roughness.insert(0, ch.image.clone());
                     }
                     _ => {}
                 }
@@ -490,6 +495,19 @@ fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
         if let Some((img, _)) = &m.base_color_texture {
             t.base_color.insert(i, img.clone());
         }
+        if let Some((img, _)) = &m.metallic_roughness_texture {
+            t.metallic_roughness.insert(i, img.clone());
+        }
+        if let Some((img, _, _)) = &m.normal_texture {
+            // Stored 0..1; ExportTextures wants xyz in -1..1.
+            let mut n = img.clone();
+            for p in &mut n.pixels {
+                *p = (p.truncate() * 2.0 - glam::Vec3::ONE).extend(1.0);
+            }
+            t.normal.insert(i, n);
+        }
+        t.metallic_roughness_factor
+            .insert(i, glam::Vec2::new(m.metallic_factor, m.roughness_factor));
         if let MaterialClass::Masked { cutoff } = m.info.class {
             t.alpha_cutoff.insert(i, cutoff);
         }
@@ -514,9 +532,34 @@ fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
 }
 
 /// What a browser demo can know about glTF materials: base color texture × factor × vertex
-/// color, and the source's interpolated normal (source normal maps are not applied).
+/// color, metallic-roughness texture × factors, and the source's normal with its normal map
+/// applied (when the source has tangents).
 struct MaterialHost<'a> {
     materials: &'a [GltfMaterial],
+}
+
+impl MaterialHost<'_> {
+    /// World-space shading normal: the interpolated normal, perturbed by the material's
+    /// tangent-space normal map when the source mesh has tangents.
+    fn shading_normal(&self, s: &farthing::host::SurfaceSample) -> glam::Vec3 {
+        let n = s.normal.normalize_or_zero();
+        let t = s.tangent.truncate();
+        let Some((tex, set, scale)) = self
+            .materials
+            .get(s.material.0 as usize)
+            .and_then(|m| m.normal_texture.as_ref())
+        else {
+            return n;
+        };
+        if t.length_squared() < 1e-12 || n == glam::Vec3::ZERO {
+            return n;
+        }
+        let t = (t - n * n.dot(t)).normalize_or_zero();
+        let b = n.cross(t) * if s.tangent.w < 0.0 { -1.0 } else { 1.0 };
+        let m = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
+        let (x, y, z) = ((m.x * 2.0 - 1.0) * scale, (m.y * 2.0 - 1.0) * scale, m.z * 2.0 - 1.0);
+        (t * x + b * y + n * z).try_normalize().unwrap_or(n)
+    }
 }
 
 impl RenderHost for MaterialHost<'_> {
@@ -530,6 +573,7 @@ impl RenderHost for MaterialHost<'_> {
         let n = (req.width * req.height) as usize;
         let mut color = vec![Vec4::ZERO; n];
         let mut normal = vec![Vec4::ZERO; n];
+        let mut orm = vec![Vec4::ZERO; n];
         for (i, s) in req.samples.iter().enumerate() {
             let Some(s) = s else { continue };
             let mut c = s.color;
@@ -543,7 +587,17 @@ impl RenderHost for MaterialHost<'_> {
                 }
             }
             color[i] = c;
-            normal[i] = s.normal.normalize_or_zero().extend(1.0);
+            normal[i] = self.shading_normal(s).extend(1.0);
+            // glTF layout: R occlusion (unused here), G roughness, B metalness.
+            orm[i] = self.materials.get(s.material.0 as usize).map_or(Vec4::new(1.0, 0.8, 0.0, 1.0), |m| {
+                let mut v = Vec4::new(1.0, m.roughness_factor, m.metallic_factor, 1.0);
+                if let Some((tex, set)) = &m.metallic_roughness_texture {
+                    let t = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
+                    v.y *= t.y;
+                    v.z *= t.z;
+                }
+                v
+            });
         }
         let image = |pixels| Image {
             width: req.width,
@@ -555,7 +609,8 @@ impl RenderHost for MaterialHost<'_> {
             let (img, encoding) = match ch.as_str() {
                 channels::BASE_COLOR => (image(color.clone()), ChannelEncoding::Color),
                 channels::NORMAL => (image(normal.clone()), ChannelEncoding::NormalWorld),
-                _ => return Err(Error::Unsupported("channel (demo host: base_color, normal)")),
+                channels::ORM => (image(orm.clone()), ChannelEncoding::Data),
+                _ => return Err(Error::Unsupported("channel (demo host: base_color, normal, orm)")),
             };
             out.insert(ch.clone(), ChannelImage { image: img, encoding });
         }

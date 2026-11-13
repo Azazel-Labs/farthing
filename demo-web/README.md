@@ -9,7 +9,8 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 - **Near levels** (LOD1 up to *Bake proxy from*) are reduced mesh by mesh. Each level is built
   from the previous one and keeps the original's UVs and materials.
 - **Far levels** merge the scene into one mesh and reduce it. The mesh is then unwrapped
-  (LSCM, or planar charts) and the original's base color and normals are baked into an atlas.
+  (LSCM, or planar charts) and the original's base color, normals (including normal maps) and
+  roughness/metalness are baked into an atlas.
   The textures appear in the panel as soon as they are baked.
 - **Error** is the measured deviation from LOD0: a sampled two-way Hausdorff distance,
   relative to the scene's bounding-box diagonal. *Switch at* is the camera distance where that
@@ -42,8 +43,9 @@ natively on a zipped `.gltf`.
 
 ## Limits
 
-- The bake reads base color (texture × factor × vertex color) and the mesh normals. Source
-  normal maps and other PBR channels are not baked.
+- The bake reads base color (texture × factor × vertex color), normals (mesh normals plus
+  source normal maps) and roughness/metalness (texture × factor). Occlusion, emissive and
+  other extensions are not baked.
 - Base color textures that use a second UV set are exported on the first set.
 - Baked proxies are static: skins and morph targets are dropped. Reduced levels keep them.
 - The wasm build is single-threaded (rayon falls back to the calling thread). A large model

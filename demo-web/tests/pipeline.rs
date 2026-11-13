@@ -113,7 +113,7 @@ fn zipped_gltf_reduces_and_bakes() {
     let baked = &levels[3].0;
     assert!(baked.coverage.unwrap() > 0.2, "{baked:?}");
     let names: Vec<&str> = textures.iter().map(|t| t.0.as_str()).collect();
-    assert_eq!(names, ["base_color", "normal"]);
+    assert_eq!(names, ["base_color", "normal", "orm"]);
     // The checker survives: the baked base color has both red and white texels.
     let px = textures[0].1.chunks_exact(4);
     let red = px.clone().filter(|p| p[0] > 200 && p[1] < 60).count();
@@ -123,6 +123,7 @@ fn zipped_gltf_reduces_and_bakes() {
     // The downloadable baked level embeds its textures.
     let full = demo.level_glb(3).unwrap();
     assert!(full.windows(9).any(|w| w == b"image/png"));
+    assert!(full.windows(24).any(|w| w == b"metallicRoughnessTexture"));
 }
 
 #[test]
