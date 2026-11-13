@@ -214,6 +214,8 @@ jobs:
           done
       - uses: actions/download-artifact@v8
         with:
+          # Only the CLI binaries, not the Pages site artifact from the demo job.
+          pattern: farthing-*
           path: dist
           merge-multiple: true
       - name: Tag and create GitHub release
