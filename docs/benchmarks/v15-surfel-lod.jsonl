@@ -1,0 +1,7 @@
+{"fresh_cloud_psnr_db":20.239906311035156,"progressive_prefix_psnr_db":19.92046546936035,"step_change_fresh_clouds":0.009442892856895924,"step_change_progressive":0.0014366492396220565,"surfels":750}
+{"fresh_cloud_psnr_db":20.479257583618164,"progressive_prefix_psnr_db":20.372201919555664,"step_change_fresh_clouds":0.01107278373092413,"step_change_progressive":0.0016247318126261234,"surfels":1500}
+{"fresh_cloud_psnr_db":21.120019912719727,"progressive_prefix_psnr_db":20.98675537109375,"step_change_fresh_clouds":0.010293334722518921,"step_change_progressive":0.0015645907260477543,"surfels":3000}
+{"fresh_cloud_psnr_db":21.612098693847656,"progressive_prefix_psnr_db":21.612098693847656,"step_change_fresh_clouds":0.0,"step_change_progressive":0.0,"surfels":6000}
+{"build_seconds":0.12722258269786835,"bytes_per_surfel":13.008832931518555,"decode_ms":0.132986,"decoded":6000,"stream_bytes_geometry_plus_rgb":78053,"stream_bytes_with_source_refs":108045,"surfels":6000}
+{"coverage_mismatch":0.0025380454026162624,"mean_normal_deg":5.080349922180176,"splat_shader_vs_disc_mesh":1500.0}
+{"coverage_mismatch":0.0025583903770893812,"mean_normal_deg":5.081081867218018,"splat_shader_vs_disc_mesh":1500.5}

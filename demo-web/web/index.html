@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Farthing LOD Demo</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <aside id="side">
+    <header>
+      <h1>farthing</h1>
+      <p>LOD chain and proxy bake, running in WebAssembly in your browser. Nothing is uploaded.</p>
+    </header>
+
+    <section id="drop" tabindex="0">
+      <strong>Drop a model here</strong>
+      <span>.glb, a .gltf with its files, a folder, or a .zip</span>
+      <span class="row">
+        <button type="button" id="pick">Choose files</button>
+        <input type="file" id="file" multiple hidden>
+      </span>
+      <span class="row samples">Try:
+        <button type="button" data-sample="Duck">Duck</button>
+        <button type="button" data-sample="DamagedHelmet">Damaged Helmet</button>
+      </span>
+    </section>
+
+    <section id="asset" hidden>
+      <h2 id="asset-name"></h2>
+      <dl id="asset-stats"></dl>
+      <p id="asset-warn" class="warn" hidden></p>
+    </section>
+
+    <form id="opts" autocomplete="off">
+      <fieldset>
+        <legend>Chain</legend>
+        <label class="range">Levels <output name="levels_out"></output>
+          <input type="range" name="levels" min="1" max="8" value="4">
+        </label>
+        <label class="range" title="Each level keeps this fraction of the original's triangles, compounded: LODn = step^n">
+          Step <output name="step_out"></output>
+          <input type="range" name="step" min="0.2" max="0.8" step="0.05" value="0.5">
+        </label>
+        <label class="select" title="From this level on, the scene is merged into one mesh, unwrapped and its materials baked into an atlas">
+          Bake proxy from <select name="bake_from"></select>
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Reduction</legend>
+        <label class="check" title="Faster, lower-quality reduction"><input type="checkbox" name="fast"> Fast quality</label>
+        <label class="check" title="Never collapse across UV and normal seams"><input type="checkbox" name="strict_seams"> Strict seams</label>
+        <label class="check" title="Keep mirror-symmetric shapes symmetric"><input type="checkbox" name="symmetry"> Preserve symmetry</label>
+        <label class="check" title="Do not move vertices on open borders"><input type="checkbox" name="lock_border"> Lock borders</label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Bake</legend>
+        <label class="select">Atlas
+          <select name="atlas">
+            <option value="256">256 × 256</option>
+            <option value="512" selected>512 × 512</option>
+            <option value="1024">1024 × 1024</option>
+            <option value="2048">2048 × 2048</option>
+          </select>
+        </label>
+        <label class="range" title="Samples per texel along each axis">Supersample <output name="supersample_out"></output>
+          <input type="range" name="supersample" min="1" max="4" value="2">
+        </label>
+        <label class="check" title="Planar chart projection instead of LSCM"><input type="checkbox" name="planar_uv"> Planar UVs</label>
+      </fieldset>
+    </form>
+  </aside>
+
+  <main>
+    <section id="view">
+      <canvas id="gl"></canvas>
+      <div id="empty">Drop a .glb, .gltf or .zip anywhere</div>
+      <div id="hud"></div>
+      <div id="viewbar">
+        <div class="seg" role="radiogroup" aria-label="View mode">
+          <button type="button" data-mode="single" aria-pressed="true" title="Show the selected level">Level</button>
+          <button type="button" data-mode="compare" aria-pressed="false" title="Original on the left, selected level on the right">Compare</button>
+          <button type="button" data-mode="auto" aria-pressed="false" title="Switch levels by camera distance (zoom out)">Auto LOD</button>
+        </div>
+        <label class="check"><input type="checkbox" id="wire"> Wireframe</label>
+      </div>
+      <div id="status" aria-live="polite"></div>
+    </section>
+
+    <section id="panel">
+      <div id="levels">
+        <table>
+          <thead>
+            <tr>
+              <th>Level</th><th>Kind</th><th class="n">Triangles</th><th class="n">%</th>
+              <th class="n" title="Measured deviation from LOD0 (sampled Hausdorff distance), relative to the scene's bounding-box diagonal">Error</th>
+              <th class="n" title="Camera distance where the error is under 1 pixel at 1080p, 60° FOV">Switch at</th>
+              <th class="n">Time</th><th></th>
+            </tr>
+          </thead>
+          <tbody id="level-rows"></tbody>
+        </table>
+      </div>
+      <div id="bake">
+        <h3 id="bake-title">Baked textures</h3>
+        <div class="tex">
+          <figure><canvas id="tex-base_color" width="1" height="1"></canvas><figcaption>Base color</figcaption></figure>
+          <figure><canvas id="tex-normal" width="1" height="1"></canvas><figcaption>Normal</figcaption></figure>
+        </div>
+        <p id="bake-stats"></p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

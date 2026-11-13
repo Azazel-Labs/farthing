@@ -1,0 +1,146 @@
+[
+  {
+    "asset": "DamagedHelmet",
+    "charts": 245,
+    "method": "farthing",
+    "ms": 394.60704899999996,
+    "seam_ratio": 0.13310635089874268,
+    "stretch": 1.0033999681472778,
+    "utilization": 0.5541294813156128
+  },
+  {
+    "asset": "DamagedHelmet",
+    "charts": 847,
+    "method": "xatlas",
+    "ms": 334.999907,
+    "seam_ratio": 0.25841575860977173,
+    "stretch": 1.0057897567749023,
+    "utilization": 0.47031235694885254
+  },
+  {
+    "asset": "Duck",
+    "charts": 12,
+    "method": "farthing",
+    "ms": 148.006731,
+    "seam_ratio": 0.04871995374560356,
+    "stretch": 1.0037387609481812,
+    "utilization": 0.6500916481018066
+  },
+  {
+    "asset": "Duck",
+    "charts": 30,
+    "method": "xatlas",
+    "ms": 244.476967,
+    "seam_ratio": 0.07553650438785553,
+    "stretch": 1.0085145235061646,
+    "utilization": 0.5746002197265625
+  },
+  {
+    "asset": "pirate",
+    "charts": 107,
+    "method": "farthing",
+    "ms": 188.57262899999998,
+    "seam_ratio": 0.20251329243183136,
+    "stretch": 1.0013259649276733,
+    "utilization": 0.5771421790122986
+  },
+  {
+    "asset": "pirate",
+    "charts": 194,
+    "method": "xatlas",
+    "ms": 239.081582,
+    "seam_ratio": 0.24419817328453064,
+    "stretch": 1.0020625591278076,
+    "utilization": 0.5434332489967346
+  },
+  {
+    "asset": "WaterBottle",
+    "charts": 22,
+    "method": "farthing",
+    "ms": 103.744668,
+    "seam_ratio": 0.07772805541753769,
+    "stretch": 1.0029865503311157,
+    "utilization": 0.6167514324188232
+  },
+  {
+    "asset": "WaterBottle",
+    "charts": 48,
+    "method": "xatlas",
+    "ms": 101.21969999999999,
+    "seam_ratio": 0.09690307825803757,
+    "stretch": 1.0040136575698853,
+    "utilization": 0.6401847004890442
+  },
+  {
+    "asset": "Avocado",
+    "charts": 5,
+    "method": "farthing",
+    "ms": 18.998300999999998,
+    "seam_ratio": 0.09079114347696304,
+    "stretch": 1.0018655061721802,
+    "utilization": 0.6259324550628662
+  },
+  {
+    "asset": "Avocado",
+    "charts": 9,
+    "method": "xatlas",
+    "ms": 15.732953,
+    "seam_ratio": 0.10164041817188263,
+    "stretch": 1.002318024635315,
+    "utilization": 0.5148120522499084
+  },
+  {
+    "asset": "Fox",
+    "charts": 23,
+    "method": "farthing",
+    "ms": 27.385082,
+    "seam_ratio": 0.1817738562822342,
+    "stretch": 1.0016510486602783,
+    "utilization": 0.49974754452705383
+  },
+  {
+    "asset": "Fox",
+    "charts": 42,
+    "method": "xatlas",
+    "ms": 104.373122,
+    "seam_ratio": 0.22118060290813446,
+    "stretch": 1.0070065259933472,
+    "utilization": 0.5468338131904602
+  },
+  {
+    "asset": "BoomBox",
+    "charts": 57,
+    "method": "farthing",
+    "ms": 138.75459800000002,
+    "seam_ratio": 0.0546567440032959,
+    "stretch": 1.0063382387161255,
+    "utilization": 0.5445445775985718
+  },
+  {
+    "asset": "BoomBox",
+    "charts": 95,
+    "method": "xatlas",
+    "ms": 92.969977,
+    "seam_ratio": 0.1202118992805481,
+    "stretch": 1.0236194133758545,
+    "utilization": 0.16798345744609833
+  },
+  {
+    "asset": "Lantern",
+    "charts": 157,
+    "method": "farthing",
+    "ms": 121.604505,
+    "seam_ratio": 0.11292714625597,
+    "stretch": 1.0012580156326294,
+    "utilization": 0.7142656445503235
+  },
+  {
+    "asset": "Lantern",
+    "charts": 284,
+    "method": "xatlas",
+    "ms": 144.57544,
+    "seam_ratio": 0.21940411627292633,
+    "stretch": 1.0022757053375244,
+    "utilization": 0.626282811164856
+  }
+]

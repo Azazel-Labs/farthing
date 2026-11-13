@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/farthing", "crates/farthing-cli"]
+# The PoC engine is deliberately NOT a member: it lives in ./engine-poc as its own
+# workspace and may only use farthing's public API (see ARCHITECTURE.md).
+exclude = ["engine-poc", "bench-compare", "demo-web"]
+
+[workspace.package]
+version = "0.15.0"
+edition = "2021"
+license = "MIT-0"
+rust-version = "1.99"
+
+[workspace.dependencies]
+glam = { version = "0.34", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+rayon = "1.10"
+thread_local = "1.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "extras"] }
+tobj = { version = "4", default-features = false }
+mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+naga = { version = "30", features = ["wgsl-in"] }
+snugly = { version = "0.1.1", features = ["serde"] }
+farthing = { path = "crates/farthing", version = "0.15.0" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 2

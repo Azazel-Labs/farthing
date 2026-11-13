@@ -1,0 +1,5 @@
+n   20  quads    2400 ->    240      17.1 ms  hausdorff 1.152%  mean 0.2818%
+n   40  quads    9600 ->    912      50.3 ms  hausdorff 0.514%  mean 0.1117%
+n   60  quads   21600 ->   2152     143.5 ms  hausdorff 0.264%  mean 0.0506%
+n  100  quads   60000 ->   5890     411.8 ms  hausdorff 0.111%  mean 0.0205%
+n  200  quads  240000 ->  23894    1833.3 ms  hausdorff 0.032%  mean 0.0058%

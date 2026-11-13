@@ -1,0 +1,218 @@
+[
+  {
+    "asset": "Duck",
+    "hausdorff": 0.008846761658787727,
+    "mean": 0.00015290985174942762,
+    "method": "farthing",
+    "ms": 450.374772,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "Duck",
+    "hausdorff": 0.0066747721284627914,
+    "mean": 0.0002354494499741122,
+    "method": "baby_shark DC+decimate",
+    "ms": 1617.0211490000002,
+    "open_edges": 0.005865850485861301,
+    "tris": 2607
+  },
+  {
+    "asset": "Duck",
+    "hausdorff": 0.004970276262611151,
+    "mean": 0.0002623811597004533,
+    "method": "baby_shark MC+decimate",
+    "ms": 1526.467771,
+    "open_edges": 0.0,
+    "tris": 2608
+  },
+  {
+    "asset": "Duck",
+    "hausdorff": 0.009418385103344917,
+    "mean": 0.0001904649252537638,
+    "method": "farthing (matched)",
+    "ms": 505.27911299999994,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "Avocado",
+    "hausdorff": 0.0737946480512619,
+    "mean": 0.0012715653283521533,
+    "method": "farthing",
+    "ms": 245.19979,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "Avocado",
+    "hausdorff": 0.07392122596502304,
+    "mean": 0.0012870270293205976,
+    "method": "baby_shark DC+decimate",
+    "ms": 1131.6415630000001,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "Avocado",
+    "hausdorff": 0.0736098438501358,
+    "mean": 0.0013080614153295755,
+    "method": "baby_shark MC+decimate",
+    "ms": 1111.1030170000001,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "Avocado",
+    "hausdorff": 0.0737946480512619,
+    "mean": 0.0012757538352161646,
+    "method": "farthing (matched)",
+    "ms": 291.336948,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "Fox",
+    "hausdorff": 0.007595011033117771,
+    "mean": 0.0001512233866378665,
+    "method": "farthing",
+    "ms": 115.095167,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "Fox",
+    "hausdorff": 0.011180601082742214,
+    "mean": 0.0002776365727186203,
+    "method": "baby_shark MC+decimate",
+    "ms": 673.1042040000001,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "Fox",
+    "hausdorff": 0.007595011033117771,
+    "mean": 0.0001559778320370242,
+    "method": "farthing (matched)",
+    "ms": 115.941264,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "BoomBox",
+    "hausdorff": 0.0231382604688406,
+    "mean": 0.0002488006721250713,
+    "method": "farthing",
+    "ms": 630.61926,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "BoomBox",
+    "hausdorff": 0.022173458710312843,
+    "mean": 0.0002738692273851484,
+    "method": "baby_shark DC+decimate",
+    "ms": 1939.41464,
+    "open_edges": 0.014474352821707726,
+    "tris": 2607
+  },
+  {
+    "asset": "BoomBox",
+    "hausdorff": 0.022349972277879715,
+    "mean": 0.0002820352092385292,
+    "method": "baby_shark MC+decimate",
+    "ms": 2028.3745,
+    "open_edges": 0.0,
+    "tris": 2608
+  },
+  {
+    "asset": "BoomBox",
+    "hausdorff": 0.0231382604688406,
+    "mean": 0.0002843498659785837,
+    "method": "farthing (matched)",
+    "ms": 620.644567,
+    "open_edges": 0.0,
+    "tris": 2606
+  },
+  {
+    "asset": "DamagedHelmet",
+    "hausdorff": 0.03509436175227165,
+    "mean": 0.0017591664800420403,
+    "method": "farthing",
+    "ms": 841.2729949999999,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "Lantern",
+    "hausdorff": 0.03479219228029251,
+    "mean": 0.0009151695412583649,
+    "method": "farthing",
+    "ms": 71.94154599999999,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "Lantern",
+    "hausdorff": 0.03493320569396019,
+    "mean": 0.0008902238914743066,
+    "method": "baby_shark DC+decimate",
+    "ms": 783.044191,
+    "open_edges": 0.00638243556022644,
+    "tris": 2603
+  },
+  {
+    "asset": "Lantern",
+    "hausdorff": 0.035422153770923615,
+    "mean": 0.0009345811558887362,
+    "method": "baby_shark MC+decimate",
+    "ms": 747.560373,
+    "open_edges": 0.0,
+    "tris": 2604
+  },
+  {
+    "asset": "Lantern",
+    "hausdorff": 0.03479219228029251,
+    "mean": 0.0009149920078925788,
+    "method": "farthing (matched)",
+    "ms": 78.963716,
+    "open_edges": 0.0,
+    "tris": 2602
+  },
+  {
+    "asset": "DragonAttenuation",
+    "hausdorff": 0.015495777130126953,
+    "mean": 0.00039363547693938017,
+    "method": "farthing",
+    "ms": 600.891963,
+    "open_edges": 0.0,
+    "tris": 3000
+  },
+  {
+    "asset": "DragonAttenuation",
+    "hausdorff": 0.01158753503113985,
+    "mean": 0.0003635612956713885,
+    "method": "baby_shark DC+decimate",
+    "ms": 1454.748918,
+    "open_edges": 0.1010223925113678,
+    "tris": 2605
+  },
+  {
+    "asset": "DragonAttenuation",
+    "hausdorff": 0.008690474554896355,
+    "mean": 0.00039074313826859,
+    "method": "baby_shark MC+decimate",
+    "ms": 1492.337145,
+    "open_edges": 0.06293359398841858,
+    "tris": 2606
+  },
+  {
+    "asset": "DragonAttenuation",
+    "hausdorff": 0.014801418408751488,
+    "mean": 0.0004357589059509337,
+    "method": "farthing (matched)",
+    "ms": 599.84402,
+    "open_edges": 0.0,
+    "tris": 2604
+  }
+]

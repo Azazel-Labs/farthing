@@ -1,0 +1,7 @@
+DragonAttenuation  0.25 lf  33748 h   0.111 m  0.0052 uv  0.00002/ 0.0001 n   0.92  549.3ms
+DragonAttenuation  0.05 lf   6748 h   0.526 m  0.0403 uv  0.00021/ 0.0010 n   4.35  483.0ms
+CarConcept      0.25 lf  53336 h   0.173 m  0.0035 uv  0.00000/ 0.0001 n   1.18  683.0ms
+CarConcept      0.05 lf  10682 h   1.634 m  0.0924 uv  0.00042/ 0.3253 n  25.26  738.0ms
+ABeautifulGame  0.25 lf 374768 h   0.045 m  0.0005 uv  0.00000/ 0.0001 n   5.11 3883.4ms
+ABeautifulGame  0.05 lf  74952 h   0.162 m  0.0034 uv  0.00000/ 0.0007 n   6.87 3995.4ms
+GEOMEAN lf: hausd 0.2223%  mean 0.00695%  uv90 0.00080  normal 4.015deg  time 1129.34ms

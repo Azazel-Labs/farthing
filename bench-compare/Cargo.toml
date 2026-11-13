@@ -1,0 +1,30 @@
+[package]
+name = "bench-compare"
+version = "0.1.0"
+license = "MIT-0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+# The xatlas UV baseline. Off by default because its bindings need libclang:
+# cargo run --release --features xatlas -- uv <assets...>
+xatlas = ["dep:xatlas-rs-v2"]
+
+[dependencies]
+farthing = { path = "../crates/farthing" }
+snugly = "0.1"
+etagere = "0.3"
+guillotiere = "0.7"
+rectangle-pack = "0.4"
+crunch = "0.5"
+meshopt = "0.7"
+xatlas-rs-v2 = { version = "0.1.4", optional = true }
+baby_shark = "0.3"
+glam = "0.34"
+nalgebra = "0.34"
+serde_json = "1"
+
+[profile.release]
+debug = false

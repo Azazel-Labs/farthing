@@ -1,4 +1,7 @@
-# Farthing
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.png">
+  <img alt="farthing: small change for far things. A little goes a long way: a flight helmet's LOD chain, each level a quarter of the last, at 94,722, 23,679, 5,916 and 1,480 triangles (baked). The last helmet is 1/64 of the first, and looks the same from where it's used." src="docs/images/hero-light.png">
+</picture>
 
 *Small change for far things.* A farthing was the smallest coin; the toolkit makes far things
 small: LODs, proxies and impostors for what's in the distance. (Formerly lodforge.)
@@ -8,7 +11,7 @@ symmetry-aware reduction, remeshed proxies, material baking, aggregation, impost
 visibility culling, occluders and bone reduction. It is engine-agnostic middleware, built from
 published techniques (see [PROVENANCE.md](PROVENANCE.md)).
 
-**v15 (0.15.0).** The UV atlas now beats xatlas on utilization on all eight test assets (Fox 0.634 vs 0.547), by splitting sprawling charts and also packing chart bounding boxes with MaxRects. `snugly` 0.1.0 is ready to release as its own crate: error types, an optional `parallel` feature (WASM builds), a verified MSRV, CI and an export script. Aggressive targets: junction branch points collapse, and fast mode shares the default's part and junction handling. Impostors get a half-resolution second layer and automatic layer choice; surfels get a reference splat shader and optional per-surfel radii. Everything is MIT-0. The toolkit is renamed **Farthing** (crates `farthing-*`, CLI `farthing`) and the packer **snugly**.
+**v15 (0.15.0).** The UV atlas now beats xatlas on utilization on all eight test assets (Fox 0.634 vs 0.547), by splitting sprawling charts and also packing chart bounding boxes with MaxRects. `snugly` 0.1.0 is ready to release as its own crate: error types, an optional `parallel` feature (WASM builds), a verified MSRV, CI and an export script. Aggressive targets: junction branch points collapse, and fast mode shares the default's part and junction handling. Impostors get a half-resolution second layer and automatic layer choice; surfels get a reference splat shader and optional per-surfel radii. Everything is MIT-0. The toolkit is renamed **Farthing** (one library crate `farthing`, CLI `farthing`) and the packer **snugly**.
 **v14 (0.14.0):** A fast reducer mode (4–5× faster than the default, still ahead of
 meshoptimizer on worst-case and mean error). `snugly` is product-ready: it now has the
 highest rectangle-packing density of the Rust packers tested, and shapes can nest inside each
@@ -72,7 +75,7 @@ rendered by the PoC engine. The marble and checker are procedural world-space ma
 | Area | v12 | v13 |
 |---|---|---|
 | `unsafe` | Two AVX2 kernels and a thread-local scratch reference | **None in any crate**, enforced by `#![forbid(unsafe_code)]`. The AVX2 builds measured no faster than the plain code (reducer 5.39 vs 5.38 s, UV 2.51 vs 2.44 s) and were deleted; per-thread scratch now uses the `thread_local` crate. Output unchanged |
-| Atlas packer | Module inside `farthing-uv` | **`snugly` crate** with no mesh dependencies: `pack(shapes, PackOptions)` for irregular shapes (from triangles, raster masks or rectangles; rotations on/off; height cap; hole filling auto/always/never) and `pack_rects` for rectangles. `farthing_uv::pack` re-exports it |
+| Atlas packer | Module inside `farthing::uv` | **`snugly` crate** with no mesh dependencies: `pack(shapes, PackOptions)` for irregular shapes (from triangles, raster masks or rectangles; rotations on/off; height cap; hole filling auto/always/never) and `pack_rects` for rectangles. `farthing::uv::pack` re-exports it |
 | Hole-filling packer speed | Exact check of every refined position | **Branch and bound** on the cheap lower bound, same placements: Fox 147 → 112 ms, Duck 325 → 282 ms, water bottle 186 → 167 ms (1 thread) |
 | Scaling on your hardware | Projections from a 2-core box | **`scripts/scaling.sh [ASSET_DIR]`**: every workload at 1, 2, 4, … threads, output hashes checked against 1 thread, speedups, parallel share, and the thread count from which parallel commits pay off (`FARTHING_PAR_COMMIT_THREADS`) |
 | Single-thread reducer | — | Profiled (see limitations); a single-wedge fast path in wedge mapping saves 2% of instructions, output unchanged |
@@ -109,7 +112,7 @@ rendered by the PoC engine. The marble and checker are procedural world-space ma
 
 | Area | v8 | v9 |
 |---|---|---|
-| Relightable distant LODs | — | **Surfel proxies** (`farthing_impostor::surfels`): blue-noise oriented discs with normals and source barycentrics, optionally visibility-weighted. On a 3000-leaf bush under four moving lights: +1.7 to +2.9 dB over the triangle LOD at equal budget, level with or ahead of the voxel proxy from 1500 primitives up, and they keep the leafy look. See BENCHMARKS, "Surfel proxies" |
+| Relightable distant LODs | — | **Surfel proxies** (`farthing::impostor::surfels`): blue-noise oriented discs with normals and source barycentrics, optionally visibility-weighted. On a 3000-leaf bush under four moving lights: +1.7 to +2.9 dB over the triangle LOD at equal budget, level with or ahead of the voxel proxy from 1500 primitives up, and they keep the leafy look. See BENCHMARKS, "Surfel proxies" |
 | Proxy gap sealing | All-or-nothing closing when the flood leaks | **Per pocket**: only cavities behind leaks are sealed; crevices stay open (DamagedHelmet proxy mean error −7%) |
 | Silhouette weight | — | Face quadrics scaled by the expected silhouette fraction of their edges (dihedral angle / π), weight 0.5: Hausdorff −3%, UV −3%, image space vs meshoptimizer +1.41 → +1.51 dB |
 | Patents | — | A patent shame list (below): what farthing avoids, who owns it, and how it stays clear |
@@ -194,22 +197,22 @@ rendered by the PoC engine. The marble and checker are procedural world-space ma
 
 ## Capabilities
 
-| Capability | Crate | Implementation |
+| Capability | Module | Implementation |
 |---|---|---|
-| Data model, BVH, host boundary, metrics | `farthing-core` | Wedge meshes, quad meshes, scenes, skeletons, opaque material handles; binned-SAH BVH; `RenderHost`; surface distance; image diff |
-| I/O | `farthing-io` | glTF/GLB import + export (skins, morphs, embedded textures), OBJ, quad OBJ |
-| Triangle reduction | `farthing-reduce` | QEM half-edge collapse ranked by area-weighted error; cluster-parallel for large meshes; a fast f32 mode; wedge-mapped seams (permissive by default, strict on request); weightless border planes; attribute quadrics (UVs, colors, area-scaled normals) + skin/morph deviation; importance; locks; symmetry; ratio / count / max-error / screen-size targets; part removal by visible error with protection; junction sliding; LOD chains; geomorph and source-vertex maps; parallel scene reduction; deterministic |
-| Quad reduction | `farthing-reduce` | Edge-ring (quad strip) removal ranked by rung quadric error, border constraints, flip/manifold checks |
-| Repair + GPU ordering | `farthing-reduce` | Weld, degenerate/duplicate/small-part removal, `geometry_only`; Forsyth vertex cache, ACMR |
-| Parameterization | `farthing-uv` | LSCM + ARAP charts with once-factored envelope Cholesky (normal-cone growth, split on overlap/stretch, merge under stretch and packability limits), exact overlap test, min-area-rectangle alignment, planar fallback, L2 stretch metric, packing with `snugly`; deterministic |
-| Atlas packing | `snugly` | Rectangles (MaxRects variants + skyline, fixed atlas or lowest strip) and irregular shapes (outline skyline + hole-filling packer, quarter turns, nesting in holes); padding; deterministic |
-| Material casting | `farthing-bake` | Correspondence by ray cast, point-evaluation and flattened modes, two-phase API, MikkTSpace normals, supersampling, dilation, displacement |
-| Aggregation | `farthing-aggregate` | Merge, per-class slots, island repack by texel density, texel copy, tangent-normal fix-up |
-| Remeshing / occluders | `farthing-voxel` | Voxelize, flood fill, gap closing, clip planes, surface nets, projection; conservative self-tuning occluders; box occluders |
-| Visibility | `farthing-visibility` | Sphere / hemisphere / point cameras, host ID renders, culling, importance weights |
-| Impostors | `farthing-impostor` | Octahedral / hemi-octahedral / flipbook / single view, optionally two depth layers; billboard clouds; height channel; reference WGSL with reprojection + relief parallax; progressive surfel clouds with a streaming format |
-| Bones | `farthing-bones` | Influence limiting; leaf-first removal by skinned error; locks; remap or compact |
-| CLI | `farthing-cli` | `info reduce lods quad-reduce remesh occluder visibility uv aggregate bones impostor-plan billboard optimize compare shader` |
+| Data model, BVH, host boundary, metrics | `farthing` (root) | Wedge meshes, quad meshes, scenes, skeletons, opaque material handles; binned-SAH BVH; `RenderHost`; surface distance; image diff |
+| I/O (feature `io`, default) | `farthing::io` | glTF/GLB import + export (skins, morphs, embedded textures), OBJ, quad OBJ |
+| Triangle reduction | `farthing::reduce` | QEM half-edge collapse ranked by area-weighted error; cluster-parallel for large meshes; a fast f32 mode; wedge-mapped seams (permissive by default, strict on request); weightless border planes; attribute quadrics (UVs, colors, area-scaled normals) + skin/morph deviation; importance; locks; symmetry; ratio / count / max-error / screen-size targets; part removal by visible error with protection; junction sliding; LOD chains; geomorph and source-vertex maps; parallel scene reduction; deterministic |
+| Quad reduction | `farthing::reduce` | Edge-ring (quad strip) removal ranked by rung quadric error, border constraints, flip/manifold checks |
+| Repair + GPU ordering | `farthing::reduce` | Weld, degenerate/duplicate/small-part removal, `geometry_only`; Forsyth vertex cache, ACMR |
+| Parameterization | `farthing::uv` | LSCM + ARAP charts with once-factored envelope Cholesky (normal-cone growth, split on overlap/stretch, merge under stretch and packability limits), exact overlap test, min-area-rectangle alignment, planar fallback, L2 stretch metric, packing with `snugly`; deterministic |
+| Atlas packing | `snugly` (dependency) | Rectangles (MaxRects variants + skyline, fixed atlas or lowest strip) and irregular shapes (outline skyline + hole-filling packer, quarter turns, nesting in holes); padding; deterministic |
+| Material casting | `farthing::bake` | Correspondence by ray cast, point-evaluation and flattened modes, two-phase API, MikkTSpace normals, supersampling, dilation, displacement |
+| Aggregation | `farthing::aggregate` | Merge, per-class slots, island repack by texel density, texel copy, tangent-normal fix-up |
+| Remeshing / occluders | `farthing::voxel` | Voxelize, flood fill, gap closing, clip planes, surface nets, projection; conservative self-tuning occluders; box occluders |
+| Visibility | `farthing::visibility` | Sphere / hemisphere / point cameras, host ID renders, culling, importance weights |
+| Impostors | `farthing::impostor` | Octahedral / hemi-octahedral / flipbook / single view, optionally two depth layers; billboard clouds; height channel; reference WGSL with reprojection + relief parallax; progressive surfel clouds with a streaming format |
+| Bones | `farthing::bones` | Influence limiting; leaf-first removal by skinned error; locks; remap or compact |
+| CLI | `farthing-cli` crate | `info reduce lods quad-reduce remesh occluder visibility uv aggregate bones impostor-plan billboard optimize compare shader` |
 | PoC engine | `engine-poc/` | Headless wgpu `RenderHost` with procedural materials; renders and scores every processor |
 
 All Rust crates are pure Rust: `glam`, `gltf`, `tobj`, `image`, `mikktspace` (glam backend),
@@ -218,8 +221,8 @@ All Rust crates are pure Rust: `glam`, `gltf`, `tobj`, `image`, `mikktspace` (gl
 ## Quick start
 
 ```sh
-cargo test --workspace                                   # 85 tests
-cargo run --release -p farthing-reduce --example bench_assets -- model.glb   # timing + output hashes
+cargo test --workspace                                   # 107 tests
+cargo run --release -p farthing --example bench_assets -- model.glb   # timing + output hashes
 cargo build --release -p farthing-cli
 
 farthing reduce model.glb -o lod.glb --ratio 0.25 --symmetry
@@ -236,7 +239,8 @@ farthing bones character.glb -o char_lod.glb --ratio 0.5 --influences 2
 # End-to-end proof (GPU or a software Vulkan driver such as lavapipe)
 cd engine-poc && cargo run --release -- [optional.glb] --out poc-out
 
-# Head-to-head benchmark (separate workspace; links meshoptimizer/xatlas, needs C++ + libclang)
+# Head-to-head benchmark (separate workspace; links meshoptimizer, needs a C++ compiler;
+# add --features xatlas for the xatlas UV baseline, which also needs libclang)
 cd bench-compare && cargo run --release -- reduce <assets...> && python3 pairwise.py results-reduce.json
 ```
 
@@ -304,8 +308,17 @@ utilization 0.562 vs 0.470, seams 13.3% vs 25.8%.
 
 ## Integrating
 
-farthing is middleware: a set of Rust crates with no engine dependency. A host integrates at
-whichever level suits it.
+farthing is middleware: one Rust crate with no engine dependency. The data model sits at the
+crate root (`farthing::Mesh`, `farthing::Scene`, `farthing::host::RenderHost`) and each
+processor is a module (`farthing::reduce`, `farthing::uv`, `farthing::bake`, ...).
+
+```toml
+[dependencies]
+farthing = "0.15"                                            # with glTF/OBJ I/O
+# farthing = { version = "0.15", default-features = false }  # geometry only, no file formats
+```
+
+A host integrates at whichever level suits it.
 
 | Level | How | Use when |
 |---|---|---|
@@ -405,18 +418,22 @@ not had a freedom-to-operate review. If you know of one that belongs here, open 
 
 ```
 crates/
-  farthing-core        data model (meshes, quad meshes, scenes), BVH, RenderHost, images, metrics
-  farthing-io          glTF / OBJ / quad OBJ
-  farthing-reduce      reduction (triangle, quad, symmetric), repair, vertex-cache optimization
-  snugly        2D atlas packing (rectangles, irregular shapes, hole filling); no mesh deps
-  farthing-uv          LSCM + ARAP + planar parameterization (packs with snugly)
-  farthing-bake        correspondence, point-eval + flattened baking, two-phase API
-  farthing-aggregate   merge + atlas repack
-  farthing-voxel       remeshing, occluders
-  farthing-visibility  camera-sampled visibility
-  farthing-impostor    impostors, billboard clouds, reference WGSL
-  farthing-bones       bone reduction
-  farthing-cli         `farthing` binary
+  farthing/            the library (published as one crate)
+    src/               data model at the root: meshes, quad meshes, scenes, BVH, RenderHost,
+                       images, metrics
+      io/              glTF / OBJ / quad OBJ (feature `io`)
+      reduce/          reduction (triangle, quad, symmetric), repair, vertex-cache optimization
+      uv/              LSCM + ARAP + planar parameterization (packs with snugly)
+      bake/            correspondence, point-eval + flattened baking, two-phase API
+      aggregate/       merge + atlas repack
+      voxel/           remeshing, occluders
+      visibility/      camera-sampled visibility
+      impostor/        impostors, billboard clouds, surfels
+      bones/           bone reduction
+    shaders/           reference WGSL (impostor, surfel splat)
+    examples/          benchmarks (bench_assets, bench_uv, ...)
+  farthing-cli/        `farthing` binary
+demo-web/              separate workspace: WebAssembly browser demo
 engine-poc/            separate workspace: wgpu engine implementing RenderHost
 bench-compare/         separate workspace: head-to-head vs meshoptimizer, xatlas, baby_shark
 docs/                  PoC outputs, BENCHMARKS.md, raw benchmark data

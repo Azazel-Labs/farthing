@@ -1,0 +1,66 @@
+{
+  "aggregate": {
+    "draw_calls_after": 1,
+    "draw_calls_before": 3,
+    "islands": 8,
+    "psnr_db": 34.15351104736328,
+    "seconds": 2.520073652267456
+  },
+  "far_lod_5pct_baked": {
+    "psnr_db": 24.798139572143555,
+    "seconds": 1.9027330875396729,
+    "silhouette_mismatch": 0.0034434001427143812,
+    "triangles": 2354
+  },
+  "near_lod_25pct": {
+    "psnr_db": 29.667259216308594,
+    "seconds": 0.3605416417121887,
+    "silhouette_mismatch": 0.000713348388671875,
+    "triangles": 11714
+  },
+  "occluder": {
+    "outside_fraction": 0.0005000000237487257,
+    "seconds": 0.12773221731185913,
+    "triangles": 300
+  },
+  "octahedral_impostor_knot": {
+    "atlas_px": 1920,
+    "close_psnr_db": 21.829689025878906,
+    "close_silhouette_mismatch": 0.0071004233323037624,
+    "far_psnr_db": 23.23624610900879,
+    "far_silhouette_mismatch": 0.0082003278657794,
+    "frames": 144,
+    "seconds": 16.748979568481445
+  },
+  "original": {
+    "seconds": 0.4149129390716553
+  },
+  "remesh_proxy": {
+    "bake_coverage": 0.39122986793518066,
+    "psnr_db": 25.028640747070312,
+    "seconds": 5.202625274658203,
+    "silhouette_mismatch": 0.0028902690391987562,
+    "triangles": 3000,
+    "voxels": [
+      134,
+      93,
+      51
+    ]
+  },
+  "source": {
+    "instances": 3,
+    "materials": [
+      "marble",
+      "checker"
+    ],
+    "triangles": 46860
+  },
+  "total_seconds": 27.674497604370117,
+  "visibility_hemisphere": {
+    "hidden_cube_triangles_seen": 0,
+    "removed_triangles": 2102,
+    "seconds": 0.151800736784935,
+    "views": 48,
+    "visible_fraction": 0.712291955947876
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "farthing-cli"
+description = "Command-line front end for farthing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "farthing"
+path = "src/main.rs"
+
+[dependencies]
+farthing.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+anyhow.workspace = true

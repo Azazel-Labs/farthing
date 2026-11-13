@@ -1,0 +1,28 @@
+asset            method                    tris   hausd%     mean%    open%       ms
+Duck             farthing                  3000    0.885    0.0153     0.00      482
+Duck             baby_shark DC+decimate    2607    0.536    0.0247     0.59     1667
+Duck             baby_shark MC+decimate    2608    0.497    0.0262     0.00     1533
+Duck             farthing (matched)        2606    0.942    0.0190     0.00      432
+Avocado          farthing                  3000    7.379    0.1272     0.00      246
+Avocado          baby_shark DC+decimate    2606    7.392    0.1287     0.00     1068
+Avocado          baby_shark MC+decimate    2606    7.361    0.1308     0.00     1100
+Avocado          farthing (matched)        2606    7.379    0.1276     0.00      235
+Fox              farthing                  3000    0.760    0.0151     0.00      119
+Fox baby_shark DC+decimate: decimator panicked
+Fox              baby_shark MC+decimate    2606    1.118    0.0278     0.00      719
+Fox              farthing (matched)        2606    0.760    0.0156     0.00      110
+BoomBox          farthing                  3000    2.314    0.0249     0.00      611
+BoomBox          baby_shark DC+decimate    2607    2.195    0.0270     1.45     1950
+BoomBox          baby_shark MC+decimate    2608    2.235    0.0282     0.00     1981
+BoomBox          farthing (matched)        2606    2.314    0.0284     0.00      638
+DamagedHelmet    farthing                  3000    3.509    0.1759     0.00      851
+DamagedHelmet baby_shark DC+decimate: decimator panicked
+DamagedHelmet baby_shark MC+decimate: decimator panicked
+Lantern          farthing                  3000    3.479    0.0915     0.00       76
+Lantern          baby_shark DC+decimate    2603    3.493    0.0889     0.64      704
+Lantern          baby_shark MC+decimate    2604    3.542    0.0935     0.00      691
+Lantern          farthing (matched)        2602    3.479    0.0915     0.00       73
+DragonAttenuation farthing                  3000    1.550    0.0394     0.00      593
+DragonAttenuation baby_shark DC+decimate    2606    1.159    0.0365    10.35     1530
+DragonAttenuation baby_shark MC+decimate    2606    0.869    0.0391     6.29     1429
+DragonAttenuation farthing (matched)        2606    1.480    0.0436     0.00      588

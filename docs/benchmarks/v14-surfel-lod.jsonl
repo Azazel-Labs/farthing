@@ -1,0 +1,5 @@
+{"fresh_cloud_psnr_db":20.239906311035156,"progressive_prefix_psnr_db":19.92046546936035,"step_change_fresh_clouds":0.009442892856895924,"step_change_progressive":0.001436648890376091,"surfels":750}
+{"fresh_cloud_psnr_db":20.479257583618164,"progressive_prefix_psnr_db":20.372201919555664,"step_change_fresh_clouds":0.01107278373092413,"step_change_progressive":0.0016247318126261234,"surfels":1500}
+{"fresh_cloud_psnr_db":21.120019912719727,"progressive_prefix_psnr_db":20.98675537109375,"step_change_fresh_clouds":0.010293334722518921,"step_change_progressive":0.0015645907260477543,"surfels":3000}
+{"fresh_cloud_psnr_db":21.612098693847656,"progressive_prefix_psnr_db":21.612098693847656,"step_change_fresh_clouds":0.0,"step_change_progressive":0.0,"surfels":6000}
+{"build_seconds":0.13232755661010742,"bytes_per_surfel":13.008832931518555,"decode_ms":0.212833,"decoded":6000,"stream_bytes_geometry_plus_rgb":78053,"stream_bytes_with_source_refs":108045,"surfels":6000}

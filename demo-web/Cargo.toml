@@ -1,0 +1,40 @@
+[package]
+name = "farthing-demo-web"
+description = "Browser demo: drop a glTF, tune LOD options, watch the chain build and bake."
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+license = "MIT-0"
+publish = false
+
+# Like engine-poc, the demo is its own workspace and only uses farthing's public API.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+farthing = { path = "../crates/farthing" }
+glam = "0.34"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Decompression only (zipped .gltf + .bin + textures); pure Rust, builds for wasm32.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Must match the installed wasm-bindgen CLI exactly (`wasm-bindgen --version`).
+wasm-bindgen = "=0.2.129"
+js-sys = "0.3"
+console_error_panic_hook = "0.1.7"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

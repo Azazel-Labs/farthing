@@ -1,0 +1,25 @@
+Avocado          0.1 attr     68  mo 28.54  lf 28.90  +0.36  sil mo 0.0169 lf 0.0165
+Avocado          0.1 perm     67  mo 28.26  lf 28.82  +0.56  sil mo 0.0162 lf 0.0165
+Avocado         0.25 attr    168  mo 33.71  lf 33.88  +0.17  sil mo 0.0051 lf 0.0054
+Avocado         0.25 perm    170  mo 33.74  lf 33.89  +0.15  sil mo 0.0054 lf 0.0054
+BoomBox          0.1 attr    601  mo 22.95  lf 23.51  +0.57  sil mo 0.0107 lf 0.0056
+BoomBox          0.1 perm    602  mo 23.64  lf 23.51  -0.13  sil mo 0.0086 lf 0.0056
+BoomBox         0.25 attr   1509  mo 26.35  lf 28.21  +1.87  sil mo 0.0033 lf 0.0022
+BoomBox         0.25 perm   1509  mo 26.64  lf 28.21  +1.57  sil mo 0.0031 lf 0.0022
+DamagedHelmet    0.1 attr   3349  mo 18.40  lf 22.13  +3.73  sil mo 0.0186 lf 0.0033
+DamagedHelmet    0.1 perm   1544  mo 18.47  lf 18.26  -0.21  sil mo 0.0089 lf 0.0105
+DamagedHelmet   0.25 attr   3861  mo 20.83  lf 23.14  +2.31  sil mo 0.0064 lf 0.0026
+DamagedHelmet   0.25 perm   3863  mo 22.34  lf 23.14  +0.80  sil mo 0.0030 lf 0.0026
+Duck             0.1 attr    420  mo 19.97  lf 21.65  +1.68  sil mo 0.0138 lf 0.0078
+Duck             0.1 perm    420  mo 20.60  lf 21.65  +1.06  sil mo 0.0121 lf 0.0078
+Duck            0.25 attr   1052  mo 25.50  lf 27.56  +2.06  sil mo 0.0038 lf 0.0020
+Duck            0.25 perm   1052  mo 25.92  lf 27.56  +1.64  sil mo 0.0033 lf 0.0020
+Lantern          0.1 attr    772  mo 23.47  lf 27.29  +3.81  sil mo 0.0176 lf 0.0057
+Lantern          0.1 perm    536  mo 22.43  lf 22.15  -0.28  sil mo 0.0111 lf 0.0101
+Lantern         0.25 attr   1348  mo 26.85  lf 28.00  +1.15  sil mo 0.0054 lf 0.0046
+Lantern         0.25 perm   1348  mo 26.41  lf 28.00  +1.59  sil mo 0.0053 lf 0.0046
+WaterBottle      0.1 attr    450  mo 28.35  lf 32.06  +3.71  sil mo 0.0107 lf 0.0050
+WaterBottle      0.1 perm    451  mo 28.62  lf 32.06  +3.44  sil mo 0.0102 lf 0.0050
+WaterBottle     0.25 attr   1126  mo 34.93  lf 37.21  +2.28  sil mo 0.0028 lf 0.0015
+WaterBottle     0.25 perm   1126  mo 34.92  lf 37.21  +2.30  sil mo 0.0029 lf 0.0015
+wins 21/24 mean +1.51 dB

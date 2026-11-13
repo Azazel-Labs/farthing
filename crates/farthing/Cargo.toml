@@ -1,0 +1,52 @@
+[package]
+name = "farthing"
+description = "Mesh LOD for real-time 3D: attribute-aware reduction, UV unwrapping and atlas packing, material baking, aggregation, voxel remeshing, impostors, visibility culling and skinning LOD."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme = "../../README.md"
+keywords = ["lod", "mesh", "simplification", "gltf", "gamedev"]
+categories = ["graphics", "game-development", "rendering"]
+
+[features]
+default = ["io"]
+# glTF 2.0 and OBJ import/export (`farthing::io`).
+io = ["dep:gltf", "dep:tobj", "dep:serde_json"]
+
+[dependencies]
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+image.workspace = true
+rayon.workspace = true
+thread_local.workspace = true
+mikktspace.workspace = true
+snugly.workspace = true
+gltf = { workspace = true, optional = true }
+tobj = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+naga.workspace = true
+
+[[example]]
+name = "bench_assets"
+required-features = ["io"]
+
+[[example]]
+name = "bench_ir"
+required-features = ["io"]
+
+[[example]]
+name = "diag_target"
+required-features = ["io"]
+
+[[example]]
+name = "bench_uv"
+required-features = ["io"]
+
+[[example]]
+name = "bench_remesh"
+required-features = ["io"]

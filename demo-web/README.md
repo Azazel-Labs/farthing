@@ -1,0 +1,50 @@
+# farthing browser demo
+
+Drop a model, adjust the LOD options and watch the chain build and bake. Everything runs
+locally in WebAssembly in a Web Worker. Nothing is uploaded.
+
+- **Input:** a `.glb`, a `.gltf` together with its `.bin` and texture files, a folder, or a
+  `.zip` of any of these. External files are resolved by relative path, with a fallback to a
+  unique file name.
+- **Near levels** (LOD1 up to *Bake proxy from*) are reduced mesh by mesh. Each level is built
+  from the previous one and keeps the original's UVs and materials.
+- **Far levels** merge the scene into one mesh and reduce it. The mesh is then unwrapped
+  (LSCM, or planar charts) and the original's base color and normals are baked into an atlas.
+  The textures appear in the panel as soon as they are baked.
+- **Error** is the measured deviation from LOD0: a sampled two-way Hausdorff distance,
+  relative to the scene's bounding-box diagonal. *Switch at* is the camera distance where that
+  error drops below one pixel (1080p, 60° FOV). **Auto LOD** mode switches levels using those
+  distances, scaled to your window. Zoom out to watch it change.
+- **Compare** shows the original next to the selected level. Each level downloads as a
+  self-contained `.glb`.
+- Changing an option restarts the run. A wasm call can't be interrupted, so the page replaces
+  the worker.
+
+## Build and run
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129   # must match the pin in Cargo.toml
+./build.sh                                         # → web/pkg/
+python -m http.server -d web 8000                  # then open http://localhost:8000
+```
+
+Any static file server works if it serves `.js` as JavaScript. Opening `index.html` from disk
+(`file://`) doesn't work, because module workers and wasm need http. If
+[binaryen](https://github.com/WebAssembly/binaryen)'s `wasm-opt` is on `PATH`, `build.sh`
+also optimizes the module for size.
+
+`index.html?model=<url>` loads a model on start, for example
+`?model=https://cdn.jsdelivr.net/gh/KhronosGroup/glTF-Sample-Assets@main/Models/Duck/glTF-Binary/Duck.glb`.
+
+The pipeline itself (`src/pipeline.rs`) has no browser dependencies. `cargo test` runs it
+natively on a zipped `.gltf`.
+
+## Limits
+
+- The bake reads base color (texture × factor × vertex color) and the mesh normals. Source
+  normal maps and other PBR channels are not baked.
+- Base color textures that use a second UV set are exported on the first set.
+- Baked proxies are static: skins and morph targets are dropped. Reduced levels keep them.
+- The wasm build is single-threaded (rayon falls back to the calling thread). A large model
+  with a 2048² atlas takes a while.

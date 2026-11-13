@@ -1,0 +1,105 @@
+asset             ratio method                     tris   hausd%     mean%  vis hd%    uv p50    uv p90   n deg       ms
+Avocado            0.01 farthing                      8   14.254    3.7544   14.254   0.02379   0.53820   39.70      4.4
+Avocado            0.01 farthing fast                 8   15.705    5.0502   15.705   0.09997   0.72737   36.36      1.3
+Avocado            0.01 meshopt attr perm             8   19.511    4.9888   19.511   0.05767   0.56897   34.76      0.4
+Avocado           0.003 farthing                      8   14.254    3.7544   14.254   0.02379   0.53820   39.70      3.6
+Avocado           0.003 farthing fast                 8   15.705    5.0502   15.705   0.09997   0.72737   36.36      1.3
+Avocado           0.003 meshopt attr perm             8   19.511    4.9888   19.511   0.05767   0.56897   34.76      0.3
+Avocado           0.001 farthing                      8   14.254    3.7544   14.254   0.02379   0.53820   39.70      3.2
+Avocado           0.001 farthing fast                 8   15.705    5.0502   15.705   0.09997   0.72737   36.36      1.4
+Avocado           0.001 meshopt attr perm             8   19.511    4.9888   19.511   0.05767   0.56897   34.76      0.4
+BoomBox            0.01 farthing                     60    7.112    2.6106    7.112   0.00682   0.04221   21.76     27.3
+BoomBox            0.01 farthing fast                60   19.183    2.2412   19.183   0.00682   0.20201   21.11     13.1
+BoomBox            0.01 meshopt attr perm            60   19.218    3.7439   19.218   0.01374   0.40994   25.23      3.4
+BoomBox           0.003 farthing                     18   21.054    6.3023   21.054   0.02736   0.50145   26.81     33.7
+BoomBox           0.003 farthing fast                17   28.639    6.5267   28.639   0.04833   0.65859   27.37     14.3
+BoomBox           0.003 meshopt attr perm            18   20.851    6.8404   20.851   0.03536   0.65393   35.16      3.3
+BoomBox           0.001 farthing                      8   30.858    8.8244   30.858   0.04211   0.64189   32.13     29.1
+BoomBox           0.001 farthing fast                 8   35.893    9.0343   35.893   0.04521   0.62606   29.64     19.1
+BoomBox           0.001 meshopt attr perm             6   35.613   10.6710   35.613   0.12724   0.66632   62.01      3.4
+DamagedHelmet      0.01 farthing                    154    9.681    2.1448    9.681   0.15587   0.78388   48.31    194.3
+DamagedHelmet      0.01 farthing fast               180   27.074    3.5021   27.074   0.42032   0.78395   59.93     77.0
+DamagedHelmet      0.01 meshopt attr perm           148    7.593    1.6844    7.593   0.11804   0.69429   50.07     15.6
+DamagedHelmet     0.003 farthing                     60   29.420    4.7144   29.420   0.40012   0.81438   70.39    231.3
+DamagedHelmet     0.003 farthing fast               180   20.766    3.4412   20.766   0.39745   0.77839   59.00     78.5
+DamagedHelmet     0.003 meshopt attr perm            45   16.743    3.1805   16.743   0.32404   0.82560   54.72     16.1
+DamagedHelmet     0.001 farthing                     60   29.420    4.7144   29.420   0.40012   0.81438   70.39    195.0
+DamagedHelmet     0.001 farthing fast               166   20.810    3.3485   20.810   0.41058   0.77441   61.34     81.6
+DamagedHelmet     0.001 meshopt attr perm            15   28.016    6.6645   28.016   0.51341   0.87916   61.53     15.2
+Duck               0.01 farthing                     42   12.430    3.6341   12.430   0.00788   0.18625   21.56     20.8
+Duck               0.01 farthing fast                42   11.758    2.9783   11.758   0.01293   0.38215   23.11      4.7
+Duck               0.01 meshopt attr perm            42   12.158    4.1384   12.158   0.01219   0.29349   23.04      2.3
+Duck              0.003 farthing                     12   21.217    7.2771   21.217   0.02165   0.36173   41.99     21.5
+Duck              0.003 farthing fast                12   17.480    6.3142   17.480   0.05264   0.33796   39.68      4.8
+Duck              0.003 meshopt attr perm            10   22.950    8.1601   22.950   0.02459   0.35817   47.47      2.2
+Duck              0.001 farthing                      8   24.631    8.1111   24.631   0.02889   0.40944   48.84     16.6
+Duck              0.001 farthing fast                 8   20.666    7.2921   20.666   0.04382   0.36946   41.79      4.6
+Duck              0.001 meshopt attr perm             8   31.056    9.3938   31.056   0.03836   0.55302   71.60      2.4
+Fox                0.01 farthing                      8   30.402    4.9014   30.402   0.16990   0.60309   54.88      8.1
+Fox                0.01 farthing fast                 8   32.572    5.2462   32.572   0.21401   0.55523   64.01      1.1
+Fox                0.01 meshopt attr perm             8   31.344    5.6864   31.344   0.29170   0.61254   65.57      1.4
+Fox               0.003 farthing                      8   30.402    4.9014   30.402   0.16990   0.60309   54.88      9.3
+Fox               0.003 farthing fast                 8   32.572    5.2462   32.572   0.21401   0.55523   64.01      1.2
+Fox               0.003 meshopt attr perm             8   31.344    5.6864   31.344   0.29170   0.61254   65.57      1.4
+Fox               0.001 farthing                      8   30.402    4.9014   30.402   0.16990   0.60309   54.88     12.3
+Fox               0.001 farthing fast                 8   32.572    5.2462   32.572   0.21401   0.55523   64.01      1.2
+Fox               0.001 meshopt attr perm             8   31.344    5.6864   31.344   0.29170   0.61254   65.57      1.8
+Lantern            0.01 farthing                     52    9.569    0.5476    9.569   0.02459   0.44135   44.85     44.1
+Lantern            0.01 farthing fast                52   15.850    2.6434   15.850   0.32004   0.77789   79.45     25.2
+Lantern            0.01 meshopt attr perm            52   15.935    1.2649   15.935   0.24610   0.83947   52.62      4.4
+Lantern           0.003 farthing                     16   15.926    1.7291   15.926   0.16712   0.82169   59.80     37.9
+Lantern           0.003 farthing fast                24   78.811   19.5367   78.811   0.39479   0.63505   96.03     26.7
+Lantern           0.003 meshopt attr perm            16   18.901    3.1652   18.901   0.43919   0.86049   79.98      4.5
+Lantern           0.001 farthing                      8   20.943    2.5973   20.943   0.34214   0.78757   67.46     38.0
+Lantern           0.001 farthing fast                24   78.811   19.5379   78.811   0.39488   0.63505   96.05     25.9
+Lantern           0.001 meshopt attr perm             8   18.901    3.4569   18.901   0.48609   0.87917   89.12      4.5
+WaterBottle        0.01 farthing                     44    9.852    2.4245    8.411   0.01355   0.25195   61.53     15.0
+WaterBottle        0.01 farthing fast                45    9.908    2.1323    8.100   0.05507   0.33798   51.88      7.7
+WaterBottle        0.01 meshopt attr perm            45   16.525    4.4136   16.525   0.20992   0.45165   81.56      2.1
+WaterBottle       0.003 farthing                     27   11.581    4.7054   11.581   0.04678   0.32694   79.37     21.2
+WaterBottle       0.003 farthing fast                27   16.404    4.8346   16.404   0.11623   0.32666   80.63      8.2
+WaterBottle       0.003 meshopt attr perm            20   20.137    4.9511   20.137   0.21741   0.38658   83.42      2.2
+WaterBottle       0.001 farthing                     27   11.581    4.7054   11.581   0.04678   0.32694   79.37     18.7
+WaterBottle       0.001 farthing fast                27   16.404    4.8351   16.404   0.11623   0.32687   80.63      8.3
+WaterBottle       0.001 meshopt attr perm            20   20.739    4.8909   20.739   0.21793   0.38465   84.64      2.1
+pirate             0.01 farthing                     50   19.625    2.3292   19.625   0.23198   0.58311   46.78     34.7
+pirate             0.01 farthing fast                50   14.810    1.8190   14.810   0.22915   0.50771   39.19     14.4
+pirate             0.01 meshopt attr perm            46    9.446    1.9912    9.446   0.11395   0.53365   53.41      3.2
+pirate            0.003 farthing                     41   19.656    2.6422   19.656   0.28901   0.69384   48.38     24.3
+pirate            0.003 farthing fast                41   19.710    2.3404   19.710   0.31947   0.59869   40.52     12.7
+pirate            0.003 meshopt attr perm            14   33.991    4.9871   33.991   0.29400   0.54203   72.31      4.6
+pirate            0.001 farthing                     41   19.656    2.6422   19.656   0.28901   0.69384   48.38     30.1
+pirate            0.001 farthing fast                41   19.710    2.3402   19.710   0.31947   0.59869   40.52     15.8
+pirate            0.001 meshopt attr perm             7   47.674    8.4754   47.674   0.33357   0.57088   80.28      3.6
+ABeautifulGame     0.01 farthing                  14990    0.473    0.0139    0.473   0.00001   0.00368   11.10   4694.8
+ABeautifulGame     0.01 farthing fast             14990    0.646    0.0157    0.646   0.00000   0.00645   13.66   5485.1
+ABeautifulGame     0.01 meshopt attr perm         14988    0.512    0.0180    0.495   0.00003   0.00985   11.90   2068.6
+ABeautifulGame    0.003 farthing                   4496    0.905    0.0373    0.905   0.00002   0.02384   18.38   4255.6
+ABeautifulGame    0.003 farthing fast              4496    1.290    0.0444    1.290   0.00003   0.15123   22.28   4951.1
+ABeautifulGame    0.003 meshopt attr perm          4496    1.151    0.0409    1.151   0.00005   0.04102   19.40   1834.8
+ABeautifulGame    0.001 farthing                   1498    2.975    0.0745    2.975   0.00005   0.38560   27.47   4538.1
+ABeautifulGame    0.001 farthing fast              1498    3.003    0.1368    3.003   0.00449   0.43355   37.18   5488.7
+ABeautifulGame    0.001 meshopt attr perm          1486    1.774    0.0728    1.774   0.00012   0.36383   34.23   2073.2
+CarConcept         0.01 farthing                   2132    9.615    0.4842    5.264   0.05226   1.08268   66.23   1602.0
+CarConcept         0.01 farthing fast              2133    8.338    0.3271    3.751   0.00938   0.89323   62.12   1601.8
+CarConcept         0.01 meshopt attr perm          2133    6.224    0.3415    4.863   0.00935   0.90920   61.86    278.0
+CarConcept        0.003 farthing                    639    9.417    0.8874    9.417   0.37157   1.04401   76.92   1654.4
+CarConcept        0.003 farthing fast               801   21.847    3.0895   21.847   0.46694   0.97523   87.09   1956.9
+CarConcept        0.003 meshopt attr perm           634    7.319    0.7380    5.394   0.37886   1.55205   84.88    325.9
+CarConcept        0.001 farthing                    212   12.778    1.5263   12.778   0.47206   1.11261   85.83   1703.3
+CarConcept        0.001 farthing fast               475   22.155    3.2236   22.155   0.46991   0.92983   87.27   2196.1
+CarConcept        0.001 meshopt attr perm           318    7.583    1.0404    7.583   0.47813   4.68809   88.71    313.1
+ChronographWatch   0.01 farthing                   1175   16.022    2.2447   16.022   0.49388   2.18254   83.36   1129.2
+ChronographWatch   0.01 farthing fast              1391   15.422    1.6317   15.422   0.45372   1.69247   83.73    571.2
+ChronographWatch   0.01 meshopt attr perm           979    4.654    0.4485    4.654   0.21417   1.03146   63.05    214.2
+ChronographWatch  0.003 farthing                   1175   16.022    2.2447   16.022   0.49388   2.18254   83.36   1159.6
+ChronographWatch  0.003 farthing fast              1372   15.423    1.7124   15.423   0.45207   1.68298   84.22    625.6
+ChronographWatch  0.003 meshopt attr perm           289    7.682    1.1628    7.682   0.47022   2.18010   81.24    212.3
+ChronographWatch  0.001 farthing                   1175   16.022    2.2447   16.022   0.49388   2.18254   83.36   1207.8
+ChronographWatch  0.001 farthing fast              1367   15.422    1.5663   15.422   0.44037   1.74301   82.19    580.8
+ChronographWatch  0.001 meshopt attr perm           255    8.134    1.3031    8.134   0.48463   2.29542   81.65    233.4
+SUMMARY (geometric means over all assets x ratios; lower is better)
+method                  hausd%     mean%   vis hd%    uv p90     n deg       ms  reached
+farthing               12.8539   1.97532   12.5610   0.45786    47.561    79.54      73%
+farthing fast          16.1452   2.47119   15.6631   0.52033    49.585    36.59      58%
+meshopt attr perm      13.0399   2.14315   12.8100   0.56801    53.172    11.07      88%
