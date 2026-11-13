@@ -4,8 +4,8 @@
 //! common authoring case). A plane is accepted when at least 95% of positions have a mirror
 //! partner within 1e-4 of the bounding-box diagonal.
 
-use glam::{Vec3, Vec4};
 use crate::Mesh;
+use glam::{Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

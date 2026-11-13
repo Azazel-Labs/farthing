@@ -15,8 +15,8 @@
 //! deterministic (single-threaded; hash sets are only looked up, never iterated).
 
 use crate::reduce::simplify::{SimplifyOptions, SimplifyResult};
-use glam::Vec3;
 use crate::{Mesh, Result};
+use glam::Vec3;
 
 /// Symmetric 4×4 quadric: a00 a01 a02 a03 a11 a12 a13 a22 a23 a33.
 #[derive(Clone, Copy, Default)]
@@ -210,7 +210,8 @@ pub(crate) fn simplify_fast(
         }
         for i in 0..3 {
             let (e0, e1) = (p[i], p[(i + 1) % 3]);
-            if border_deg[e0 as usize] > 0 && border_deg[e1 as usize] > 0 && is_border_edge(e0, e1) {
+            if border_deg[e0 as usize] > 0 && border_deg[e1 as usize] > 0 && is_border_edge(e0, e1)
+            {
                 let (x0, x1) = (pos[e0 as usize], pos[e1 as usize]);
                 let dir = x1 - x0;
                 let bn = dir.cross(nn).normalize_or_zero();
@@ -274,7 +275,11 @@ pub(crate) fn simplify_fast(
         warea,
         attr,
         dim,
-        nd: if mesh.normals.is_some() && nw > 0.0 { 3 } else { 0 },
+        nd: if mesh.normals.is_some() && nw > 0.0 {
+            3
+        } else {
+            0
+        },
         avg_area,
         locked,
         border_deg,
@@ -314,12 +319,20 @@ pub(crate) fn simplify_fast(
         // Near an aggressive target, parts whose removal moves the surface less than a quarter of
         // the deviation collapses have accepted go (the full reducer's rule); analysed on first
         // need.
-        if let Some(t) = target.filter(|&t| opts.remove_parts && alive_tris <= 4 * t && 10 * t <= nt) {
+        if let Some(t) =
+            target.filter(|&t| opts.remove_parts && alive_tris <= 4 * t && 10 * t <= nt)
+        {
             if let Some(parts) = parts.get_or_insert_with(analyze).as_mut() {
                 let thr = 0.25 * worst2.sqrt() * diag;
-                while let Some((n, e)) =
-                    take_part(&mut st, parts, thr, opts.max_error, alive_tris, t, &mut pos_alive)
-                {
+                while let Some((n, e)) = take_part(
+                    &mut st,
+                    parts,
+                    thr,
+                    opts.max_error,
+                    alive_tris,
+                    t,
+                    &mut pos_alive,
+                ) {
                     alive_tris -= n;
                     part_err2 = part_err2.max((e / diag) * (e / diag));
                 }
@@ -364,7 +377,9 @@ pub(crate) fn simplify_fast(
                     if !g.is_finite() || best.is_some_and(|x| g >= x.0) {
                         continue;
                     }
-                    let Some(ac) = st.attr_cost(a, b, &mut map) else { continue };
+                    let Some(ac) = st.attr_cost(a, b, &mut map) else {
+                        continue;
+                    };
                     let c = g + ac;
                     if best.is_none_or(|x| c < x.0) {
                         best = Some((c, a, b));
@@ -383,9 +398,13 @@ pub(crate) fn simplify_fast(
             break;
         }
         cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
-        let needed = target.map_or(cands.len(), |t| alive_tris.saturating_sub(t).div_ceil(2).max(1));
+        let needed = target.map_or(cands.len(), |t| {
+            alive_tris.saturating_sub(t).div_ceil(2).max(1)
+        });
         // Pass cost limit (see PASS_SHARE, PASS_LIMIT): passes stay close to cost order.
-        let m = needed.min((cands.len() as f32 * PASS_SHARE).ceil() as usize).clamp(1, cands.len());
+        let m = needed
+            .min((cands.len() as f32 * PASS_SHARE).ceil() as usize)
+            .clamp(1, cands.len());
         let limit = if stall > 0 {
             f32::INFINITY
         } else {
@@ -441,9 +460,15 @@ pub(crate) fn simplify_fast(
                             f32::INFINITY
                         };
                         let floor = t.saturating_sub(alive_tris - t);
-                        let Some((n, e)) =
-                            take_part(&mut st, parts, limit, opts.max_error, alive_tris, floor, &mut pos_alive)
-                        else {
+                        let Some((n, e)) = take_part(
+                            &mut st,
+                            parts,
+                            limit,
+                            opts.max_error,
+                            alive_tris,
+                            floor,
+                            &mut pos_alive,
+                        ) else {
                             break;
                         };
                         alive_tris -= n;
@@ -472,7 +497,8 @@ pub(crate) fn simplify_fast(
     for t in 0..nt {
         if alive[t] {
             out.indices.extend(tris[t].iter().map(|&v| resolve(v)));
-            out.material_ids.push(mesh.material_ids.get(t).copied().unwrap_or(0));
+            out.material_ids
+                .push(mesh.material_ids.get(t).copied().unwrap_or(0));
         }
     }
     let remap = out.compact();
@@ -595,7 +621,10 @@ impl St {
 
     #[inline]
     fn live(&self, p: u32) -> impl Iterator<Item = usize> + '_ {
-        self.star(p).iter().map(|&t| t as usize).filter(|&t| self.alive[t])
+        self.star(p)
+            .iter()
+            .map(|&t| t as usize)
+            .filter(|&t| self.alive[t])
     }
 
     fn is_border_edge(&self, a: u32, b: u32) -> bool {
@@ -604,8 +633,7 @@ impl St {
 
     /// Whether p may move onto q: not locked, and border vertices slide along their border.
     fn can(&self, p: u32, q: u32) -> bool {
-        !self.locked[p as usize]
-            && (self.border_deg[p as usize] == 0 || self.is_border_edge(p, q))
+        !self.locked[p as usize] && (self.border_deg[p as usize] == 0 || self.is_border_edge(p, q))
     }
 
     /// Squared attribute distance between wedges a and b (pre-scaled channels).
@@ -619,7 +647,11 @@ impl St {
             &self.attr[b as usize * d..(b as usize + 1) * d],
         );
         let sq = |r: std::ops::Range<usize>| -> f32 {
-            x[r.clone()].iter().zip(&y[r]).map(|(p, q)| (p - q) * (p - q)).sum()
+            x[r.clone()]
+                .iter()
+                .zip(&y[r])
+                .map(|(p, q)| (p - q) * (p - q))
+                .sum()
         };
         sq(0..self.nd) + sq(self.nd..d)
     }
@@ -629,7 +661,10 @@ impl St {
     /// and q share no triangle).
     fn wedge_map(&self, p: u32, q: u32, out: &mut Vec<(u32, u32)>) -> Option<f32> {
         out.clear();
-        let (s, e) = (self.start[p as usize] as usize, self.start[p as usize + 1] as usize);
+        let (s, e) = (
+            self.start[p as usize] as usize,
+            self.start[p as usize + 1] as usize,
+        );
         let mut single = true;
         let first_pw = self.corners.get(s).map_or(u32::MAX, |c| c[0]);
         for k in s..e {
@@ -683,9 +718,14 @@ impl St {
     fn attr_cost(&self, p: u32, q: u32, scratch: &mut Vec<(u32, u32)>) -> Option<f32> {
         let pw = self.single[p as usize];
         if pw >= u32::MAX - 1 {
-            return self.attr_cost_seam(p, q).or_else(|| self.wedge_map(p, q, scratch));
+            return self
+                .attr_cost_seam(p, q)
+                .or_else(|| self.wedge_map(p, q, scratch));
         }
-        let (s, e) = (self.start[p as usize] as usize, self.start[p as usize + 1] as usize);
+        let (s, e) = (
+            self.start[p as usize] as usize,
+            self.start[p as usize + 1] as usize,
+        );
         for k in s..e {
             let [_, pa, aw, pb, bw] = self.corners[k];
             let qw = if pa == q {
@@ -711,7 +751,10 @@ impl St {
         let mut np = 0;
         let mut maps = [(0u32, 0u32); N];
         let mut nm = 0;
-        let (s, e) = (self.start[p as usize] as usize, self.start[p as usize + 1] as usize);
+        let (s, e) = (
+            self.start[p as usize] as usize,
+            self.start[p as usize + 1] as usize,
+        );
         for k in s..e {
             if !self.alive[self.list[k] as usize] {
                 continue;
@@ -804,7 +847,10 @@ impl St {
             self.warea[qw as usize] += a;
         }
         let mut removed = 0;
-        let (s, e) = (self.start[p as usize] as usize, self.start[p as usize + 1] as usize);
+        let (s, e) = (
+            self.start[p as usize] as usize,
+            self.start[p as usize + 1] as usize,
+        );
         for k in s..e {
             let t = self.list[k] as usize;
             if !self.alive[t] {
@@ -829,7 +875,10 @@ impl St {
         self.quad[q as usize].add(&qp);
         if self.border_deg[p as usize] > 0 {
             // p's border edges (p, r) become (q, r); the edge (p, q) disappears.
-            let (s, e) = (self.start[p as usize] as usize, self.start[p as usize + 1] as usize);
+            let (s, e) = (
+                self.start[p as usize] as usize,
+                self.start[p as usize + 1] as usize,
+            );
             let mut moved = Vec::new();
             for k in s..e {
                 let t = self.list[k] as usize;
@@ -935,12 +984,19 @@ mod tests {
             let r = simplify(&m, &opts(ratio)).unwrap();
             r.mesh.validate().unwrap();
             let target = (m.triangle_count() as f32 * ratio) as usize;
-            assert!(r.mesh.triangle_count() <= target, "{ratio}: {}", r.mesh.triangle_count());
+            assert!(
+                r.mesh.triangle_count() <= target,
+                "{ratio}: {}",
+                r.mesh.triangle_count()
+            );
             assert!(
                 edge_counts(&r.mesh).values().all(|&c| c == 2),
                 "{ratio}: not closed and manifold"
             );
-            assert!(r.vertex_remap.iter().all(|&v| (v as usize) < r.mesh.vertex_count()));
+            assert!(r
+                .vertex_remap
+                .iter()
+                .all(|&v| (v as usize) < r.mesh.vertex_count()));
             let d = crate::metrics::surface_distance(&m, &r.mesh, 4000);
             assert!(d.relative_mean < mean, "{ratio}: {d:?}");
         }
@@ -949,12 +1005,18 @@ mod tests {
     #[test]
     fn deterministic_and_close_to_best() {
         let m = sphere();
-        let (a, b) = (simplify(&m, &opts(0.1)).unwrap(), simplify(&m, &opts(0.1)).unwrap());
+        let (a, b) = (
+            simplify(&m, &opts(0.1)).unwrap(),
+            simplify(&m, &opts(0.1)).unwrap(),
+        );
         assert_eq!(a.mesh, b.mesh);
         let best = simplify(&m, &SimplifyOptions::ratio(0.1)).unwrap();
         let df = crate::metrics::surface_distance(&m, &a.mesh, 8000);
         let db = crate::metrics::surface_distance(&m, &best.mesh, 8000);
-        assert!(df.relative_mean < db.relative_mean * 2.0, "{df:?} vs {db:?}");
+        assert!(
+            df.relative_mean < db.relative_mean * 2.0,
+            "{df:?} vs {db:?}"
+        );
     }
 
     #[test]
@@ -982,7 +1044,10 @@ mod tests {
                 (b - a).cross(c - a).length() * 0.5
             })
             .sum();
-        assert!((area - (n * n) as f32).abs() < 1e-3, "outline moved: area {area}");
+        assert!(
+            (area - (n * n) as f32).abs() < 1e-3,
+            "outline moved: area {area}"
+        );
         assert!(r.mesh.triangle_count() <= 40);
     }
 }

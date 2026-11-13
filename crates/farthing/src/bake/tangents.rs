@@ -1,8 +1,8 @@
 //! MikkTSpace tangents (via the pure-Rust `mikktspace` crate), so baked normal maps decode
 //! identically in engines that use MikkTSpace.
 
-use glam::{Vec3, Vec4};
 use crate::{Error, Mesh, Result};
+use glam::{Vec3, Vec4};
 
 struct Geo<'a> {
     mesh: &'a Mesh,

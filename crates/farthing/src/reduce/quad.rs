@@ -7,10 +7,10 @@
 //! largest quadric error of its rung collapses (Garland–Heckbert quadrics built from the quad
 //! faces). Related work: Daniels et al. 2008, Tarini et al. 2010 (quad simplification).
 
-use crate::reduce::quadric::Quadric;
-use glam::Vec3;
 use crate::quad::QuadMesh;
+use crate::reduce::quadric::Quadric;
 use crate::{Error, Result};
+use glam::Vec3;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

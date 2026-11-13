@@ -636,7 +636,10 @@ mod tests {
         assert_eq!(bvh.order, one.order);
         assert_eq!(bvh.nodes.len(), one.nodes.len());
         for (a, b) in bvh.nodes.iter().zip(&one.nodes) {
-            assert_eq!((a.min, a.max, a.first, a.count), (b.min, b.max, b.first, b.count));
+            assert_eq!(
+                (a.min, a.max, a.first, a.count),
+                (b.min, b.max, b.first, b.count)
+            );
         }
         let mut r = Pcg32::new(11);
         for _ in 0..100 {
@@ -673,4 +676,3 @@ mod tests {
         }
     }
 }
-

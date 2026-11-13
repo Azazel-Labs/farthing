@@ -1,5 +1,5 @@
-use glam::{Vec2, Vec3};
 use crate::{Error, MaterialId, MaterialSlot, Mesh, Result, Scene};
+use glam::{Vec2, Vec3};
 use std::fmt::Write as _;
 use std::path::Path;
 

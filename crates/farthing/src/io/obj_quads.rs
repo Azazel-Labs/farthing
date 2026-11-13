@@ -1,6 +1,6 @@
-use glam::{Vec2, Vec3};
 use crate::quad::QuadMesh;
 use crate::{Error, Result};
+use glam::{Vec2, Vec3};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;

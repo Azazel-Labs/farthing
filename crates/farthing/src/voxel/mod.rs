@@ -18,12 +18,12 @@
 pub mod grid;
 mod sdf;
 
-use glam::{Vec3, Vec4};
-use grid::Grid;
 use crate::bvh::Bvh;
 use crate::metrics::sample_surface;
-use crate::{Aabb, Error, Mesh, Result, Scene};
 use crate::reduce::{simplify, SimplifyOptions};
+use crate::{Aabb, Error, Mesh, Result, Scene};
+use glam::{Vec3, Vec4};
+use grid::Grid;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -592,9 +592,9 @@ pub fn box_occluders(scene: &Scene, resolution: usize, max_boxes: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Mat4;
     use crate::metrics::surface_distance;
     use crate::Instance;
+    use glam::Mat4;
 
     fn cube(size: f32) -> Mesh {
         let mut positions = Vec::new();

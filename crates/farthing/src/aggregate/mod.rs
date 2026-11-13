@@ -15,13 +15,13 @@
     clippy::type_complexity
 )]
 
-use glam::{Vec2, Vec4};
 use crate::bake::FlattenedTextures;
 use crate::host::{MaterialClass, MaterialInfo};
 use crate::image::Image;
 use crate::math::triangle_area;
-use crate::{Error, MaterialId, MaterialSlot, Mesh, Result, Scene};
 use crate::uv::pack_rects;
+use crate::{Error, MaterialId, MaterialSlot, Mesh, Result, Scene};
+use glam::{Vec2, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -370,9 +370,9 @@ pub fn copy_tangent_normals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::{Mat4, Vec3};
     use crate::host::ChannelEncoding;
     use crate::Instance;
+    use glam::{Mat4, Vec3};
 
     fn quad() -> Mesh {
         let mut m = Mesh::new(

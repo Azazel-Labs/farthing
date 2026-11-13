@@ -6,11 +6,11 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use glam::Vec4;
 use farthing::host::{GeometryOnlyHost, MaterialInfo};
 use farthing::metrics::surface_distance;
-use farthing::{Mesh, Scene};
 use farthing::reduce::{lod_chain, screen_size_to_max_error, simplify, SimplifyOptions};
+use farthing::{Mesh, Scene};
+use glam::Vec4;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -351,31 +351,28 @@ fn main() -> Result<()> {
             let chains: Vec<Vec<farthing::reduce::LodLevel>> = s
                 .meshes
                 .iter()
-                .map(
-                    |m| -> farthing::Result<Vec<farthing::reduce::LodLevel>> {
-                        let mut chain = lod_chain(m, &ratios[..near], &SimplifyOptions::default())?;
-                        if near < levels {
-                            // Far levels: geometry-only from the last near level.
-                            let base = chain.last().unwrap();
-                            let geo = farthing::reduce::repair::geometry_only(&base.mesh);
-                            let rel: Vec<f32> = ratios[near..]
-                                .iter()
-                                .map(|r| {
-                                    r * m.triangle_count() as f32
-                                        / geo.triangle_count().max(1) as f32
-                                })
-                                .collect();
-                            let far = lod_chain(&geo, &rel, &SimplifyOptions::default())?;
-                            let err0 = base.error;
-                            for mut l in far.into_iter().skip(1) {
-                                l.error += err0;
-                                l.mesh.compute_normals(60.0);
-                                chain.push(l);
-                            }
+                .map(|m| -> farthing::Result<Vec<farthing::reduce::LodLevel>> {
+                    let mut chain = lod_chain(m, &ratios[..near], &SimplifyOptions::default())?;
+                    if near < levels {
+                        // Far levels: geometry-only from the last near level.
+                        let base = chain.last().unwrap();
+                        let geo = farthing::reduce::repair::geometry_only(&base.mesh);
+                        let rel: Vec<f32> = ratios[near..]
+                            .iter()
+                            .map(|r| {
+                                r * m.triangle_count() as f32 / geo.triangle_count().max(1) as f32
+                            })
+                            .collect();
+                        let far = lod_chain(&geo, &rel, &SimplifyOptions::default())?;
+                        let err0 = base.error;
+                        for mut l in far.into_iter().skip(1) {
+                            l.error += err0;
+                            l.mesh.compute_normals(60.0);
+                            chain.push(l);
                         }
-                        Ok(chain)
-                    },
-                )
+                    }
+                    Ok(chain)
+                })
                 .collect::<farthing::Result<_>>()?;
             let fov = fov.to_radians();
             let mut info = Vec::new();

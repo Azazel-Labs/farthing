@@ -1,12 +1,12 @@
 //! Chart segmentation + per-chart flattening (LSCM or planar) + packing.
 
-use crate::uv::lscm::{layout_overlaps, lscm};
-use snugly::{pack, rotate_point, ChartMask, HoleFill, MaskPlacement, PackOptions};
-use glam::{Vec2, Vec3};
 use crate::math::{orthonormal_basis, triangle_area};
+use crate::uv::lscm::{layout_overlaps, lscm};
 use crate::{Error, Mesh, Result};
+use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use snugly::{pack, rotate_point, ChartMask, HoleFill, MaskPlacement, PackOptions};
 use std::collections::VecDeque;
 
 /// Small-key hasher (multiply-rotate, as in rustc's FxHash): the maps here hold vertex, face and
@@ -330,7 +330,8 @@ fn planar_chart(mesh: &Mesh, topo: &Topo, faces: Vec<usize>) -> Chart {
     crate::uv::lscm::normalize_area(&pos, &tris, &mut uvs);
     if !flipped && tris.len() >= 2 {
         let before = uvs.clone();
-        if !crate::uv::lscm::arap_refine(&pos, &tris, &mut uvs, 10) || layout_overlaps(&uvs, &tris, 256)
+        if !crate::uv::lscm::arap_refine(&pos, &tris, &mut uvs, 10)
+            || layout_overlaps(&uvs, &tris, 256)
         {
             uvs = before;
         }
@@ -762,7 +763,11 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
                 .collect();
             let merged = merge_charts(mesh, &topo, built.into_iter().flatten().collect());
             if opts.split_sprawling {
-                charts.extend(merged.into_iter().flat_map(|c| split_sprawling(&topo, c, 0)));
+                charts.extend(
+                    merged
+                        .into_iter()
+                        .flat_map(|c| split_sprawling(&topo, c, 0)),
+                );
             } else {
                 charts.extend(merged);
             }

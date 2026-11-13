@@ -245,11 +245,7 @@ pub fn lscm(pos: &[Vec3], tris: &[[u32; 3]]) -> Option<Vec<Vec2>> {
     let signed: Vec<f32> = tris
         .iter()
         .map(|t| {
-            crate::math::signed_area_2d(
-                uv[t[0] as usize],
-                uv[t[1] as usize],
-                uv[t[2] as usize],
-            )
+            crate::math::signed_area_2d(uv[t[0] as usize], uv[t[1] as usize], uv[t[2] as usize])
         })
         .collect();
     let neg = signed.iter().filter(|&&s| s < 0.0).count();
@@ -270,11 +266,7 @@ pub fn lscm(pos: &[Vec3], tris: &[[u32; 3]]) -> Option<Vec<Vec2>> {
     let a3: f32 = tris
         .iter()
         .map(|t| {
-            crate::math::triangle_area(
-                pos[t[0] as usize],
-                pos[t[1] as usize],
-                pos[t[2] as usize],
-            )
+            crate::math::triangle_area(pos[t[0] as usize], pos[t[1] as usize], pos[t[2] as usize])
         })
         .sum();
     let a2: f32 = signed.iter().map(|s| s.abs()).sum();

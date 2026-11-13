@@ -1,12 +1,12 @@
 use crate::bake::correspondence::{build_correspondence, Correspondence};
 use crate::bake::tangents::compute_tangents;
-use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use crate::host::{
     channels, ChannelEncoding, ChannelImage, ChannelImages, RenderHost, SurfaceBakeRequest,
     SurfaceSample,
 };
 use crate::image::Image;
 use crate::{Error, Mesh, Result, Scene};
+use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 

@@ -125,7 +125,10 @@ pub fn visible_surface_distance(a: &Mesh, b: &Mesh, samples: usize) -> SurfaceDi
     let visible = |pts: Vec<Vec3>, own: &Bvh| -> Vec<Vec3> {
         let eps = diagonal * 1e-5;
         pts.into_par_iter()
-            .filter(|p| dirs.iter().any(|&d| !own.occluded(*p, d, eps, diagonal * 4.0)))
+            .filter(|p| {
+                dirs.iter()
+                    .any(|&d| !own.occluded(*p, d, eps, diagonal * 4.0))
+            })
             .collect()
     };
     let fwd = one_way(&visible(sample_surface(a, samples, 11), &bvh_a), &bvh_b);

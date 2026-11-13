@@ -1,10 +1,10 @@
-use glam::{Mat4, Vec2, Vec3, Vec4};
 use crate::host::{MaterialClass, MaterialInfo};
 use crate::image::Image;
 use crate::{
     Error, Instance, Joint, MaterialId, MaterialSlot, Mesh, MorphTarget, Result, Scene, Skeleton,
     Skin,
 };
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -31,7 +31,9 @@ pub struct GltfMaterial {
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<(Scene, Vec<GltfMaterial>)> {
     let (doc, buffers, images) =
         gltf::import(path.as_ref()).map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
-    build(&doc, &buffers, &|i, srgb| images.get(i).map(|d| decode_image(d, srgb)))
+    build(&doc, &buffers, &|i, srgb| {
+        images.get(i).map(|d| decode_image(d, srgb))
+    })
 }
 
 /// Loads a GLB, or a `.gltf` whose buffers and images are embedded (`data:` URIs), from memory.
@@ -95,7 +97,12 @@ pub fn load_gltf_with(
     build(&document, &buffers, &|i, srgb| {
         let bytes = encoded.get(i)?.as_ref()?;
         let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
-        Some(Image::from_rgba8(rgba.width(), rgba.height(), rgba.as_raw(), srgb))
+        Some(Image::from_rgba8(
+            rgba.width(),
+            rgba.height(),
+            rgba.as_raw(),
+            srgb,
+        ))
     })
 }
 
@@ -186,7 +193,11 @@ fn build(
                 .metallic_roughness_texture()
                 .and_then(|t| Some((image(t.texture().source().index(), false)?, t.tex_coord())));
             let normal = m.normal_texture().and_then(|t| {
-                Some((image(t.texture().source().index(), false)?, t.tex_coord(), t.scale()))
+                Some((
+                    image(t.texture().source().index(), false)?,
+                    t.tex_coord(),
+                    t.scale(),
+                ))
             });
             GltfMaterial {
                 name: materials[i].name.clone(),

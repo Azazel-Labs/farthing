@@ -1,8 +1,8 @@
 //! Reducer timing + golden hashes: `cargo run --release -p farthing --example bench_assets -- [-n RUNS] files...`
 //! Prints min-of-N wall time per (asset, ratio) and an FNV hash of the output mesh so layout and
 //! SIMD refactors can be checked for identical behaviour.
-use farthing::Mesh;
 use farthing::reduce::{simplify, SimplifyOptions};
+use farthing::Mesh;
 use std::time::Instant;
 
 fn hash(m: &Mesh) -> u64 {
@@ -97,7 +97,10 @@ fn main() {
         ));
     }
     // Run inside the pool so profilers see the whole reduction on one call stack.
-    rayon::ThreadPoolBuilder::new().build().unwrap().install(|| run(&meshes, runs));
+    rayon::ThreadPoolBuilder::new()
+        .build()
+        .unwrap()
+        .install(|| run(&meshes, runs));
 }
 
 fn run(meshes: &[(String, Mesh)], runs: usize) {

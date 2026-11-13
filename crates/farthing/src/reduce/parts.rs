@@ -13,10 +13,10 @@
 //! already accepted, and, when collapses stall above the target, deletes the cheapest part and
 //! carries on.
 
-use crate::reduce::SimplifyResult;
-use glam::Vec3;
 use crate::bvh::Bvh;
+use crate::reduce::SimplifyResult;
 use crate::Mesh;
+use glam::Vec3;
 use rayon::prelude::*;
 
 /// Parts of the original input (connected by shared positions) with what removing each costs.
@@ -151,10 +151,12 @@ impl Parts {
         let eps = self.reach * 1e-6;
         vis_dirs().iter().any(|d| {
             d.dot(n) > 0.2
-                && !self.all.occluded_where(p + n * eps, *d, eps, self.reach, |t| {
-                    let j = self.tri_part[t as usize] as usize;
-                    j != k && !self.removed[j] && self.occluder[t as usize]
-                })
+                && !self
+                    .all
+                    .occluded_where(p + n * eps, *d, eps, self.reach, |t| {
+                        let j = self.tri_part[t as usize] as usize;
+                        j != k && !self.removed[j] && self.occluder[t as usize]
+                    })
         })
     }
 

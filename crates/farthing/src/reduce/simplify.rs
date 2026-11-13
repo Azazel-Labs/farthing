@@ -19,8 +19,8 @@
 use crate::reduce::kernels;
 use crate::reduce::quadric::Quadric;
 use crate::reduce::symmetry::{mirror_map, Symmetry};
-use glam::DVec3;
 use crate::{Error, Mesh, Result, Scene};
+use glam::DVec3;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -907,7 +907,9 @@ impl<'a> State<'a> {
                             break;
                         }
                         *cur += 1;
-                        let Some(f) = &faces[t as usize - c0] else { continue };
+                        let Some(f) = &faces[t as usize - c0] else {
+                            continue;
+                        };
                         q.add(&f.plane);
                         for (i, bq) in f.border.iter().enumerate() {
                             if let Some(bq) = bq {
@@ -933,7 +935,9 @@ impl<'a> State<'a> {
                             }
                             *cur += 1;
                             let Some(f) = &faces[t - c0] else { continue };
-                            let Some((cn, co, grads)) = &f.attr else { continue };
+                            let Some((cn, co, grads)) = &f.attr else {
+                                continue;
+                            };
                             let area = f.area;
                             for k in 0..12 {
                                 row[k] += cn[k];
@@ -1811,7 +1815,8 @@ impl<'a> State<'a> {
                 continue;
             }
             self.p_corners(x, &mut corners);
-            if !self.strict && !self.relaxed && Self::distinct_wedges(&corners) > MAX_SOURCE_WEDGES {
+            if !self.strict && !self.relaxed && Self::distinct_wedges(&corners) > MAX_SOURCE_WEDGES
+            {
                 continue;
             }
             if self.map_from_corners(&corners, q, &mut map) {
@@ -1994,11 +1999,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             cand.par_iter()
                 .with_min_len(4096)
                 .enumerate()
-                .filter_map(|(p, c)| {
-                    c.as_ref()
-                        .filter(|_| alive[p])
-                        .map(|c| (c.cost, p as u32))
-                })
+                .filter_map(|(p, c)| c.as_ref().filter(|_| alive[p]).map(|c| (c.cost, p as u32)))
                 .collect()
         };
         if list.is_empty() {
@@ -2134,17 +2135,20 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 .collect();
             sub += 1;
             let reserve_ref = &reserve;
-            sets.par_iter().zip(pending[..prefix].par_iter()).for_each(|(set, &li)| {
-                for &v in set {
-                    reserve_ref[v as usize].fetch_min(li as u32, AtomicOrdering::Relaxed);
-                }
-            });
+            sets.par_iter()
+                .zip(pending[..prefix].par_iter())
+                .for_each(|(set, &li)| {
+                    for &v in set {
+                        reserve_ref[v as usize].fetch_min(li as u32, AtomicOrdering::Relaxed);
+                    }
+                });
             let won: Vec<bool> = sets
                 .par_iter()
                 .zip(pending[..prefix].par_iter())
                 .map(|(set, &li)| {
-                    set.iter()
-                        .all(|&v| reserve_ref[v as usize].load(AtomicOrdering::Relaxed) == li as u32)
+                    set.iter().all(|&v| {
+                        reserve_ref[v as usize].load(AtomicOrdering::Relaxed) == li as u32
+                    })
                 })
                 .collect();
             sets.par_iter().for_each(|set| {
@@ -2352,7 +2356,8 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         if executed == 0 {
             stall += 1;
             // Collapses are stuck above the target: delete the cheapest part and go on.
-            if let Some(t) = target.filter(|&t| stall >= 3 && st.parts.is_some() && alive_tris > t) {
+            if let Some(t) = target.filter(|&t| stall >= 3 && st.parts.is_some() && alive_tris > t)
+            {
                 let floor = t.saturating_sub(alive_tris - t);
                 let limit = st.stall_part_limit(worst_geom2);
                 let n = st.delete_parts(limit, 1, alive_tris, floor, &mut cand);
@@ -2926,8 +2931,8 @@ pub fn lod_chain(mesh: &Mesh, ratios: &[f32], base: &SimplifyOptions) -> Result<
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use glam::{Vec2, Vec3};
     use crate::metrics::surface_distance;
+    use glam::{Vec2, Vec3};
 
     /// UV sphere with a seam (duplicated vertices along u = 0/1) and poles.
     pub fn uv_sphere(seg: u32, rings: u32) -> Mesh {
@@ -3548,7 +3553,13 @@ mod part_tests {
                     pos.push(Vec3::new(i as f32 / n as f32, 0.0, 0.0) + dir * (j as f32 * 0.1));
                 }
             }
-            let at = |i: u32, j: u32| if j == 0 { i } else { base + (j - 1) * (n + 1) + i };
+            let at = |i: u32, j: u32| {
+                if j == 0 {
+                    i
+                } else {
+                    base + (j - 1) * (n + 1) + i
+                }
+            };
             for j in 0..4 {
                 for i in 0..n {
                     let (a, b, c, d) = (at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1));
@@ -3577,7 +3588,11 @@ mod part_tests {
                 .filter(|p| p.y.abs() < 1e-6 && p.z.abs() < 1e-6)
                 .count()
         };
-        assert!(on_line(&r.mesh) < (n + 1) as usize / 2, "{} junction vertices left", on_line(&r.mesh));
+        assert!(
+            on_line(&r.mesh) < (n + 1) as usize / 2,
+            "{} junction vertices left",
+            on_line(&r.mesh)
+        );
         // The junction keeps its ends and the fins keep their extent.
         let d = crate::metrics::surface_distance(&m, &r.mesh, 4000);
         assert!(d.relative_hausdorff < 0.01, "{d:?}");
@@ -3612,7 +3627,11 @@ mod part_tests {
             },
         )
         .unwrap();
-        assert!(r.mesh.triangle_count() <= m.triangle_count() / 10 + 2, "{}", r.mesh.triangle_count());
+        assert!(
+            r.mesh.triangle_count() <= m.triangle_count() / 10 + 2,
+            "{}",
+            r.mesh.triangle_count()
+        );
         // Its open border is still a border: corners and edges stay in place.
         let d = crate::metrics::surface_distance(&m, &r.mesh, 4000);
         assert!(d.relative_hausdorff < 0.02, "{d:?}");
@@ -3624,7 +3643,10 @@ mod part_tests {
         // deleting one removes a whole visible object.
         let mut m = Mesh::default();
         for k in 0..3 {
-            m.append(&moved(torus(16, 8), Vec3::new(10.0 * k as f32, 0.0, 0.0), 1.0), 0);
+            m.append(
+                &moved(torus(16, 8), Vec3::new(10.0 * k as f32, 0.0, 0.0), 1.0),
+                0,
+            );
         }
         let run = |protect: f32| {
             simplify(

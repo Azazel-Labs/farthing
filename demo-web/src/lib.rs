@@ -66,7 +66,8 @@ mod web {
                     &Uint8Array::from(bytes).into(),
                 );
             };
-            let mut emit = |e: Event| match e {
+            let mut emit = |e: Event| {
+                match e {
                 Event::Stage(s) => call("stage", s.to_owned(), &[]),
                 Event::Level { info, glb } => {
                     call("level", serde_json::to_string(info).unwrap_or_default(), glb)
@@ -83,6 +84,7 @@ mod web {
                         .to_string(),
                     rgba,
                 ),
+            }
             };
             self.0
                 .run(&opts, &now, &mut emit)

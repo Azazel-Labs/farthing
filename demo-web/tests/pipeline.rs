@@ -2,9 +2,9 @@
 //! through reduced and baked levels.
 
 use farthing::image::Image;
+use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
 use farthing::{Mesh, Scene};
 use farthing_demo_web::pipeline::{Demo, Event, LodOptions};
-use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
 use glam::{Vec2, Vec3, Vec4};
 use std::io::Write;
 
@@ -52,13 +52,16 @@ fn split_glb(glb: &[u8], bin_uri: &str) -> (Vec<u8>, Vec<u8>) {
     let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
     let mut doc: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
     doc["buffers"][0]["uri"] = bin_uri.into();
-    (serde_json::to_vec(&doc).unwrap(), glb[20 + json_len + 8..].to_vec())
+    (
+        serde_json::to_vec(&doc).unwrap(),
+        glb[20 + json_len + 8..].to_vec(),
+    )
 }
 
 fn zip(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (name, data) in files {
         w.start_file(*name, opts).unwrap();
         w.write_all(data).unwrap();
@@ -89,14 +92,24 @@ fn zipped_gltf_reduces_and_bakes() {
     };
     let (mut levels, mut textures, mut stages) = (vec![], vec![], 0);
     let t0 = std::time::Instant::now();
-    demo.run(&opts, &|| t0.elapsed().as_secs_f64() * 1e3, &mut |e| match e {
-        Event::Stage(_) => stages += 1,
-        Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
-        Event::Texture { channel, width, height, rgba, .. } => {
-            assert_eq!(rgba.len(), (width * height * 4) as usize);
-            textures.push((channel.to_owned(), rgba.to_vec()));
-        }
-    })
+    demo.run(
+        &opts,
+        &|| t0.elapsed().as_secs_f64() * 1e3,
+        &mut |e| match e {
+            Event::Stage(_) => stages += 1,
+            Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+            Event::Texture {
+                channel,
+                width,
+                height,
+                rgba,
+                ..
+            } => {
+                assert_eq!(rgba.len(), (width * height * 4) as usize);
+                textures.push((channel.to_owned(), rgba.to_vec()));
+            }
+        },
+    )
     .unwrap();
 
     assert!(stages > 3);
@@ -131,6 +144,8 @@ fn reports_missing_files() {
     let (gltf, _) = split_glb(&textured_sphere(), "missing.bin");
     let e = Demo::load(vec![("a.gltf".into(), gltf)]).err().unwrap();
     assert!(e.contains("missing.bin"), "{e}");
-    let e = Demo::load(vec![("notes.txt".into(), b"hi".to_vec())]).err().unwrap();
+    let e = Demo::load(vec![("notes.txt".into(), b"hi".to_vec())])
+        .err()
+        .unwrap();
     assert!(e.contains("no .glb or .gltf"), "{e}");
 }

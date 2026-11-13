@@ -150,10 +150,13 @@ mod tests {
 
         doc["buffers"][0]["uri"] = "my%20mesh.bin".into();
         let text = serde_json::to_vec(&doc).unwrap();
-        let (back, _) = load_gltf_with(&text, |name| (name == "my mesh.bin").then(|| bin.clone()))
-            .unwrap();
+        let (back, _) =
+            load_gltf_with(&text, |name| (name == "my mesh.bin").then(|| bin.clone())).unwrap();
         assert_eq!(back.triangle_count(), 2);
-        assert!(load_gltf_slice(&text).is_err(), "external file without a resolver");
+        assert!(
+            load_gltf_slice(&text).is_err(),
+            "external file without a resolver"
+        );
 
         let b64 = {
             const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -163,7 +166,11 @@ mod tests {
                     | (*c.get(1).unwrap_or(&0) as u32) << 8
                     | *c.get(2).unwrap_or(&0) as u32;
                 for k in 0..4 {
-                    s.push(if k <= c.len() { T[(n >> (18 - 6 * k) & 63) as usize] as char } else { '=' });
+                    s.push(if k <= c.len() {
+                        T[(n >> (18 - 6 * k) & 63) as usize] as char
+                    } else {
+                        '='
+                    });
                 }
             }
             s

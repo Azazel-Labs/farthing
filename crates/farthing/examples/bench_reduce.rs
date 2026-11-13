@@ -1,7 +1,7 @@
 //! Reduction throughput benchmark: `cargo run --release -p farthing --example bench_reduce [segments]`
-use glam::{Vec2, Vec3};
-use farthing::Mesh;
 use farthing::reduce::{simplify, SeamMode, SimplifyOptions};
+use farthing::Mesh;
+use glam::{Vec2, Vec3};
 use std::time::Instant;
 
 /// Noisy UV sphere with seams, normals and UVs.

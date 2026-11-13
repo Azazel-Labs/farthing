@@ -1,6 +1,6 @@
-use glam::Mat4;
 use crate::image::Image;
 use crate::{Error, Result, Scene};
+use glam::Mat4;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;

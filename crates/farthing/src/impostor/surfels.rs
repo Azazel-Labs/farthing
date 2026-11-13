@@ -98,7 +98,12 @@ pub const MIN_SIZING_WEIGHT: f32 = 0.05;
 fn sizing_scale(opts: &SurfelOptions, t: usize) -> f32 {
     match &opts.triangle_weights {
         Some(w) if opts.adaptive_density => {
-            1.0 / w.get(t).copied().unwrap_or(0.0).clamp(MIN_SIZING_WEIGHT, 1.0).sqrt()
+            1.0 / w
+                .get(t)
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(MIN_SIZING_WEIGHT, 1.0)
+                .sqrt()
         }
         _ => 1.0,
     }
@@ -152,8 +157,12 @@ fn cloud_and_area(mesh: &Mesh, opts: &SurfelOptions) -> Result<(Vec<Surfel>, f64
         let [a, b, c] = mesh.triangle_positions(t);
         cand.push((a * bary.x + b * bary.y + c * bary.z, t as u32, bary));
     }
-    let scales: Option<Vec<f32>> = (opts.adaptive_density && opts.triangle_weights.is_some())
-        .then(|| cand.iter().map(|c| sizing_scale(opts, c.1 as usize)).collect());
+    let scales: Option<Vec<f32>> =
+        (opts.adaptive_density && opts.triangle_weights.is_some()).then(|| {
+            cand.iter()
+                .map(|c| sizing_scale(opts, c.1 as usize))
+                .collect()
+        });
     let keep = eliminate(
         &cand.iter().map(|c| c.0).collect::<Vec<_>>(),
         scales.as_deref(),
@@ -325,7 +334,12 @@ impl SurfelCloud {
     /// Surfel count for an object whose bounding sphere spans `screen_diameter_px` pixels, with
     /// each disc covering about `px_per_surfel` pixels across: (visible area in pixels) ÷ (disc
     /// area). Clamped to the cloud's size; fractional for fading.
-    pub fn count_for_screen(&self, screen_diameter_px: f32, radius: f32, px_per_surfel: f32) -> f32 {
+    pub fn count_for_screen(
+        &self,
+        screen_diameter_px: f32,
+        radius: f32,
+        px_per_surfel: f32,
+    ) -> f32 {
         // Roughly half the surface faces the camera; pixels per world unit at that size.
         let ppu = screen_diameter_px / (2.0 * radius.max(1e-12));
         let visible_px = 0.5 * self.area * ppu * ppu;
@@ -343,8 +357,16 @@ impl SurfelCloud {
         let k = k.clamp(1.0, n_all);
         let whole = k.floor() as usize;
         let frac = k - whole as f32;
-        let n = if frac > 0.0 { (whole + 1).min(self.surfels.len()) } else { whole };
-        (&self.surfels[..n], (n_all / k).sqrt(), if frac > 0.0 { frac } else { 1.0 })
+        let n = if frac > 0.0 {
+            (whole + 1).min(self.surfels.len())
+        } else {
+            whole
+        };
+        (
+            &self.surfels[..n],
+            (n_all / k).sqrt(),
+            if frac > 0.0 { frac } else { 1.0 },
+        )
     }
 }
 
@@ -377,7 +399,9 @@ const FLAG_SOURCE: u16 = 1;
 const FLAG_RADII: u16 = 2;
 
 fn encode_scale(s: f32) -> u8 {
-    ((s.max(1e-6).log2() + 4.0) * 16.0).round().clamp(0.0, 255.0) as u8
+    ((s.max(1e-6).log2() + 4.0) * 16.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 fn decode_scale(q: u8) -> f32 {
@@ -389,13 +413,18 @@ impl SurfelCloud {
     /// vary, see [`has_varying_radii`](Self::has_varying_radii)).
     pub fn record_size(channels: &[SurfelChannel], with_source: bool) -> usize {
         10 + if with_source { 8 } else { 0 }
-            + channels.iter().map(|c| c.components as usize).sum::<usize>()
+            + channels
+                .iter()
+                .map(|c| c.components as usize)
+                .sum::<usize>()
     }
 
     /// Whether surfels differ in radius (weighted clouds), so the stream stores a scale each.
     pub fn has_varying_radii(&self) -> bool {
         let base = self.radius_for(self.surfels.len() as f32);
-        self.surfels.iter().any(|s| (s.radius / base - 1.0).abs() > 1e-4)
+        self.surfels
+            .iter()
+            .any(|s| (s.radius / base - 1.0).abs() > 1e-4)
     }
 
     /// Compact stream, little-endian: a header (magic `LFSF`, version, flags, count, area,
@@ -419,7 +448,11 @@ impl SurfelCloud {
             (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
             |(lo, hi), s| (lo.min(s.position), hi.max(s.position)),
         );
-        let (lo, hi) = if n == 0 { (Vec3::ZERO, Vec3::ZERO) } else { (lo, hi) };
+        let (lo, hi) = if n == 0 {
+            (Vec3::ZERO, Vec3::ZERO)
+        } else {
+            (lo, hi)
+        };
         let radii = self.has_varying_radii();
         let base = self.radius_for(n as f32);
         let mut out = Vec::with_capacity(64 + n * (Self::record_size(channels, with_source) + 1));
@@ -471,7 +504,9 @@ impl SurfelCloud {
         let bad = |m: &str| Error::InvalidInput(format!("surfel stream: {m}"));
         let mut at = 0usize;
         let mut take = |k: usize| -> Result<&[u8]> {
-            let s = bytes.get(at..at + k).ok_or_else(|| bad("truncated header"))?;
+            let s = bytes
+                .get(at..at + k)
+                .ok_or_else(|| bad("truncated header"))?;
             at += k;
             Ok(s)
         };
@@ -561,8 +596,13 @@ pub fn progressive_surfel_cloud(mesh: &Mesh, opts: &SurfelOptions) -> Result<Sur
     let (surfels, area) = cloud_and_area(mesh, opts)?;
     let area = area as f32;
     let pts: Vec<Vec3> = surfels.iter().map(|s| s.position).collect();
-    let scales: Option<Vec<f32>> = (opts.adaptive_density && opts.triangle_weights.is_some())
-        .then(|| surfels.iter().map(|s| sizing_scale(opts, s.triangle as usize)).collect());
+    let scales: Option<Vec<f32>> =
+        (opts.adaptive_density && opts.triangle_weights.is_some()).then(|| {
+            surfels
+                .iter()
+                .map(|s| sizing_scale(opts, s.triangle as usize))
+                .collect()
+        });
     let order = progressive_order(&pts, scales.as_deref(), area as f64);
     Ok(SurfelCloud {
         surfels: order.into_iter().map(|i| surfels[i]).collect(),
@@ -587,7 +627,10 @@ fn progressive_order(pts: &[Vec3], scale: Option<&[f32]>, area: f64) -> Vec<usiz
             kept[k] = true;
         }
         eliminated.extend(keep.1.iter().map(|&k| alive[k]));
-        alive = (0..sub.len()).filter(|&k| kept[k]).map(|k| alive[k]).collect();
+        alive = (0..sub.len())
+            .filter(|&k| kept[k])
+            .map(|k| alive[k])
+            .collect();
     }
     eliminated.extend(alive);
     eliminated.reverse();
@@ -649,11 +692,18 @@ mod tests {
     /// Both reference shaders parse and validate (naga: wgpu's shader compiler).
     #[test]
     fn reference_shaders_validate() {
-        for (name, src) in [("surfel_splat", SURFEL_SHADER), ("octahedral", crate::impostor::REFERENCE_SHADER)] {
-            let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
-            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
-                .validate(&module)
-                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        for (name, src) in [
+            ("surfel_splat", SURFEL_SHADER),
+            ("octahedral", crate::impostor::REFERENCE_SHADER),
+        ] {
+            let module = naga::front::wgsl::parse_str(src)
+                .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::empty(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         }
     }
 
@@ -761,8 +811,15 @@ mod tests {
         let cloud = progressive_surfel_cloud(&m, &opts).unwrap();
         let plain = surfel_cloud(&m, &opts).unwrap();
         // Same surfels, reordered.
-        let mut a: Vec<_> = cloud.surfels.iter().map(|s| s.position.to_array().map(f32::to_bits)).collect();
-        let mut b: Vec<_> = plain.iter().map(|s| s.position.to_array().map(f32::to_bits)).collect();
+        let mut a: Vec<_> = cloud
+            .surfels
+            .iter()
+            .map(|s| s.position.to_array().map(f32::to_bits))
+            .collect();
+        let mut b: Vec<_> = plain
+            .iter()
+            .map(|s| s.position.to_array().map(f32::to_bits))
+            .collect();
         a.sort_unstable();
         b.sort_unstable();
         assert_eq!(a, b);
@@ -773,10 +830,20 @@ mod tests {
             // About as hole-free and as evenly spread as a cloud generated for k surfels
             // directly (blue noise thins out at the plane's open border, so up to 1% of probes
             // near it can miss; a fresh cloud misses up to 0.1%).
-            let fresh = surfel_cloud(&m, &SurfelOptions { count: k, ..opts.clone() }).unwrap();
+            let fresh = surfel_cloud(
+                &m,
+                &SurfelOptions {
+                    count: k,
+                    ..opts.clone()
+                },
+            )
+            .unwrap();
             let (h, hf) = (holes(prefix, r), holes(&fresh, fresh[0].radius));
             assert!(h < 0.01, "prefix {k}: holes {h} vs fresh {hf}");
-            assert!(min_spacing(prefix) >= 0.9 * min_spacing(&fresh), "prefix {k} clumps");
+            assert!(
+                min_spacing(prefix) >= 0.9 * min_spacing(&fresh),
+                "prefix {k} clumps"
+            );
             // A prefix of the unordered cloud leaves holes at the same radius.
             if k < 400 {
                 let hp = holes(&plain[..k], r);
@@ -859,8 +926,18 @@ mod tests {
         assert!(lo.len() * 3 < hi.len(), "{} vs {}", lo.len(), hi.len());
         // No holes on either half (interior probes), even where surfels are sparse.
         for k in 0..900 {
-            let p = Vec3::new(0.08 + 0.84 * (k % 30) as f32 / 29.0, 0.0, 0.08 + 0.84 * (k / 30) as f32 / 29.0);
-            assert!(cloud.surfels.iter().any(|x| (x.position - p).length() <= x.radius), "hole at {p}");
+            let p = Vec3::new(
+                0.08 + 0.84 * (k % 30) as f32 / 29.0,
+                0.0,
+                0.08 + 0.84 * (k / 30) as f32 / 29.0,
+            );
+            assert!(
+                cloud
+                    .surfels
+                    .iter()
+                    .any(|x| (x.position - p).length() <= x.radius),
+                "hole at {p}"
+            );
         }
         // The stream keeps the radii (one byte each, within 4.4%).
         assert!(cloud.has_varying_radii());
@@ -868,7 +945,12 @@ mod tests {
         assert_eq!(bytes.len(), 45 + 500 * 11);
         let d = SurfelCloud::decode(&bytes).unwrap();
         for (a, b) in cloud.surfels.iter().zip(&d.cloud.surfels) {
-            assert!((b.radius / a.radius - 1.0).abs() < 0.023, "{} vs {}", a.radius, b.radius);
+            assert!(
+                (b.radius / a.radius - 1.0).abs() < 0.023,
+                "{} vs {}",
+                a.radius,
+                b.radius
+            );
         }
     }
 

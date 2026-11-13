@@ -31,13 +31,13 @@ pub use billboard::{
     billboard_cloud, build_billboard_cloud, BillboardCloud, BillboardOptions, BillboardPlane,
 };
 
-use glam::{Vec2, Vec3, Vec4};
 use crate::host::{
     channels, BakedMaterialDesc, BakedMaterialKind, ChannelImage, ChannelImages, MaterialClass,
     RenderHost, View, ViewImages, ViewRenderRequest,
 };
 use crate::image::Image;
 use crate::{Aabb, Error, MaterialId, Mesh, Result, Scene};
+use glam::{Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -379,7 +379,16 @@ pub fn build_impostor_supersampled(
     create_material: bool,
     supersample: u32,
 ) -> Result<ImpostorAsset> {
-    build(host, scene, kind, frame_size, create_material, supersample, 1, None)
+    build(
+        host,
+        scene,
+        kind,
+        frame_size,
+        create_material,
+        supersample,
+        1,
+        None,
+    )
 }
 
 /// Two-layer impostor for concave props. Each frame also stores the nearest front-facing
@@ -472,7 +481,16 @@ pub fn build_layered_impostor_with(
     create_material: bool,
     opts: &LayerOptions,
 ) -> Result<ImpostorAsset> {
-    match build(host, scene, kind, frame_size, create_material, 2, 2, Some(opts)) {
+    match build(
+        host,
+        scene,
+        kind,
+        frame_size,
+        create_material,
+        2,
+        2,
+        Some(opts),
+    ) {
         Err(Error::Unsupported(_)) if opts.auto => {
             build(host, scene, kind, frame_size, create_material, 2, 1, None)
         }
@@ -522,14 +540,20 @@ fn build(
         };
         if !keep {
             layers = 1;
-        } else if layer_opts.is_some_and(|o| o.half_resolution) && frame_size.is_multiple_of(2) && frame_size >= 8 {
+        } else if layer_opts.is_some_and(|o| o.half_resolution)
+            && frame_size.is_multiple_of(2)
+            && frame_size >= 8
+        {
             // Half resolution: the same captures box-filtered twice as far, same layout
             // (normalized atlas coordinates match the first layer's).
             let half = CapturePlan {
                 frame_size: frame_size / 2,
                 ..p.clone()
             };
-            let small: Vec<ViewImages> = back_full.iter().map(|v| downsample_view(v, 2 * ss)).collect();
+            let small: Vec<ViewImages> = back_full
+                .iter()
+                .map(|v| downsample_view(v, 2 * ss))
+                .collect();
             for (name, ch) in assemble(&half, &small, 2)? {
                 atlas.insert(layer_channel(&name, 1), ch);
             }
@@ -650,7 +674,10 @@ mod layer_tests {
             }
             assert_eq!(behind.len(), req.views.len());
             assert!(bias > 0.0);
-            assert_eq!(behind[0].width, req.views[0].width, "peel at capture resolution");
+            assert_eq!(
+                behind[0].width, req.views[0].width,
+                "peel at capture resolution"
+            );
             assert_eq!(behind[0].pixels[0].x, 1.0);
             Ok(req.views.iter().map(|v| images(v, 3.0, true)).collect())
         }
@@ -669,8 +696,8 @@ mod layer_tests {
             frames_per_side: 4,
             hemisphere: false,
         };
-        let imp = build_layered_impostor(&mut Peeler { peel: true }, &scene, &kind, 16, false)
-            .unwrap();
+        let imp =
+            build_layered_impostor(&mut Peeler { peel: true }, &scene, &kind, 16, false).unwrap();
         assert_eq!(imp.params.layers, 2);
         let front = &imp.atlas[channels::BASE_COLOR].image;
         let back = &imp.atlas[&layer_channel(channels::BASE_COLOR, 1)].image;
@@ -687,7 +714,9 @@ mod layer_tests {
         assert!(matches!(err, Err(Error::Unsupported(_))));
         let one = build_impostor(&mut Peeler { peel: false }, &scene, &kind, 16, false).unwrap();
         assert_eq!(one.params.layers, 1);
-        assert!(!one.atlas.contains_key(&layer_channel(channels::BASE_COLOR, 1)));
+        assert!(!one
+            .atlas
+            .contains_key(&layer_channel(channels::BASE_COLOR, 1)));
         // Half of each frame has a surface behind it: the benefit is that share × the gap.
         let b = layer_benefit(&imp.atlas).unwrap();
         assert!(b > 0.25, "{b}");
@@ -704,15 +733,24 @@ mod layer_tests {
         .unwrap();
         assert_eq!(half.params.layers, 2);
         let back = &half.atlas[&layer_channel(channels::BASE_COLOR, 1)].image;
-        assert_eq!((back.width, back.height), (front.width / 2, front.height / 2));
+        assert_eq!(
+            (back.width, back.height),
+            (front.width / 2, front.height / 2)
+        );
         // Auto: below the threshold the second layer is dropped; without peeling, one layer.
         let strict = LayerOptions {
             auto_threshold: 100.0,
             ..Default::default()
         };
-        let dropped =
-            build_layered_impostor_with(&mut Peeler { peel: true }, &scene, &kind, 16, false, &strict)
-                .unwrap();
+        let dropped = build_layered_impostor_with(
+            &mut Peeler { peel: true },
+            &scene,
+            &kind,
+            16,
+            false,
+            &strict,
+        )
+        .unwrap();
         assert_eq!(dropped.params.layers, 1);
         assert!(!dropped.atlas.contains_key(&layer_channel(HEIGHT, 1)));
         let fallback = build_layered_impostor_with(

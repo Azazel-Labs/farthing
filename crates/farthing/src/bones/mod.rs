@@ -16,8 +16,8 @@
     clippy::type_complexity
 )]
 
-use glam::{Mat4, Vec3};
 use crate::{Error, Mesh, Result, Skeleton};
+use glam::{Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// Keeps the `max` largest weights per vertex and renormalizes. Returns vertices changed.

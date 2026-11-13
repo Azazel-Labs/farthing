@@ -1,7 +1,7 @@
 //! Dense voxel grids: triangle voxelization, flood fill, morphology, surface nets.
 
-use glam::Vec3;
 use crate::{Aabb, Mesh};
+use glam::Vec3;
 use std::collections::VecDeque;
 
 /// A dense grid of cubic cells. Cell (x, y, z) covers `origin + [x, x+1) * cell` etc.

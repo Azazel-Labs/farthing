@@ -20,9 +20,9 @@
 //!   on its own) keeps every boundary cell around it, so the slab does not thin into a
 //!   staircase that falls apart into islands.
 
+use crate::bvh::Bvh;
 use crate::voxel::grid::Grid;
 use glam::Vec3;
-use crate::bvh::Bvh;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -177,7 +177,9 @@ pub(crate) fn relabel_boundary(
                 for b in 0..=k - a {
                     let (u, v) = (a as f32 / k as f32, b as f32 / k as f32);
                     let p = t[0] + (t[1] - t[0]) * u + (t[2] - t[0]) * v;
-                    let Some([x, y, z]) = grid.cell_of(p) else { continue };
+                    let Some([x, y, z]) = grid.cell_of(p) else {
+                        continue;
+                    };
                     let (mut ok, mut any_in) = (false, false);
                     'search: for dz in -1i32..=1 {
                         for dy in -1i32..=1 {
@@ -233,7 +235,13 @@ pub(crate) fn relabel_boundary(
             for dy in -1i32..=1 {
                 for dx in -1i32..=1 {
                     let (a, b, cz) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
-                    if a < 0 || b < 0 || cz < 0 || a >= nx as i32 || b >= ny as i32 || cz >= nz as i32 {
+                    if a < 0
+                        || b < 0
+                        || cz < 0
+                        || a >= nx as i32
+                        || b >= ny as i32
+                        || cz >= nz as i32
+                    {
                         continue;
                     }
                     let j = grid.idx(a as usize, b as usize, cz as usize);

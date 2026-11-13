@@ -15,11 +15,11 @@
     clippy::type_complexity
 )]
 
-use glam::Vec3;
 use crate::host::{IdRenderRequest, RenderHost, View};
 use crate::math::fibonacci_directions;
 use crate::scene::TriRef;
 use crate::{Instance, Mesh, Result, Scene};
+use glam::Vec3;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -250,8 +250,8 @@ pub fn cull_invisible(scene: &Scene, vis: &VisibilityResult, grow_rings: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glam::Mat4;
     use crate::host::GeometryOnlyHost;
+    use glam::Mat4;
 
     fn cube() -> Mesh {
         let mut positions = Vec::new();

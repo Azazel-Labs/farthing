@@ -2,15 +2,15 @@
 //! textured planes chosen greedily by how much surface area each plane can represent within
 //! a distance tolerance.
 
-use glam::{Vec2, Vec3, Vec4};
 use crate::host::{
     channels, BakedMaterialDesc, BakedMaterialKind, ChannelImage, ChannelImages, MaterialClass,
     RenderHost, View, ViewRenderRequest,
 };
 use crate::image::Image;
 use crate::math::{fibonacci_directions, orthonormal_basis, triangle_area};
-use crate::{Error, Instance, MaterialId, Mesh, Result, Scene};
 use crate::uv::pack_rects;
+use crate::{Error, Instance, MaterialId, Mesh, Result, Scene};
+use glam::{Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

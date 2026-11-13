@@ -2,10 +2,10 @@
 //! surface point it maps to.
 
 use crate::bake::raster::rasterize_uv;
-use glam::{Mat4, Vec3};
 use crate::bvh::Bvh;
 use crate::scene::TriRef;
 use crate::{Error, Mesh, Result, Scene};
+use glam::{Mat4, Vec3};
 use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq)]

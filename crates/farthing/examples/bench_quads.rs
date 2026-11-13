@@ -1,7 +1,7 @@
 //! Quad reduction timing and error on bumpy quad spheres of growing size.
-use glam::Vec3;
 use farthing::quad::QuadMesh;
 use farthing::reduce::{reduce_quads, QuadReduceOptions};
+use glam::Vec3;
 use std::collections::HashMap;
 use std::time::Instant;
 

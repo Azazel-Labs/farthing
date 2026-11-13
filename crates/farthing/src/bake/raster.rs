@@ -1,8 +1,8 @@
 //! UV-space rasterization: which destination triangle (and where in it) covers each texel.
 
-use glam::{Vec2, Vec3};
 use crate::math::barycentric_2d;
 use crate::Mesh;
+use glam::{Vec2, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TexelSample {

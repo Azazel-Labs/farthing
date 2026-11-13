@@ -13,11 +13,11 @@ use farthing::host::{
     MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages, ViewRenderRequest,
 };
 use farthing::image::{linear_to_srgb, Image};
-use farthing::metrics::surface_distance;
-use farthing::{Error, MaterialId, Mesh, Scene};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
+use farthing::metrics::surface_distance;
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
 use farthing::uv::{parameterize, ParamOptions};
+use farthing::{Error, MaterialId, Mesh, Scene};
 use glam::{Mat4, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -178,11 +178,18 @@ impl Demo {
             let names: Vec<&str> = files.iter().map(|f| f.0.as_str()).take(12).collect();
             return Err(format!(
                 "no .glb or .gltf found (got: {})",
-                if names.is_empty() { "nothing".into() } else { names.join(", ") }
+                if names.is_empty() {
+                    "nothing".into()
+                } else {
+                    names.join(", ")
+                }
             ));
         };
         let main_name = files[main].0.clone();
-        let dir = main_name.rfind('/').map_or("", |i| &main_name[..=i]).to_owned();
+        let dir = main_name
+            .rfind('/')
+            .map_or("", |i| &main_name[..=i])
+            .to_owned();
         let by_path: HashMap<String, usize> = files
             .iter()
             .enumerate()
@@ -209,7 +216,11 @@ impl Demo {
             return Err(format!("{main_name} has no triangles"));
         }
         let textures = original_textures(&materials);
-        let name = main_name.rsplit('/').next().unwrap_or(&main_name).to_owned();
+        let name = main_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(&main_name)
+            .to_owned();
         Ok(Demo {
             name,
             levels: vec![(scene.clone(), textures.clone())],
@@ -297,7 +308,10 @@ impl Demo {
 
         self.levels.truncate(1);
         let info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0);
-        emit(Event::Level { info: &info, glb: &[] });
+        emit(Event::Level {
+            info: &info,
+            glb: &[],
+        });
 
         // Near levels: each mesh simplified from its previous level (as `lod_chain` does),
         // keeping UVs and material slots.
@@ -306,7 +320,11 @@ impl Demo {
         let mut mesh_scale = vec![0.0f32; self.scene.meshes.len()];
         for inst in &self.scene.instances {
             let m = glam::Mat3::from_mat4(inst.transform);
-            let s = m.x_axis.length().max(m.y_axis.length()).max(m.z_axis.length());
+            let s = m
+                .x_axis
+                .length()
+                .max(m.y_axis.length())
+                .max(m.z_axis.length());
             mesh_scale[inst.mesh] = mesh_scale[inst.mesh].max(s);
         }
         for level in 1..bake_from {
@@ -315,7 +333,8 @@ impl Demo {
             let ratio = step.powi(level as i32);
             let mut next = Vec::with_capacity(prev.len());
             for (mi, (mesh, error)) in prev.iter().enumerate() {
-                let target = ((self.scene.meshes[mi].triangle_count() as f32 * ratio) as usize).max(1);
+                let target =
+                    ((self.scene.meshes[mi].triangle_count() as f32 * ratio) as usize).max(1);
                 let r = simplify(
                     mesh,
                     &SimplifyOptions {
@@ -339,7 +358,10 @@ impl Demo {
                 .fold(0.0, f32::max);
             let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
             let info = level_info(level, LevelKind::Reduced, &s, bound, now() - t0);
-            emit(Event::Level { info: &info, glb: &glb });
+            emit(Event::Level {
+                info: &info,
+                glb: &glb,
+            });
             self.levels.push((s, self.textures.clone()));
         }
         if bake_from > levels {
@@ -392,7 +414,10 @@ impl Demo {
             let mut mesh = p.mesh;
             compute_tangents(&mut mesh, 0).map_err(err)?;
 
-            emit(Event::Stage(&format!("LOD{level}: baking {0}×{0}", opts.atlas)));
+            emit(Event::Stage(&format!(
+                "LOD{level}: baking {0}×{0}",
+                opts.atlas
+            )));
             let bake = bake_with_host(
                 &mut host,
                 &mesh,
@@ -403,7 +428,11 @@ impl Demo {
                     height: opts.atlas,
                     supersample: opts.supersample.clamp(1, 4),
                     gutter: 4,
-                    channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into(), channels::ORM.into()],
+                    channels: vec![
+                        channels::BASE_COLOR.into(),
+                        channels::NORMAL.into(),
+                        channels::ORM.into(),
+                    ],
                     ..Default::default()
                 },
             )
@@ -438,7 +467,10 @@ impl Demo {
             info.coverage = Some(bake.coverage);
             info.charts = Some(p.charts);
             info.utilization = Some(p.utilization);
-            emit(Event::Level { info: &info, glb: &glb });
+            emit(Event::Level {
+                info: &info,
+                glb: &glb,
+            });
             self.levels.push((s, tex));
         }
         emit(Event::Stage("done"));
@@ -454,7 +486,8 @@ fn expand_zips(files: Vec<(String, Vec<u8>)>) -> Result<Vec<(String, Vec<u8>)>, 
             out.push((name, data));
             continue;
         }
-        let mut zip = zip::ZipArchive::new(Cursor::new(data)).map_err(|e| format!("{name}: {e}"))?;
+        let mut zip =
+            zip::ZipArchive::new(Cursor::new(data)).map_err(|e| format!("{name}: {e}"))?;
         for i in 0..zip.len() {
             let mut f = zip.by_index(i).map_err(|e| format!("{name}: {e}"))?;
             let n = f
@@ -465,7 +498,8 @@ fn expand_zips(files: Vec<(String, Vec<u8>)>) -> Result<Vec<(String, Vec<u8>)>, 
                 continue;
             }
             let mut buf = Vec::with_capacity(f.size() as usize);
-            f.read_to_end(&mut buf).map_err(|e| format!("{name}/{n}: {e}"))?;
+            f.read_to_end(&mut buf)
+                .map_err(|e| format!("{name}/{n}: {e}"))?;
             out.push((n, buf));
         }
     }
@@ -520,7 +554,11 @@ fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
     let mut out = Vec::with_capacity(img.pixels.len() * 4);
     for p in &img.pixels {
         let rgb = match encoding {
-            ChannelEncoding::Color => [linear_to_srgb(p.x), linear_to_srgb(p.y), linear_to_srgb(p.z)],
+            ChannelEncoding::Color => [
+                linear_to_srgb(p.x),
+                linear_to_srgb(p.y),
+                linear_to_srgb(p.z),
+            ],
             ChannelEncoding::NormalTangent | ChannelEncoding::NormalWorld => {
                 [p.x * 0.5 + 0.5, p.y * 0.5 + 0.5, p.z * 0.5 + 0.5]
             }
@@ -557,7 +595,11 @@ impl MaterialHost<'_> {
         let t = (t - n * n.dot(t)).normalize_or_zero();
         let b = n.cross(t) * if s.tangent.w < 0.0 { -1.0 } else { 1.0 };
         let m = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
-        let (x, y, z) = ((m.x * 2.0 - 1.0) * scale, (m.y * 2.0 - 1.0) * scale, m.z * 2.0 - 1.0);
+        let (x, y, z) = (
+            (m.x * 2.0 - 1.0) * scale,
+            (m.y * 2.0 - 1.0) * scale,
+            m.z * 2.0 - 1.0,
+        );
         (t * x + b * y + n * z).try_normalize().unwrap_or(n)
     }
 }
@@ -589,15 +631,18 @@ impl RenderHost for MaterialHost<'_> {
             color[i] = c;
             normal[i] = self.shading_normal(s).extend(1.0);
             // glTF layout: R occlusion (unused here), G roughness, B metalness.
-            orm[i] = self.materials.get(s.material.0 as usize).map_or(Vec4::new(1.0, 0.8, 0.0, 1.0), |m| {
-                let mut v = Vec4::new(1.0, m.roughness_factor, m.metallic_factor, 1.0);
-                if let Some((tex, set)) = &m.metallic_roughness_texture {
-                    let t = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
-                    v.y *= t.y;
-                    v.z *= t.z;
-                }
-                v
-            });
+            orm[i] = self.materials.get(s.material.0 as usize).map_or(
+                Vec4::new(1.0, 0.8, 0.0, 1.0),
+                |m| {
+                    let mut v = Vec4::new(1.0, m.roughness_factor, m.metallic_factor, 1.0);
+                    if let Some((tex, set)) = &m.metallic_roughness_texture {
+                        let t = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
+                        v.y *= t.y;
+                        v.z *= t.z;
+                    }
+                    v
+                },
+            );
         }
         let image = |pixels| Image {
             width: req.width,
@@ -610,9 +655,19 @@ impl RenderHost for MaterialHost<'_> {
                 channels::BASE_COLOR => (image(color.clone()), ChannelEncoding::Color),
                 channels::NORMAL => (image(normal.clone()), ChannelEncoding::NormalWorld),
                 channels::ORM => (image(orm.clone()), ChannelEncoding::Data),
-                _ => return Err(Error::Unsupported("channel (demo host: base_color, normal, orm)")),
+                _ => {
+                    return Err(Error::Unsupported(
+                        "channel (demo host: base_color, normal, orm)",
+                    ))
+                }
             };
-            out.insert(ch.clone(), ChannelImage { image: img, encoding });
+            out.insert(
+                ch.clone(),
+                ChannelImage {
+                    image: img,
+                    encoding,
+                },
+            );
         }
         Ok(out)
     }
