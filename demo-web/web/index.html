@@ -244,8 +244,8 @@
           <thead>
             <tr>
               <th>Level</th><th>Kind</th><th class="n">Triangles</th><th class="n">%</th>
-              <th class="n" title="Measured deviation from LOD0 (sampled Hausdorff distance), relative to the scene's bounding-box diagonal">Error</th>
-              <th class="n" title="Camera distance where the error is under 1 pixel, for the viewing budget's field of view and screen (1080p, 60° by default)">Switch at</th>
+              <th class="n" title="Measured deviation from LOD0 (two-way Hausdorff distance over surface samples and every vertex), relative to the scene's bounding-box diagonal. Hover a value for the mean, RMS and normal deviation.">Error</th>
+              <th class="n" title="Camera distance from the model's center beyond which the error stays under 1 pixel, even on the model's near side, for the viewing budget's field of view and screen (1080p, 60° by default)">Switch at</th>
               <th class="n">Time</th><th class="n" title="Download size (GLB, PLY, or the packed GPU cluster format)">Size</th>
               <th class="n" title="GPU memory of the textures the level is drawn with: RGBA8 with full mip chains, each texture counted once">Textures</th><th></th>
             </tr>

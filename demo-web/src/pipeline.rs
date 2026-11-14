@@ -19,7 +19,7 @@ use farthing::host::{
 };
 use farthing::image::{linear_to_srgb, Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
-use farthing::metrics::surface_distance;
+use farthing::metrics::{surface_distance, SurfaceDistance};
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
 use farthing::uv::{parameterize, texel_density, ParamOptions};
 use farthing::{Error, MaterialId, Mesh, Scene};
@@ -35,6 +35,19 @@ pub(crate) const MEASURE_SAMPLES: usize = 20_000;
 /// high, 60 degree vertical field of view.
 pub(crate) fn reference_ppr() -> f32 {
     1080.0 / (2.0 * 30f32.to_radians().tan())
+}
+
+/// Distance from the scene's bounding-box center beyond which a deviation of `error` projects
+/// to at most one pixel in a view with `ppr` pixels per radian, wherever on the model it is:
+/// half the diagonal more than the error alone needs, since the near side of the model is that
+/// much closer. Measured from the center like `HlodNode::switch_distance`, and like THREE.LOD
+/// on the page. Zero when there is no error.
+pub(crate) fn switch_distance(error: f32, diagonal: f32, ppr: f32) -> f32 {
+    if error > 0.0 {
+        error * ppr + 0.5 * diagonal
+    } else {
+        0.0
+    }
 }
 
 /// Which example the page runs.
@@ -230,16 +243,25 @@ pub struct LevelInfo {
     pub kind: LevelKind,
     pub triangles: usize,
     pub vertices: usize,
-    /// Measured deviation from LOD0: sampled two-way Hausdorff distance, world units.
+    /// Measured deviation from LOD0: two-way Hausdorff distance over area-weighted samples and
+    /// every vertex of both, world units.
     pub error: f32,
     /// `error` relative to the scene's bounding-box diagonal.
     pub relative_error: f32,
     /// The simplifier's own estimate, summed over the chain: an upper bound, often loose.
     pub error_bound: f32,
-    /// Camera distance at which `error` projects to one pixel, for `ppr`.
+    /// Camera distance from the bounding-box center beyond which `error` projects to at most
+    /// one pixel in the view `ppr` describes; see [`switch_distance`].
     pub switch_distance_1px: f32,
     /// Pixels per radian of the view `switch_distance_1px` is given for.
     pub ppr: f32,
+    /// Measured levels: mean distance to LOD0 over the area-weighted samples, both ways.
+    pub mean_error: Option<f32>,
+    /// Measured levels: root mean square of the same distances.
+    pub rms_error: Option<f32>,
+    /// Measured levels: mean angle in degrees between the level's shading normals and LOD0's
+    /// at matching points. `None` for baked levels, whose normal maps make up for it.
+    pub normal_error: Option<f32>,
     /// Time to build the level (measuring it not included).
     pub ms: f64,
     /// Baked levels: fraction of texels that found the source surface.
@@ -279,6 +301,9 @@ impl LevelInfo {
             error_bound: 0.0,
             switch_distance_1px: 0.0,
             ppr: reference_ppr(),
+            mean_error: None,
+            rms_error: None,
+            normal_error: None,
             ms: 0.0,
             coverage: None,
             charts: None,
@@ -294,6 +319,25 @@ impl LevelInfo {
             view_texel_density: None,
             view_texels: None,
         }
+    }
+
+    /// Measures the level `scene` against LOD0 (`source`, flattened): its error, mean and RMS
+    /// distance, normal deviation and switch distance. `diagonal` is LOD0's bounding-box
+    /// diagonal.
+    pub(crate) fn measure(&mut self, source: &Mesh, scene: &Scene, diagonal: f32) {
+        let d = surface_distance(source, &scene.flatten().0, MEASURE_SAMPLES);
+        self.set_distance(&d, diagonal);
+    }
+
+    /// Records `d`, the level measured against LOD0, with the switch distance for `ppr`.
+    pub(crate) fn set_distance(&mut self, d: &SurfaceDistance, diagonal: f32) {
+        self.error = d.hausdorff;
+        self.relative_error = d.hausdorff / diagonal;
+        self.switch_distance_1px = switch_distance(d.hausdorff, diagonal, self.ppr);
+        self.mean_error = Some(d.mean);
+        self.rms_error = Some(d.rms);
+        self.normal_error =
+            (!matches!(self.kind, LevelKind::Baked)).then_some(d.normal_mean_degrees);
     }
 }
 
@@ -485,23 +529,25 @@ impl Demo {
         let ppr = opts.ppr();
         let visible = opts.visible_error();
         let source = self.scene.flatten().0;
-        let measure =
-            |s: &Scene| surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
-        let level_info = |level, kind, s: &Scene, error: f32, bound: f32, ms| LevelInfo {
-            triangles: s.triangle_count(),
-            vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
-            error,
-            relative_error: error / diag,
-            error_bound: bound,
-            switch_distance_1px: error * ppr,
-            ppr,
-            ms,
-            note: visible.map(|v| view_note(level, error, v, opts.view_distance)),
-            ..LevelInfo::new(level, kind)
+        let measure = |s: &Scene| surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES);
+        let level_info = |level, kind, s: &Scene, d: Option<&SurfaceDistance>, bound: f32, ms| {
+            let mut info = LevelInfo {
+                triangles: s.triangle_count(),
+                vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
+                error_bound: bound,
+                ppr,
+                ms,
+                ..LevelInfo::new(level, kind)
+            };
+            if let Some(d) = d {
+                info.set_distance(d, diag);
+            }
+            info.note = visible.map(|v| view_note(level, info.error, v, opts.view_distance));
+            info
         };
 
         let original_bytes = texture_bytes(&original_textures(&self.materials));
-        let mut info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0, 0.0);
+        let mut info = level_info(0, LevelKind::Original, &self.scene, None, 0.0, 0.0);
         info.texture_bytes = Some(original_bytes);
         if let Some(v) = visible {
             let dens = self.artist_density(&source);
@@ -532,7 +578,7 @@ impl Demo {
             let t0 = now();
             let ratio = step.powi((level - from_level) as i32);
             let limit = visible.filter(|_| level == 1);
-            let ((next, s), error) = fit_visible(limit, |k| {
+            let ((next, s, d), _) = fit_visible(limit, |k| {
                 let mut next = Vec::with_capacity(prev.len());
                 let mut extended = false;
                 for (mi, (mesh, error)) in prev.iter().enumerate() {
@@ -549,8 +595,8 @@ impl Demo {
                 for (mi, (m, _)) in next.iter().enumerate() {
                     s.meshes[mi] = m.clone();
                 }
-                let error = measure(&s);
-                Ok(((next, s), error, extended))
+                let d = measure(&s);
+                Ok(((next, s, d), d.hausdorff, extended))
             })?;
             prev = next;
             if limit.is_some() {
@@ -565,7 +611,7 @@ impl Demo {
                 .fold(0.0, f32::max);
             let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
             let ms = now() - t0;
-            let mut info = level_info(level, LevelKind::Reduced, &s, error, bound, ms);
+            let mut info = level_info(level, LevelKind::Reduced, &s, Some(&d), bound, ms);
             info.bytes = Some(glb.len());
             info.texture_bytes = Some(original_bytes);
             emit(Event::Level {
@@ -607,13 +653,13 @@ impl Demo {
             let limit = visible.filter(|_| level == 1);
             // Measured before the unwrap (which only splits vertices), so a budget can size the
             // atlas for the distance the level appears at.
-            let ((m, e, mesh), error) = fit_visible(limit, |k| {
+            let ((m, e, mesh, d), error) = fit_visible(limit, |k| {
                 let (m, e, x) =
                     reduce_to(&geo, &far_base, target, limit.map(|v| k * v)).map_err(err)?;
                 let mut mesh = m.clone();
                 mesh.compute_normals(60.0);
-                let error = measure(&Scene::from_mesh(mesh.clone()));
-                Ok(((m, e, mesh), error, x))
+                let d = measure(&Scene::from_mesh(mesh.clone()));
+                Ok(((m, e, mesh, d), d.hausdorff, x))
             })?;
             geo = m;
             geo_error += e;
@@ -663,7 +709,7 @@ impl Demo {
             s.materials[0].name = "baked".into();
             let glb = glb_bytes(&s, &tex).map_err(err)?;
             let ms = now() - t0;
-            let mut info = level_info(level, LevelKind::Baked, &s, error, geo_error, ms);
+            let mut info = level_info(level, LevelKind::Baked, &s, Some(&d), geo_error, ms);
             info.coverage = Some(bake.coverage);
             info.charts = Some(p.charts);
             info.utilization = Some(p.utilization);
@@ -808,15 +854,15 @@ impl Demo {
             let ratio = step.powi((level - from.1) as i32);
             let target = ((from.0 as f32 * ratio) as usize).max(4);
             let limit = visible.filter(|_| level == 1);
-            let ((m, e, s), error) = fit_visible(limit, |k| {
+            let ((m, e, s, d), error) = fit_visible(limit, |k| {
                 let (m, e, x) =
                     reduce_to(&mesh, &base, target, limit.map(|v| k * v)).map_err(err)?;
                 let mut t = m.clone();
                 compute_tangents(&mut t, 0).map_err(err)?;
                 let mut s = Scene::from_mesh(t);
                 s.materials[0].name = "shared".into();
-                let error = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
-                Ok(((m, e, s), error, x))
+                let d = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES);
+                Ok(((m, e, s, d), d.hausdorff, x))
             })?;
             mesh = m;
             error_bound += e;
@@ -830,13 +876,10 @@ impl Demo {
             }
             .map_err(err)?;
             let ms = now() - t0;
-            let info = LevelInfo {
+            let mut info = LevelInfo {
                 triangles: s.triangle_count(),
                 vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
-                error,
-                relative_error: error / diag,
                 error_bound,
-                switch_distance_1px: error * ppr,
                 ppr,
                 ms,
                 note: visible.map(|v| view_note(level, error, v, opts.view_distance)),
@@ -853,6 +896,7 @@ impl Demo {
                 shared_textures: Some(1),
                 ..LevelInfo::new(level, LevelKind::Shared)
             };
+            info.set_distance(&d, diag);
             emit(Event::Level {
                 info: &info,
                 glb: &glb,
