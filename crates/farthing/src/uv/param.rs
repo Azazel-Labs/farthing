@@ -83,9 +83,9 @@ pub struct ParamOptions {
     #[serde(skip)]
     pub texel_density: Option<Vec<f32>>,
     /// Mipmap-safe packing: every chart owns whole `block × block` pixel cells (see
-    /// [`snugly::PackOptions::block`]), so mip level log2(`block`) and coarser never mix two
-    /// charts in a texel. Set `padding` to at least `block` to also keep a one-texel gutter at
-    /// that level. 1: pixel placement.
+    /// [`snugly::PackOptions::block`]), so mip levels up to log2(`block`) never mix two charts
+    /// in a texel (coarser ones can: their texels span several cells). Set `padding` to at
+    /// least `block` to also keep a one-texel gutter at that level. 1: pixel placement.
     #[serde(default = "default_block")]
     pub block: u32,
     /// Keep the source's own texel layout instead of unwrapping afresh: triangles that read a
