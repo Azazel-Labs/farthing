@@ -83,25 +83,7 @@ impl Image {
         }
         let (w, h) = (self.width / factor, self.height / factor);
         let mut out = Image::new(w, h, Vec4::ZERO);
-        for y in 0..h {
-            for x in 0..w {
-                let mut acc = Vec4::ZERO;
-                let mut n = 0u32;
-                for sy in 0..factor {
-                    for sx in 0..factor {
-                        let p = self.get(x * factor + sx, y * factor + sy);
-                        if p.w > 0.0 {
-                            acc += p.truncate().extend(1.0);
-                            n += 1;
-                        }
-                    }
-                }
-                if n > 0 {
-                    let rgb = acc.truncate() / n as f32;
-                    out.set(x, y, rgb.extend(n as f32 / (factor * factor) as f32));
-                }
-            }
-        }
+        downsample_coverage_rows(&self.pixels, self.width, factor, &mut out.pixels);
         out
     }
 
@@ -215,6 +197,35 @@ impl Image {
     }
 }
 
+/// [`Image::downsample_coverage`] of whole rows: `src` is `width` pixels wide, and each
+/// `width / factor` pixels of `out` (one output row) reads the next `factor` rows of `src`.
+pub(crate) fn downsample_coverage_rows(src: &[Vec4], width: u32, factor: u32, out: &mut [Vec4]) {
+    let (sw, ow) = (width as usize, (width / factor) as usize);
+    let f = factor as usize;
+    if ow == 0 {
+        return;
+    }
+    for (y, row) in out.chunks_exact_mut(ow).enumerate() {
+        for (x, o) in row.iter_mut().enumerate() {
+            let mut acc = Vec4::ZERO;
+            let mut n = 0u32;
+            for sy in 0..f {
+                for sx in 0..f {
+                    let p = src[(y * f + sy) * sw + x * f + sx];
+                    if p.w > 0.0 {
+                        acc += p.truncate().extend(1.0);
+                        n += 1;
+                    }
+                }
+            }
+            if n > 0 {
+                let rgb = acc.truncate() / n as f32;
+                *o = rgb.extend(n as f32 / (factor * factor) as f32);
+            }
+        }
+    }
+}
+
 /// A material texture as stored: 8-bit RGBA, a quarter of an [`Image`]'s memory (a 2048²
 /// texture is 16 MB instead of 64 MB), behind an `Arc` so clones share the texels.
 ///
@@ -271,33 +282,36 @@ impl Texture {
 
     /// Quantizes a linear [`Image`]; with `srgb` its RGB is encoded linear→sRGB.
     pub fn from_image(img: &Image, srgb: bool) -> Texture {
-        let enc = |c: f32| unorm8(if srgb { linear_to_srgb(c) } else { c });
         Texture {
             width: img.width,
             height: img.height,
             srgb,
-            texels: img
-                .pixels
-                .iter()
-                .map(|p| [enc(p.x), enc(p.y), enc(p.z), unorm8(p.w)])
-                .collect(),
+            texels: img.pixels.iter().map(|&p| Self::encode(p, srgb)).collect(),
         }
+    }
+
+    /// The texel [`Texture::from_image`] stores for the linear pixel `p`, for building a
+    /// texture a few rows at a time (then [`Texture::from_rgba8`]).
+    pub fn encode(p: Vec4, srgb: bool) -> [u8; 4] {
+        let enc = |c: f32| unorm8(if srgb { linear_to_srgb(c) } else { c });
+        [enc(p.x), enc(p.y), enc(p.z), unorm8(p.w)]
     }
 
     /// A tangent-space normal map from xyz in -1..1 (the bake convention), stored as glTF
     /// does: xyz · 0.5 + 0.5, alpha 1.
     pub fn from_signed_normals(img: &Image) -> Texture {
-        let enc = |c: f32| unorm8(c * 0.5 + 0.5);
         Texture {
             width: img.width,
             height: img.height,
             srgb: false,
-            texels: img
-                .pixels
-                .iter()
-                .map(|p| [enc(p.x), enc(p.y), enc(p.z), 255])
-                .collect(),
+            texels: img.pixels.iter().map(|&p| Self::encode_normal(p)).collect(),
         }
+    }
+
+    /// The texel [`Texture::from_signed_normals`] stores for the normal `p`.
+    pub fn encode_normal(p: Vec4) -> [u8; 4] {
+        let enc = |c: f32| unorm8(c * 0.5 + 0.5);
+        [enc(p.x), enc(p.y), enc(p.z), 255]
     }
 
     /// The stored bytes, RGBA row-major.

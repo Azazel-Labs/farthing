@@ -100,7 +100,9 @@ pub struct HlodTreeOptions {
     /// Count one atlas texel (world units) as error, so a proxy is not drawn while its
     /// texels are larger than the pixel threshold.
     pub texel_error: bool,
-    /// Keep each bake's texel correspondence (large: one entry per supersampled texel).
+    /// Keep each bake's texel correspondence (large: one entry per supersampled texel). It
+    /// overrides the proxy's [`BakeOptions::keep_correspondence`](crate::bake::BakeOptions)
+    /// when false.
     pub keep_correspondence: bool,
     /// Cells whose culled sources and reductions are in flight at once (0: one per rayon
     /// thread). Peak memory grows with it; the output does not depend on it.
@@ -445,11 +447,16 @@ fn level_options(opts: &HlodTreeOptions, level: u32, parent_input: Option<usize>
         let cap = ((input as f64 * opts.parent_reduction as f64).ceil() as usize).max(1);
         target = Some(target.map_or(cap, |t| t.min(cap)));
     }
-    HlodOptions {
+    let mut lo = HlodOptions {
         target_triangles: target,
         max_error: opts.proxy.max_error.map(|e| e * scale),
         ..opts.proxy.clone()
+    };
+    if let Some(b) = &mut lo.bake {
+        // Not kept, the correspondence is never held for a whole atlas.
+        b.keep_correspondence &= opts.keep_correspondence;
     }
+    lo
 }
 
 /// The input of one node: its own source instances plus its children's proxies (from
@@ -574,9 +581,6 @@ fn build_batch(
                 textures: b.textures.clone(),
                 parameters: BTreeMap::new(),
             })?);
-            if !opts.keep_correspondence {
-                b.correspondence.entries = Vec::new();
-            }
         }
         let child_geo = node
             .children

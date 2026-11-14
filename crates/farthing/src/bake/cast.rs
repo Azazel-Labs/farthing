@@ -1,10 +1,10 @@
-use crate::bake::correspondence::{build_correspondence, copy_correspondence, Correspondence};
+use crate::bake::correspondence::{Correspondence, Tracer};
 use crate::bake::tangents::compute_tangents;
 use crate::host::{
     channels, ChannelEncoding, ChannelImage, ChannelImages, RenderHost, SurfaceBakeRequest,
     SurfaceSample,
 };
-use crate::image::Image;
+use crate::image::{downsample_coverage_rows, Image};
 use crate::{Error, Mesh, Result, Scene};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -13,9 +13,10 @@ use std::collections::{BTreeMap, HashMap};
 /// Channel produced by farthing itself: signed source distance along the destination normal.
 pub const DISPLACEMENT: &str = "displacement";
 
-/// [`bake_with_host`] shades at most this many samples per [`RenderHost::bake_surface`] call,
-/// so the request (about 90 bytes a sample) stays small however large the atlas.
-const BAND_SAMPLES: usize = 1 << 20;
+/// [`bake_with_host`] traces and shades at most this many samples at a time: the request
+/// (about 100 bytes a sample), the correspondence entries (about 45) and the host's output
+/// for them stay a few megabytes however large the atlas.
+const BAND_SAMPLES: usize = 1 << 17;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BakeOptions {
@@ -36,6 +37,16 @@ pub struct BakeOptions {
     /// surface point instead of casting rays: an exact transfer, with `max_distance` unused.
     #[serde(skip)]
     pub source_triangles: Option<Vec<crate::scene::TriRef>>,
+    /// Return the correspondence's entries in [`BakeOutput::correspondence`] (about 45 bytes
+    /// a sample, held for the whole atlas), to re-bake channels later without tracing again.
+    /// Without it the bake only ever holds a band of them, and the output's correspondence
+    /// has its size but no entries.
+    #[serde(default = "keep_correspondence")]
+    pub keep_correspondence: bool,
+}
+
+fn keep_correspondence() -> bool {
+    true
 }
 
 impl Default for BakeOptions {
@@ -49,6 +60,7 @@ impl Default for BakeOptions {
             gutter: 8,
             channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into()],
             source_triangles: None,
+            keep_correspondence: true,
         }
     }
 }
@@ -59,7 +71,8 @@ pub struct BakeOutput {
     pub textures: ChannelImages,
     /// Fraction of texels with a source point.
     pub coverage: f32,
-    /// The correspondence used (keep it to re-bake channels without re-tracing).
+    /// The correspondence used (keep it to re-bake channels without re-tracing). Its entries
+    /// are empty unless [`BakeOptions::keep_correspondence`].
     pub correspondence: Correspondence,
 }
 
@@ -97,12 +110,8 @@ struct Prepared {
     corr: Correspondence,
 }
 
-fn prepare(
-    dest: &Mesh,
-    dest_to_world: Mat4,
-    source: &Scene,
-    opts: &BakeOptions,
-) -> Result<Prepared> {
+/// The destination as the bake needs it: UV set checked, normals and tangents present.
+fn prepare_dest(dest: &Mesh, opts: &BakeOptions) -> Result<Mesh> {
     let mut dest = dest.clone();
     if dest.uvs.len() <= opts.uv_set {
         return Err(Error::InvalidMesh(
@@ -113,31 +122,40 @@ fn prepare(
         dest.compute_normals(180.0);
     }
     compute_tangents(&mut dest, opts.uv_set)?;
-    let corr = if let Some(refs) = &opts.source_triangles {
-        copy_correspondence(
-            &dest,
-            source,
-            refs,
-            opts.width,
-            opts.height,
-            opts.supersample,
-            opts.uv_set,
-        )?
-    } else {
-        let maxd = opts
-            .max_distance
-            .unwrap_or_else(|| source.bounds().diagonal() * 0.03);
-        build_correspondence(
-            &dest,
-            dest_to_world,
-            source,
-            opts.width,
-            opts.height,
-            opts.supersample,
-            opts.uv_set,
-            maxd,
-        )?
-    };
+    Ok(dest)
+}
+
+/// Source lookups for `opts`' sample grid, `band` rows at a time: exact copies with
+/// `source_triangles`, rays otherwise.
+fn tracer<'a>(
+    dest: &'a Mesh,
+    dest_to_world: Mat4,
+    source: &Scene,
+    opts: &'a BakeOptions,
+    band: u32,
+) -> Result<Tracer<'a>> {
+    let ss = opts.supersample.max(1);
+    let (w, h) = (opts.width * ss, opts.height * ss);
+    match &opts.source_triangles {
+        Some(refs) => Tracer::copy(dest, source, refs, w, h, opts.uv_set, band),
+        None => {
+            let maxd = opts
+                .max_distance
+                .unwrap_or_else(|| source.bounds().diagonal() * 0.03);
+            Tracer::rays(dest, dest_to_world, source, w, h, opts.uv_set, maxd, band)
+        }
+    }
+}
+
+fn prepare(
+    dest: &Mesh,
+    dest_to_world: Mat4,
+    source: &Scene,
+    opts: &BakeOptions,
+) -> Result<Prepared> {
+    let dest = prepare_dest(dest, opts)?;
+    let ss = opts.supersample.max(1);
+    let corr = tracer(&dest, dest_to_world, source, opts, opts.height * ss)?.whole(ss);
     Ok(Prepared { dest, corr })
 }
 
@@ -157,73 +175,229 @@ fn dest_frame(dest: &Mesh, m: Mat4, tri: u32, b: Vec3) -> (Vec3, Vec3, Vec3) {
     (t, bt, n)
 }
 
+/// Finished rows of one channel, owned.
+struct Strip<'a> {
+    channel: &'a str,
+    encoding: ChannelEncoding,
+    y: u32,
+    pixels: Vec<Vec4>,
+}
+
 /// Turns per-sample channel images into final textures: normal conversion, supersample
-/// resolve, dilation.
-fn finish(
-    mut raw: ChannelImages,
-    prep: &Prepared,
+/// resolve, dilation. Bands of sample rows arrive top to bottom, and finished rows leave as
+/// soon as no later band can change them (dilation reaches `gutter` rows).
+struct Finisher<'a> {
+    dest: &'a Mesh,
     dest_to_world: Mat4,
-    opts: &BakeOptions,
-) -> ChannelImages {
-    let corr = &prep.corr;
-    for img in raw.values_mut() {
-        // Mark coverage in alpha from the correspondence (hosts may not).
-        for (i, e) in corr.entries.iter().enumerate() {
-            if e.is_none() {
-                img.image.pixels[i] = Vec4::ZERO;
-            } else if img.image.pixels[i].w <= 0.0 {
-                img.image.pixels[i].w = 1.0;
-            }
-        }
-        if img.encoding == ChannelEncoding::NormalWorld {
-            for (i, e) in corr.entries.iter().enumerate() {
-                if let Some(e) = e {
-                    let nw = img.image.pixels[i].truncate().normalize_or_zero();
-                    let (t, b, n) = dest_frame(
-                        &prep.dest,
-                        dest_to_world,
-                        e.dest_triangle,
-                        e.dest_barycentrics,
-                    );
-                    let ts = Vec3::new(nw.dot(t), nw.dot(b), nw.dot(n)).normalize_or_zero();
-                    img.image.pixels[i] = ts.extend(1.0);
-                }
-            }
-            img.encoding = ChannelEncoding::NormalTangent;
+    supersample: u32,
+    /// Output size.
+    width: u32,
+    height: u32,
+    gutter: u32,
+    channels: BTreeMap<String, Pending>,
+    /// Output rows resolved, and handed out.
+    resolved: u32,
+    emitted: u32,
+}
+
+/// A channel's resolved rows that are not finished yet.
+struct Pending {
+    /// The encoding of the channel's first band, and what it is finished as.
+    input: ChannelEncoding,
+    output: ChannelEncoding,
+    /// Undilated rows from `lo` up to the finisher's `resolved`.
+    lo: u32,
+    rows: Vec<Vec4>,
+}
+
+impl<'a> Finisher<'a> {
+    fn new(
+        dest: &'a Mesh,
+        dest_to_world: Mat4,
+        width: u32,
+        height: u32,
+        supersample: u32,
+        gutter: u32,
+    ) -> Finisher<'a> {
+        Finisher {
+            dest,
+            dest_to_world,
+            supersample: supersample.max(1),
+            width,
+            height,
+            gutter,
+            channels: BTreeMap::new(),
+            resolved: 0,
+            emitted: 0,
         }
     }
-    raw.into_iter()
-        .map(|(name, mut ci)| {
-            let mut img = if corr.supersample > 1 {
-                ci.image.downsample_coverage(corr.supersample)
+
+    /// The next `rows` sample rows: `entries` and every channel's pixels, row-major.
+    fn band(
+        &mut self,
+        rows: u32,
+        entries: &[Option<crate::bake::CorrespondenceEntry>],
+        raw: ChannelImages,
+        out: &mut dyn FnMut(Strip<'_>),
+    ) {
+        let ss = self.supersample;
+        let sample_width = self.width * ss;
+        let out_rows = rows / ss;
+        for (name, ci) in raw {
+            let p = self.channels.entry(name).or_insert_with(|| Pending {
+                input: ci.encoding,
+                output: match ci.encoding {
+                    ChannelEncoding::NormalWorld => ChannelEncoding::NormalTangent,
+                    e => e,
+                },
+                lo: 0,
+                rows: Vec::new(),
+            });
+            let mut px = ci.image.pixels;
+            // Mark coverage in alpha from the correspondence (hosts may not).
+            for (p, e) in px.iter_mut().zip(entries) {
+                if e.is_none() {
+                    *p = Vec4::ZERO;
+                } else if p.w <= 0.0 {
+                    p.w = 1.0;
+                }
+            }
+            if p.input == ChannelEncoding::NormalWorld {
+                for (p, e) in px.iter_mut().zip(entries) {
+                    if let Some(e) = e {
+                        let nw = p.truncate().normalize_or_zero();
+                        let (t, b, n) = dest_frame(
+                            self.dest,
+                            self.dest_to_world,
+                            e.dest_triangle,
+                            e.dest_barycentrics,
+                        );
+                        let ts = Vec3::new(nw.dot(t), nw.dot(b), nw.dot(n)).normalize_or_zero();
+                        *p = ts.extend(1.0);
+                    }
+                }
+            }
+            let start = p.rows.len();
+            if ss > 1 {
+                p.rows
+                    .resize(start + (out_rows * self.width) as usize, Vec4::ZERO);
+                downsample_coverage_rows(&px, sample_width, ss, &mut p.rows[start..]);
+            } else if p.rows.is_empty() {
+                p.rows = px;
             } else {
-                std::mem::replace(&mut ci.image, Image::new(0, 0, Vec4::ZERO))
-            };
-            if ci.encoding == ChannelEncoding::NormalTangent {
-                for p in &mut img.pixels {
+                p.rows.extend_from_slice(&px);
+            }
+            if p.output == ChannelEncoding::NormalTangent {
+                for p in &mut p.rows[start..] {
                     if p.w > 0.0 {
                         *p = p.truncate().normalize_or_zero().extend(p.w);
                     }
                 }
             }
-            img.dilate(opts.gutter);
+        }
+        self.resolved += out_rows;
+        self.flush(out);
+    }
+
+    /// Dilates and hands out the rows no later band can change, in strips of at least eight
+    /// gutters (each strip redoes the dilation of a gutter's worth of rows on either side).
+    fn flush(&mut self, out: &mut dyn FnMut(Strip<'_>)) {
+        let last = self.resolved >= self.height;
+        let end = if last {
+            self.height
+        } else {
+            self.resolved.saturating_sub(self.gutter)
+        };
+        if !last && end < self.emitted + (8 * self.gutter).max(1) {
+            return;
+        }
+        let (w, g, from) = (self.width as usize, self.gutter, self.emitted);
+        for (name, p) in &mut self.channels {
+            let mut img = Image {
+                width: self.width,
+                height: self.resolved - p.lo,
+                pixels: if last {
+                    std::mem::take(&mut p.rows)
+                } else {
+                    p.rows.clone()
+                },
+            };
+            img.dilate(g);
+            let mut px = img.pixels;
+            px.truncate((end - p.lo) as usize * w);
+            px.drain(..(from - p.lo) as usize * w);
             // Covered texels get full alpha; alpha is coverage, not opacity.
-            for p in &mut img.pixels {
+            for p in &mut px {
                 if p.w > 0.0 {
                     p.w = 1.0;
                 }
             }
-            ci.image = img;
-            (name, ci)
-        })
-        .collect()
+            if !last {
+                // Keep a gutter of undilated rows above the next strip.
+                let lo = end.saturating_sub(g);
+                p.rows.drain(..(lo - p.lo) as usize * w);
+                p.lo = lo;
+            }
+            out(Strip {
+                channel: name,
+                encoding: p.output,
+                y: from,
+                pixels: px,
+            });
+        }
+        self.emitted = end;
+    }
 }
 
-fn displacement_channel(corr: &Correspondence) -> ChannelImage {
-    let mut img = Image::new(corr.width, corr.height, Vec4::ZERO);
-    for (i, e) in corr.entries.iter().enumerate() {
+/// Collects strips into whole images (`width × height`).
+fn collect(textures: &mut ChannelImages, width: u32, height: u32, s: Strip<'_>) {
+    let ci = textures
+        .entry(s.channel.to_owned())
+        .or_insert_with(|| ChannelImage {
+            image: Image {
+                width,
+                height,
+                pixels: Vec::new(),
+            },
+            encoding: s.encoding,
+        });
+    let px = &mut ci.image.pixels;
+    let n = width as usize * height as usize;
+    if px.is_empty() && s.pixels.len() == n {
+        *px = s.pixels;
+    } else {
+        px.reserve_exact(n - px.len());
+        px.extend_from_slice(&s.pixels);
+    }
+}
+
+/// [`Finisher`] over whole sample images in one band.
+fn finish(
+    raw: ChannelImages,
+    prep: &Prepared,
+    dest_to_world: Mat4,
+    opts: &BakeOptions,
+) -> ChannelImages {
+    let corr = &prep.corr;
+    let ss = corr.supersample.max(1);
+    let (w, h) = (corr.width / ss, corr.height / ss);
+    let mut fin = Finisher::new(&prep.dest, dest_to_world, w, h, ss, opts.gutter);
+    let mut textures = ChannelImages::new();
+    fin.band(corr.height, &corr.entries, raw, &mut |s| {
+        collect(&mut textures, w, h, s)
+    });
+    textures
+}
+
+fn displacement_channel(
+    entries: &[Option<crate::bake::CorrespondenceEntry>],
+    width: u32,
+    height: u32,
+) -> ChannelImage {
+    let mut img = Image::new(width, height, Vec4::ZERO);
+    for (p, e) in img.pixels.iter_mut().zip(entries) {
         if let Some(e) = e {
-            img.pixels[i] = Vec4::new(e.distance, e.distance, e.distance, 1.0);
+            *p = Vec4::new(e.distance, e.distance, e.distance, 1.0);
         }
     }
     ChannelImage {
@@ -308,6 +482,15 @@ impl PreparedBake {
     }
 }
 
+/// The channels the host shades (all but [`DISPLACEMENT`]).
+fn host_channels(opts: &BakeOptions) -> Vec<String> {
+    opts.channels
+        .iter()
+        .filter(|c| c.as_str() != DISPLACEMENT)
+        .cloned()
+        .collect()
+}
+
 /// Phase 1: UV rasterization, correspondence and the surface-sample request.
 pub fn prepare_bake(
     dest: &Mesh,
@@ -325,12 +508,7 @@ pub fn prepare_bake(
             .iter()
             .map(|e| e.as_ref().map(|e| interpolate_sample(source, e)))
             .collect(),
-        channels: opts
-            .channels
-            .iter()
-            .filter(|c| c.as_str() != DISPLACEMENT)
-            .cloned()
-            .collect(),
+        channels: host_channels(opts),
     };
     Ok(PreparedBake {
         prep,
@@ -363,7 +541,8 @@ fn check_shaded(
         let img = shaded
             .get(c)
             .ok_or_else(|| Error::Host(format!("missing channel `{c}`")))?;
-        if (img.image.width, img.image.height) != (width, height) {
+        let n = width as usize * height as usize;
+        if (img.image.width, img.image.height) != (width, height) || img.image.pixels.len() != n {
             return Err(Error::Host(format!("channel `{c}` has the wrong size")));
         }
     }
@@ -377,21 +556,41 @@ fn finish_output(
     mut shaded: ChannelImages,
 ) -> BakeOutput {
     if opts.channels.iter().any(|c| c == DISPLACEMENT) {
-        shaded.insert(DISPLACEMENT.into(), displacement_channel(&prep.corr));
+        let c = &prep.corr;
+        shaded.insert(
+            DISPLACEMENT.into(),
+            displacement_channel(&c.entries, c.width, c.height),
+        );
     }
     let coverage = prep.corr.coverage();
     let textures = finish(shaded, &prep, dest_to_world, opts);
+    output(prep.corr, textures, coverage, opts)
+}
+
+/// The output, keeping the correspondence's entries only when `opts` asks.
+fn output(
+    mut correspondence: Correspondence,
+    textures: ChannelImages,
+    coverage: f32,
+    opts: &BakeOptions,
+) -> BakeOutput {
+    if !opts.keep_correspondence {
+        correspondence.entries = Vec::new();
+    }
     BakeOutput {
         textures,
         coverage,
-        correspondence: prep.corr,
+        correspondence,
     }
 }
 
 /// Point-evaluation bake: the host evaluates its real materials at the source points.
 ///
-/// The host is called once per band of rows (about a million samples each), so the request
-/// never holds a surface sample for every texel of a large atlas.
+/// The bake runs a band of rows at a time (about 128 thousand samples): the host is called
+/// once per band, and neither the request, the correspondence (unless
+/// [`BakeOptions::keep_correspondence`]) nor the supersampled channel images ever exist for
+/// the whole atlas. The output textures are whole float images; to store them in another
+/// format without ever holding those, use [`bake_rows_with_host`].
 pub fn bake_with_host(
     host: &mut dyn RenderHost,
     dest: &Mesh,
@@ -399,44 +598,139 @@ pub fn bake_with_host(
     source: &Scene,
     opts: &BakeOptions,
 ) -> Result<BakeOutput> {
-    let prep = prepare(dest, dest_to_world, source, opts)?;
-    let channels: Vec<String> = opts
-        .channels
-        .iter()
-        .filter(|c| c.as_str() != DISPLACEMENT)
-        .cloned()
-        .collect();
-    let (w, h) = (prep.corr.width, prep.corr.height);
-    let mut shaded = ChannelImages::new();
-    if !channels.is_empty() {
-        let band = (BAND_SAMPLES / w.max(1) as usize).max(1) as u32;
-        let mut y0 = 0;
-        while y0 < h {
-            let rows = band.min(h - y0);
-            let range = (y0 * w) as usize..((y0 + rows) * w) as usize;
+    let mut textures = ChannelImages::new();
+    let (w, h) = (opts.width, opts.height);
+    let (coverage, correspondence) =
+        bake_bands(host, dest, dest_to_world, source, opts, &mut |s| {
+            collect(&mut textures, w, h, s)
+        })?;
+    Ok(BakeOutput {
+        textures,
+        coverage,
+        correspondence,
+    })
+}
+
+/// Finished rows of one channel from [`bake_rows_with_host`].
+#[derive(Clone, Copy, Debug)]
+pub struct BakedRows<'a> {
+    /// The channel, as named in [`BakeOptions::channels`].
+    pub channel: &'a str,
+    /// How to read the texels; normals the host returns world-space arrive tangent-space,
+    /// as in [`BakeOutput::textures`].
+    pub encoding: ChannelEncoding,
+    /// The texture row `pixels` starts at. Each channel's rows arrive top to bottom, each
+    /// row once.
+    pub y: u32,
+    /// Whole rows of [`BakeOptions::width`] texels, exactly the texels
+    /// [`BakeOutput::textures`] would hold.
+    pub pixels: &'a [Vec4],
+}
+
+/// [`bake_with_host`] for callers that keep the textures in their own form (say 8-bit):
+/// finished rows go to `rows` as soon as no later band can change them, so the bake never
+/// holds a whole float image. Same texels, coverage and correspondence as [`bake_with_host`];
+/// the returned [`BakeOutput::textures`] is empty.
+pub fn bake_rows_with_host(
+    host: &mut dyn RenderHost,
+    dest: &Mesh,
+    dest_to_world: Mat4,
+    source: &Scene,
+    opts: &BakeOptions,
+    rows: &mut dyn FnMut(BakedRows<'_>),
+) -> Result<BakeOutput> {
+    let (coverage, correspondence) =
+        bake_bands(host, dest, dest_to_world, source, opts, &mut |s| {
+            rows(BakedRows {
+                channel: s.channel,
+                encoding: s.encoding,
+                y: s.y,
+                pixels: &s.pixels,
+            })
+        })?;
+    Ok(BakeOutput {
+        textures: ChannelImages::new(),
+        coverage,
+        correspondence,
+    })
+}
+
+/// The banded point-evaluation bake behind [`bake_with_host`] and [`bake_rows_with_host`]:
+/// per band of sample rows, trace, shade and hand the rows to a [`Finisher`].
+fn bake_bands(
+    host: &mut dyn RenderHost,
+    dest: &Mesh,
+    dest_to_world: Mat4,
+    source: &Scene,
+    opts: &BakeOptions,
+    out: &mut dyn FnMut(Strip<'_>),
+) -> Result<(f32, Correspondence)> {
+    let dest = prepare_dest(dest, opts)?;
+    let ss = opts.supersample.max(1);
+    let (w, h) = (opts.width * ss, opts.height * ss);
+    // Whole output rows per band.
+    let band = ((BAND_SAMPLES / w.max(1) as usize) as u32 / ss).max(1) * ss;
+    let mut tracer = Some(tracer(&dest, dest_to_world, source, opts, band)?);
+    let bands = tracer.as_ref().map_or(0, Tracer::bands);
+    let channels = host_channels(opts);
+    let displacement = opts.channels.iter().any(|c| c == DISPLACEMENT);
+    let mut fin = Finisher::new(
+        &dest,
+        dest_to_world,
+        opts.width,
+        opts.height,
+        ss,
+        opts.gutter,
+    );
+    let mut kept = Vec::new();
+    if opts.keep_correspondence {
+        kept.reserve_exact(w as usize * h as usize);
+    }
+    let mut covered = 0;
+    for i in 0..bands {
+        let rows = band.min(h - i as u32 * band);
+        let entries = tracer.as_ref().map_or_else(Vec::new, |t| t.rows(i));
+        if i + 1 == bands {
+            // The source lookup (a BVH when casting rays) goes before the last band is shaded.
+            tracer = None;
+        }
+        covered += entries.iter().filter(|e| e.is_some()).count();
+        let mut raw = ChannelImages::new();
+        if !channels.is_empty() {
             let req = SurfaceBakeRequest {
                 width: w,
                 height: rows,
-                samples: prep.corr.entries[range.clone()]
+                samples: entries
                     .iter()
                     .map(|e| e.as_ref().map(|e| interpolate_sample(source, e)))
                     .collect(),
                 channels: channels.clone(),
             };
-            let part = host.bake_surface(&req)?;
+            let mut part = host.bake_surface(&req)?;
+            drop(req);
             check_shaded(&part, &channels, w, rows)?;
             for c in &channels {
-                let src = &part[c];
-                let dst = shaded.entry(c.clone()).or_insert_with(|| ChannelImage {
-                    image: Image::new(w, h, Vec4::ZERO),
-                    encoding: src.encoding,
-                });
-                dst.image.pixels[range.clone()].copy_from_slice(&src.image.pixels);
+                if let Some(ci) = part.remove(c) {
+                    raw.insert(c.clone(), ci);
+                }
             }
-            y0 += rows;
+        }
+        if displacement {
+            raw.insert(DISPLACEMENT.into(), displacement_channel(&entries, w, rows));
+        }
+        fin.band(rows, &entries, raw, out);
+        if opts.keep_correspondence {
+            kept.extend(entries);
         }
     }
-    Ok(finish_output(prep, dest_to_world, opts, shaded))
+    let coverage = covered as f32 / (w as usize * h as usize).max(1) as f32;
+    let correspondence = Correspondence {
+        width: w,
+        height: h,
+        supersample: ss,
+        entries: kept,
+    };
+    Ok((coverage, correspondence))
 }
 
 /// Flattened-texture bake: moves texels from host-flattened textures (one per source
@@ -452,7 +746,11 @@ pub fn bake_flattened(
     let mut raw = ChannelImages::new();
     for name in &opts.channels {
         if name == DISPLACEMENT {
-            raw.insert(DISPLACEMENT.into(), displacement_channel(&prep.corr));
+            let c = &prep.corr;
+            raw.insert(
+                DISPLACEMENT.into(),
+                displacement_channel(&c.entries, c.width, c.height),
+            );
             continue;
         }
         let Some((encoding, _)) = flattened.channels.get(name) else {
@@ -508,11 +806,7 @@ pub fn bake_flattened(
     }
     let coverage = prep.corr.coverage();
     let textures = finish(raw, &prep, dest_to_world, opts);
-    Ok(BakeOutput {
-        textures,
-        coverage,
-        correspondence: prep.corr,
-    })
+    Ok(output(prep.corr, textures, coverage, opts))
 }
 
 #[cfg(test)]
@@ -716,7 +1010,7 @@ mod tests {
 
     #[test]
     fn banded_bake_matches_one_request() {
-        // 1100² samples: two bands of rows.
+        // Bands of rows, each finished as soon as dilation allows, against one request.
         struct Counting(u32);
         impl RenderHost for Counting {
             fn material_info(&self, m: MaterialId) -> MaterialInfo {
@@ -743,23 +1037,70 @@ mod tests {
             vec![0, 1, 2, 0, 2, 3],
         );
         quad.normals = Some(vec![Vec3::Z; 4]);
-        quad.uvs = vec![vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]];
+        // A diamond in UV space: half the texels are gutter, so dilation crosses bands.
+        quad.uvs = vec![vec![
+            Vec2::new(0.5, 0.0),
+            Vec2::new(1.0, 0.5),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(0.0, 0.5),
+        ]];
         let source = Scene::from_mesh(quad.clone());
-        let opts = BakeOptions {
-            width: 1100,
-            height: 1100,
-            supersample: 1,
-            channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into()],
-            source_triangles: Some(source.flatten().1),
-            ..Default::default()
-        };
-        let mut host = Counting(0);
-        let banded = bake_with_host(&mut host, &quad, Mat4::IDENTITY, &source, &opts).unwrap();
-        assert_eq!(host.0, 2);
-        let prepared = prepare_bake(&quad, Mat4::IDENTITY, &source, &opts).unwrap();
-        let shaded = ProceduralHost.bake_surface(&prepared.request).unwrap();
-        let whole = finish_bake(prepared, shaded).unwrap();
-        assert_eq!(banded.textures, whole.textures);
-        assert!(banded.coverage > 0.99);
+        for (supersample, gutter) in [(1, 2), (1, 12), (2, 12)] {
+            let opts = BakeOptions {
+                width: 1024,
+                height: 400,
+                supersample,
+                gutter,
+                channels: vec![
+                    channels::BASE_COLOR.into(),
+                    channels::NORMAL.into(),
+                    DISPLACEMENT.into(),
+                ],
+                source_triangles: Some(source.flatten().1),
+                ..Default::default()
+            };
+            let mut host = Counting(0);
+            let banded = bake_with_host(&mut host, &quad, Mat4::IDENTITY, &source, &opts).unwrap();
+            let band = BAND_SAMPLES as u32 / (1024 * supersample * supersample) * supersample;
+            assert_eq!(host.0, (400 * supersample).div_ceil(band));
+            assert!(host.0 > 3, "{} bands", host.0);
+            let prepared = prepare_bake(&quad, Mat4::IDENTITY, &source, &opts).unwrap();
+            let shaded = ProceduralHost.bake_surface(&prepared.request).unwrap();
+            let whole = finish_bake(prepared, shaded).unwrap();
+            assert_eq!(banded.textures, whole.textures);
+            assert_eq!(banded.coverage, whole.coverage);
+            assert!((banded.coverage - 0.5).abs() < 0.01, "{}", banded.coverage);
+            assert_eq!(banded.correspondence, whole.correspondence);
+
+            // Rows as they finish, without the correspondence: the same texels.
+            let mut rows = ChannelImages::new();
+            let opts = BakeOptions {
+                keep_correspondence: false,
+                ..opts
+            };
+            let out = bake_rows_with_host(
+                &mut ProceduralHost,
+                &quad,
+                Mat4::IDENTITY,
+                &source,
+                &opts,
+                &mut |r| {
+                    let ci = rows
+                        .entry(r.channel.into())
+                        .or_insert_with(|| ChannelImage {
+                            image: Image::new(1024, 0, Vec4::ZERO),
+                            encoding: r.encoding,
+                        });
+                    assert_eq!(ci.image.height, r.y);
+                    assert_eq!(r.pixels.len() % 1024, 0);
+                    ci.image.height += r.pixels.len() as u32 / 1024;
+                    ci.image.pixels.extend_from_slice(r.pixels);
+                },
+            )
+            .unwrap();
+            assert_eq!(rows, whole.textures);
+            assert!(out.textures.is_empty() && out.correspondence.entries.is_empty());
+            assert_eq!(out.coverage, whole.coverage);
+        }
     }
 }

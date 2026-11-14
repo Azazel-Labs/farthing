@@ -36,7 +36,7 @@ unsafe impl GlobalAlloc for Counting {
 static ALLOC: Counting = Counting;
 
 /// Peak heap a sample may reach. wasm32 linear memory stops at 4 GiB; the samples peak near
-/// 360 MB (FlightHelmet), so 1 GiB catches a regression long before a browser would trap.
+/// 430 MB (FlightHelmet), so 1 GiB catches a regression long before a browser would trap.
 const WASM_HEAP_BUDGET: usize = 1 << 30;
 
 fn textured_sphere() -> Vec<u8> {

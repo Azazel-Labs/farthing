@@ -11,13 +11,13 @@
 //!   live in [`crate::modes`]; [`Demo::run`] dispatches on [`LodOptions::mode`].
 
 use crate::modes::Extra;
-use farthing::bake::{bake_with_host, compute_tangents, BakeOptions};
+use farthing::bake::{bake_rows_with_host, compute_tangents, BakeOptions};
 use farthing::host::{
     channels, BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, IdImage,
     IdRenderRequest, MaterialClass, MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages,
     ViewRenderRequest,
 };
-use farthing::image::{linear_to_srgb, Image, Texture};
+use farthing::image::{Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
 use farthing::metrics::{surface_distance, SurfaceDistance};
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
@@ -25,7 +25,7 @@ use farthing::uv::{parameterize, texel_density, ParamOptions};
 use farthing::{Error, MaterialId, Mesh, Scene};
 use glam::{Mat4, Vec4};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Cursor, Read};
 
 /// Surface samples per mesh when measuring a level against LOD0.
@@ -68,8 +68,9 @@ pub enum DemoMode {
     Splats,
 }
 
-/// Largest shared atlas side: a 2048² bake peaks around half a gigabyte, and 4096² would need
-/// four times that, more than a browser gives WebAssembly.
+/// Largest shared atlas side: a 2048² bake holds a few hundred megabytes at its peak (the
+/// decoded source textures plus about 30 bytes a texel), and 4096² would need four times
+/// that, more than a browser gives WebAssembly.
 pub const MAX_SHARED_SIZE: u32 = 2048;
 
 /// Which textures the chain's near levels use.
@@ -685,10 +686,9 @@ impl Demo {
             compute_tangents(&mut mesh, 0).map_err(err)?;
 
             emit(Event::Stage(&format!("LOD{level}: baking {w}×{h}")));
-            let bake = bake_with_host(
+            let (tex, coverage) = bake_textures(
                 &mut host,
                 &mesh,
-                Mat4::IDENTITY,
                 &self.scene,
                 &BakeOptions {
                     width: w,
@@ -702,15 +702,16 @@ impl Demo {
                     ],
                     ..Default::default()
                 },
+                level,
+                emit,
             )
             .map_err(err)?;
-            let tex = bake_textures(&bake.textures, level, emit);
             let mut s = Scene::from_mesh(mesh);
             s.materials[0].name = "baked".into();
             let glb = glb_bytes(&s, &tex).map_err(err)?;
             let ms = now() - t0;
             let mut info = level_info(level, LevelKind::Baked, &s, Some(&d), geo_error, ms);
-            info.coverage = Some(bake.coverage);
+            info.coverage = Some(coverage);
             info.charts = Some(p.charts);
             info.utilization = Some(p.utilization);
             info.bytes = Some(glb.len());
@@ -803,11 +804,9 @@ impl Demo {
         emit(Event::Stage(&format!("Shared atlas: baking {w}×{h}")));
         let mut mesh = p.mesh;
         compute_tangents(&mut mesh, 0).map_err(err)?;
-        // The correspondence (about 45 bytes a texel) goes as soon as the bake returns.
-        let (textures, coverage) = bake_with_host(
+        let (mut tex, coverage) = bake_textures(
             &mut MaterialHost::new(&self.materials, false),
             &mesh,
-            Mat4::IDENTITY,
             &self.scene,
             &BakeOptions {
                 width: w,
@@ -822,11 +821,10 @@ impl Demo {
                 source_triangles: Some(refs),
                 ..Default::default()
             },
+            1,
+            emit,
         )
-        .map(|b| (b.textures, b.coverage))
         .map_err(err)?;
-        let mut tex = bake_textures(&textures, 1, emit);
-        drop(textures);
         let cutoff = self
             .materials
             .iter()
@@ -1054,39 +1052,71 @@ fn view_note(level: usize, error: f32, visible: f32, distance: f32) -> String {
     }
 }
 
-/// Emits a bake's textures for `level` and returns them for export (slot 0).
+/// Bakes `mesh` (in world space) from `scene` through `host`, emits the textures for `level`
+/// and returns them for export (slot 0), with the bake's coverage.
+///
+/// Rows are quantized to 8 bits as the bake finishes them, and the correspondence is not
+/// kept, so the bake never holds a float image or a correspondence entry for the whole atlas.
 fn bake_textures(
-    textures: &ChannelImages,
+    host: &mut dyn RenderHost,
+    mesh: &Mesh,
+    scene: &Scene,
+    opts: &BakeOptions,
     level: usize,
     emit: &mut dyn FnMut(Event),
-) -> ExportTextures {
+) -> Result<(ExportTextures, f32), Error> {
+    let (w, h) = (opts.width, opts.height);
+    let mut texels: BTreeMap<String, Vec<[u8; 4]>> = BTreeMap::new();
+    let opts = BakeOptions {
+        keep_correspondence: false,
+        ..opts.clone()
+    };
+    let bake = bake_rows_with_host(host, mesh, Mat4::IDENTITY, scene, &opts, &mut |r| {
+        let encode = encoder(r.channel, r.encoding);
+        texels
+            .entry(r.channel.to_owned())
+            .or_insert_with(|| Vec::with_capacity(w as usize * h as usize))
+            .extend(r.pixels.iter().map(|&p| encode(p)));
+    })?;
     let mut tex = ExportTextures::default();
-    for (name, ch) in textures {
-        let rgba = to_rgba8(&ch.image, ch.encoding);
+    for (name, texels) in texels {
+        // The page shows the texels opaque.
+        let opaque: Vec<[u8; 4]> = texels.iter().map(|&[r, g, b, _]| [r, g, b, 255]).collect();
         emit(Event::Texture {
             level,
-            channel: name,
-            width: ch.image.width,
-            height: ch.image.height,
-            rgba: &rgba,
+            channel: &name,
+            width: w,
+            height: h,
+            rgba: opaque.as_flattened(),
         });
+        drop(opaque);
+        let texture = |srgb| Texture::from_rgba8(w, h, texels.as_flattened(), srgb);
         match name.as_str() {
             channels::BASE_COLOR => {
-                tex.base_color
-                    .insert(0, Texture::from_image(&ch.image, true));
+                tex.base_color.insert(0, texture(true)?);
             }
             channels::NORMAL => {
-                tex.normal
-                    .insert(0, Texture::from_signed_normals(&ch.image));
+                tex.normal.insert(0, texture(false)?);
             }
             channels::ORM => {
-                tex.metallic_roughness
-                    .insert(0, Texture::from_image(&ch.image, false));
+                tex.metallic_roughness.insert(0, texture(false)?);
             }
             _ => {}
         }
     }
-    tex
+    Ok((tex, bake.coverage))
+}
+
+/// How a baked channel is stored: sRGB base color, signed normals, linear data.
+fn encoder(channel: &str, encoding: ChannelEncoding) -> fn(Vec4) -> [u8; 4] {
+    match (channel, encoding) {
+        (channels::BASE_COLOR, _) | (_, ChannelEncoding::Color) => |p| Texture::encode(p, true),
+        (channels::NORMAL, _)
+        | (_, ChannelEncoding::NormalTangent | ChannelEncoding::NormalWorld) => {
+            Texture::encode_normal
+        }
+        _ => |p| Texture::encode(p, false),
+    }
 }
 
 /// GPU memory of export textures: RGBA8 with a full mip chain (4/3), each texture counted
@@ -1173,26 +1203,6 @@ pub(crate) fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
         }
     }
     t
-}
-
-pub(crate) fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
-    let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    let mut out = Vec::with_capacity(img.pixels.len() * 4);
-    for p in &img.pixels {
-        let rgb = match encoding {
-            ChannelEncoding::Color => [
-                linear_to_srgb(p.x),
-                linear_to_srgb(p.y),
-                linear_to_srgb(p.z),
-            ],
-            ChannelEncoding::NormalTangent | ChannelEncoding::NormalWorld => {
-                [p.x * 0.5 + 0.5, p.y * 0.5 + 0.5, p.z * 0.5 + 0.5]
-            }
-            ChannelEncoding::Data => [p.x, p.y, p.z],
-        };
-        out.extend_from_slice(&[q(rgb[0]), q(rgb[1]), q(rgb[2]), 255]);
-    }
-    out
 }
 
 /// What a browser demo can know about glTF materials: base color texture × factor × vertex

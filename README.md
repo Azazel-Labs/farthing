@@ -352,7 +352,11 @@ A few things the bake handles for you:
 - **Quality.** Each texel is supersampled (2×2 by default), and the edges are dilated into
   the gutters.
 - **Re-baking.** `baked.correspondence` keeps the traced map from texels to the source
-  surface, so you can bake more channels later without tracing again.
+  surface, so you can bake more channels later without tracing again. It costs about 45
+  bytes a sample; set `keep_correspondence: false` when you will not re-bake.
+- **Memory.** The bake traces and shades a band of rows at a time, so a large atlas holds
+  little more than its finished textures. `bake_rows_with_host` hands you finished rows
+  instead, if you store textures in another form (say 8-bit) and never want the float images.
 - **Textures you already have.** If your materials are already flat images in the source
   UVs, `bake_flattened` copies texels and needs no host at all.
 
