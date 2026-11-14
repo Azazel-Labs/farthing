@@ -5,7 +5,9 @@ use farthing::image::Image;
 use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
 use farthing::{Mesh, Scene};
 use farthing_demo_web::modes::ViewRequest;
-use farthing_demo_web::pipeline::{Buffer, Demo, DemoMode, Event, LevelInfo, LodOptions};
+use farthing_demo_web::pipeline::{
+    Buffer, Demo, DemoMode, Event, LevelInfo, LodOptions, TextureMode,
+};
 use glam::{Vec2, Vec3, Vec4};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
@@ -171,6 +173,73 @@ fn zipped_gltf_reduces_and_bakes() {
 }
 
 #[test]
+fn shared_atlas_carries_the_original_materials() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let opts = LodOptions {
+        levels: 3,
+        bake_from: 3,
+        atlas: 64,
+        textures: TextureMode::Shared,
+        shared_size: 512,
+        ..Default::default()
+    };
+    let (mut levels, mut textures) = (vec![], vec![]);
+    let t0 = std::time::Instant::now();
+    demo.run(
+        &opts,
+        &|| t0.elapsed().as_secs_f64() * 1e3,
+        &mut |e| match e {
+            Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+            Event::Texture {
+                level,
+                channel,
+                width,
+                height,
+                rgba,
+            } => textures.push((level, channel.to_owned(), width, height, rgba.to_vec())),
+            _ => {}
+        },
+    )
+    .unwrap();
+
+    let kinds: Vec<String> = levels.iter().map(|l| format!("{:?}", l.0.kind)).collect();
+    assert_eq!(kinds, ["Original", "Shared", "Shared", "Baked"]);
+    let (one, two) = (&levels[1].0, &levels[2].0);
+    assert!(two.triangles < one.triangles);
+    for info in [one, two] {
+        assert_eq!(info.shared_textures, Some(1));
+        assert!(info.relative_error < 0.05, "{info:?}");
+        let d = info.density_scale.unwrap();
+        assert!(d > 0.0 && d <= 1.0, "{info:?}");
+        assert!(info.coverage.unwrap() > 0.2, "{info:?}");
+    }
+    let (w, h) = (one.atlas_width.unwrap(), one.atlas_height.unwrap());
+    assert!(w <= 512 && h <= 512 && w.is_power_of_two(), "{w}×{h}");
+    // Three textures (base color, normal, ORM) with mips.
+    assert_eq!(one.texture_bytes, Some(3 * (w * h) as usize * 16 / 3));
+
+    // Level 1's GLB carries the atlas; level 2 reuses it, but downloads embed it.
+    assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
+    assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
+    assert!(demo
+        .level_glb(2)
+        .unwrap()
+        .windows(9)
+        .any(|w| w == b"image/png"));
+
+    // The atlas comes from level 1 and keeps the checker.
+    let shared: Vec<_> = textures.iter().filter(|t| t.0 == 1).collect();
+    let names: Vec<&str> = shared.iter().map(|t| t.1.as_str()).collect();
+    assert_eq!(names, ["base_color", "normal", "orm"]);
+    assert_eq!((shared[0].2, shared[0].3), (w, h));
+    let px = shared[0].4.as_chunks::<4>().0.iter();
+    let red = px.clone().filter(|p| p[0] > 200 && p[1] < 60).count();
+    let white = px.filter(|p| p[0] > 200 && p[1] > 200).count();
+    assert!(red > 1000 && white > 1000, "red {red}, white {white}");
+    assert!(textures.iter().all(|t| t.0 == 1 || t.0 == 3));
+}
+
+#[test]
 fn reports_missing_files() {
     let (gltf, _) = split_glb(&textured_sphere(), "missing.bin");
     let e = Demo::load(vec![("a.gltf".into(), gltf)]).err().unwrap();
@@ -240,6 +309,45 @@ fn samples_reduce_and_bake() {
             "{file}: peak heap {} MB would not fit wasm32",
             peak >> 20
         );
+
+        // The shared atlas at its largest size, held to the same budget.
+        let t0 = std::time::Instant::now();
+        PEAK.store(LIVE.load(Relaxed), Relaxed);
+        let shared = LodOptions {
+            textures: TextureMode::Shared,
+            ..opts.clone()
+        };
+        let mut levels = vec![];
+        demo.run(&shared, &|| 0.0, &mut |e| {
+            if let Event::Level { info, .. } = e {
+                levels.push(info.clone());
+            }
+        })
+        .unwrap_or_else(|e| panic!("{file}: {e}"));
+        let peak = PEAK.load(Relaxed);
+        let atlas = &levels[1];
+        eprintln!(
+            "{file}: shared atlas {}×{} at {:.0}% of the artist's density, {:.1}s, peak heap {} MB",
+            atlas.atlas_width.unwrap(),
+            atlas.atlas_height.unwrap(),
+            atlas.density_scale.unwrap() * 100.0,
+            t0.elapsed().as_secs_f64(),
+            peak >> 20
+        );
+        assert!(
+            peak < WASM_HEAP_BUDGET,
+            "{file}: shared peak heap {} MB would not fit wasm32",
+            peak >> 20
+        );
+        assert_eq!(levels.len(), opts.levels + 1, "{file}");
+        for info in &levels[1..opts.bake_from] {
+            assert_eq!(format!("{:?}", info.kind), "Shared", "{file}");
+            assert!(info.coverage.unwrap() > 0.2, "{file}: {info:?}");
+            assert!(info.density_scale.unwrap() > 0.0, "{file}: {info:?}");
+        }
+        for w in levels.windows(2) {
+            assert!(w[1].triangles < w[0].triangles, "{file}: {:?}", w[1]);
+        }
 
         // The other modes with the page's defaults, each held to the same budget.
         for mode in [

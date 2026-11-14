@@ -133,6 +133,21 @@
         <label class="select" title="From this level on, the scene is merged into one mesh, unwrapped and its materials baked into an atlas">
           Bake proxy from <select name="bake_from"></select>
         </label>
+        <label class="select" title="Levels before the proxy: each mesh reduced with its own UVs and materials, or the whole scene re-unwrapped once and its materials baked into one shared atlas at the artist's texel density">
+          Near textures
+          <select name="textures">
+            <option value="original" selected>Original materials</option>
+            <option value="shared">Shared atlas</option>
+          </select>
+        </label>
+        <label class="select" id="shared-size" title="Largest side of the shared atlas. It keeps the artist's texel density when that fits, and shrinks every chart by the same factor when it does not.">
+          Shared atlas up to
+          <select name="shared_size">
+            <option value="512">512</option>
+            <option value="1024">1024</option>
+            <option value="2048" selected>2048</option>
+          </select>
+        </label>
       </fieldset>
 
       <fieldset data-modes="chain">
@@ -205,7 +220,8 @@
               <th>Level</th><th>Kind</th><th class="n">Triangles</th><th class="n">%</th>
               <th class="n" title="Measured deviation from LOD0 (sampled Hausdorff distance), relative to the scene's bounding-box diagonal">Error</th>
               <th class="n" title="Camera distance where the error is under 1 pixel at 1080p, 60° FOV">Switch at</th>
-              <th class="n">Time</th><th class="n" title="Download size (GLB, PLY, or the packed GPU cluster format)">Size</th><th></th>
+              <th class="n">Time</th><th class="n" title="Download size (GLB, PLY, or the packed GPU cluster format)">Size</th>
+              <th class="n" title="GPU memory of the textures the level is drawn with: RGBA8 with full mip chains, each texture counted once">Textures</th><th></th>
             </tr>
           </thead>
           <tbody id="level-rows"></tbody>

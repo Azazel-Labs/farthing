@@ -1,4 +1,4 @@
-use crate::bake::correspondence::{build_correspondence, Correspondence};
+use crate::bake::correspondence::{build_correspondence, copy_correspondence, Correspondence};
 use crate::bake::tangents::compute_tangents;
 use crate::host::{
     channels, ChannelEncoding, ChannelImage, ChannelImages, RenderHost, SurfaceBakeRequest,
@@ -13,6 +13,10 @@ use std::collections::{BTreeMap, HashMap};
 /// Channel produced by farthing itself: signed source distance along the destination normal.
 pub const DISPLACEMENT: &str = "displacement";
 
+/// [`bake_with_host`] shades at most this many samples per [`RenderHost::bake_surface`] call,
+/// so the request (about 90 bytes a sample) stays small however large the atlas.
+const BAND_SAMPLES: usize = 1 << 20;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BakeOptions {
     pub width: u32,
@@ -26,6 +30,12 @@ pub struct BakeOptions {
     /// Gutter dilation in pixels.
     pub gutter: u32,
     pub channels: Vec<String>,
+    /// The destination is a copy of the source with new UVs (say [`Scene::flatten`]'s mesh,
+    /// re-unwrapped with [`crate::uv::parameterize`]): per destination triangle, the source
+    /// triangle it copies, as `flatten` returns them. Texels then read the source at the same
+    /// surface point instead of casting rays: an exact transfer, with `max_distance` unused.
+    #[serde(skip)]
+    pub source_triangles: Option<Vec<crate::scene::TriRef>>,
 }
 
 impl Default for BakeOptions {
@@ -38,6 +48,7 @@ impl Default for BakeOptions {
             uv_set: 0,
             gutter: 8,
             channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into()],
+            source_triangles: None,
         }
     }
 }
@@ -102,19 +113,31 @@ fn prepare(
         dest.compute_normals(180.0);
     }
     compute_tangents(&mut dest, opts.uv_set)?;
-    let maxd = opts
-        .max_distance
-        .unwrap_or_else(|| source.bounds().diagonal() * 0.03);
-    let corr = build_correspondence(
-        &dest,
-        dest_to_world,
-        source,
-        opts.width,
-        opts.height,
-        opts.supersample,
-        opts.uv_set,
-        maxd,
-    )?;
+    let corr = if let Some(refs) = &opts.source_triangles {
+        copy_correspondence(
+            &dest,
+            source,
+            refs,
+            opts.width,
+            opts.height,
+            opts.supersample,
+            opts.uv_set,
+        )?
+    } else {
+        let maxd = opts
+            .max_distance
+            .unwrap_or_else(|| source.bounds().diagonal() * 0.03);
+        build_correspondence(
+            &dest,
+            dest_to_world,
+            source,
+            opts.width,
+            opts.height,
+            opts.supersample,
+            opts.uv_set,
+            maxd,
+        )?
+    };
     Ok(Prepared { dest, corr })
 }
 
@@ -171,7 +194,11 @@ fn finish(
     }
     raw.into_iter()
         .map(|(name, mut ci)| {
-            let mut img = ci.image.downsample_coverage(corr.supersample);
+            let mut img = if corr.supersample > 1 {
+                ci.image.downsample_coverage(corr.supersample)
+            } else {
+                std::mem::replace(&mut ci.image, Image::new(0, 0, Vec4::ZERO))
+            };
             if ci.encoding == ChannelEncoding::NormalTangent {
                 for p in &mut img.pixels {
                     if p.w > 0.0 {
@@ -314,37 +341,57 @@ pub fn prepare_bake(
 }
 
 /// Phase 2: takes the shaded channels (request-sized) and produces final textures.
-pub fn finish_bake(prepared: PreparedBake, mut shaded: ChannelImages) -> Result<BakeOutput> {
+pub fn finish_bake(prepared: PreparedBake, shaded: ChannelImages) -> Result<BakeOutput> {
     let req = &prepared.request;
-    for c in &req.channels {
+    check_shaded(&shaded, &req.channels, req.width, req.height)?;
+    Ok(finish_output(
+        prepared.prep,
+        prepared.dest_to_world,
+        &prepared.opts,
+        shaded,
+    ))
+}
+
+/// Every requested channel came back, at the request's size.
+fn check_shaded(
+    shaded: &ChannelImages,
+    channels: &[String],
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    for c in channels {
         let img = shaded
             .get(c)
             .ok_or_else(|| Error::Host(format!("missing channel `{c}`")))?;
-        if (img.image.width, img.image.height) != (req.width, req.height) {
+        if (img.image.width, img.image.height) != (width, height) {
             return Err(Error::Host(format!("channel `{c}` has the wrong size")));
         }
     }
-    if prepared.opts.channels.iter().any(|c| c == DISPLACEMENT) {
-        shaded.insert(
-            DISPLACEMENT.into(),
-            displacement_channel(&prepared.prep.corr),
-        );
+    Ok(())
+}
+
+fn finish_output(
+    prep: Prepared,
+    dest_to_world: Mat4,
+    opts: &BakeOptions,
+    mut shaded: ChannelImages,
+) -> BakeOutput {
+    if opts.channels.iter().any(|c| c == DISPLACEMENT) {
+        shaded.insert(DISPLACEMENT.into(), displacement_channel(&prep.corr));
     }
-    let coverage = prepared.prep.corr.coverage();
-    let textures = finish(
-        shaded,
-        &prepared.prep,
-        prepared.dest_to_world,
-        &prepared.opts,
-    );
-    Ok(BakeOutput {
+    let coverage = prep.corr.coverage();
+    let textures = finish(shaded, &prep, dest_to_world, opts);
+    BakeOutput {
         textures,
         coverage,
-        correspondence: prepared.prep.corr,
-    })
+        correspondence: prep.corr,
+    }
 }
 
 /// Point-evaluation bake: the host evaluates its real materials at the source points.
+///
+/// The host is called once per band of rows (about a million samples each), so the request
+/// never holds a surface sample for every texel of a large atlas.
 pub fn bake_with_host(
     host: &mut dyn RenderHost,
     dest: &Mesh,
@@ -352,13 +399,44 @@ pub fn bake_with_host(
     source: &Scene,
     opts: &BakeOptions,
 ) -> Result<BakeOutput> {
-    let prepared = prepare_bake(dest, dest_to_world, source, opts)?;
-    let shaded = if prepared.request.channels.is_empty() {
-        ChannelImages::new()
-    } else {
-        host.bake_surface(&prepared.request)?
-    };
-    finish_bake(prepared, shaded)
+    let prep = prepare(dest, dest_to_world, source, opts)?;
+    let channels: Vec<String> = opts
+        .channels
+        .iter()
+        .filter(|c| c.as_str() != DISPLACEMENT)
+        .cloned()
+        .collect();
+    let (w, h) = (prep.corr.width, prep.corr.height);
+    let mut shaded = ChannelImages::new();
+    if !channels.is_empty() {
+        let band = (BAND_SAMPLES / w.max(1) as usize).max(1) as u32;
+        let mut y0 = 0;
+        while y0 < h {
+            let rows = band.min(h - y0);
+            let range = (y0 * w) as usize..((y0 + rows) * w) as usize;
+            let req = SurfaceBakeRequest {
+                width: w,
+                height: rows,
+                samples: prep.corr.entries[range.clone()]
+                    .iter()
+                    .map(|e| e.as_ref().map(|e| interpolate_sample(source, e)))
+                    .collect(),
+                channels: channels.clone(),
+            };
+            let part = host.bake_surface(&req)?;
+            check_shaded(&part, &channels, w, rows)?;
+            for c in &channels {
+                let src = &part[c];
+                let dst = shaded.entry(c.clone()).or_insert_with(|| ChannelImage {
+                    image: Image::new(w, h, Vec4::ZERO),
+                    encoding: src.encoding,
+                });
+                dst.image.pixels[range.clone()].copy_from_slice(&src.image.pixels);
+            }
+            y0 += rows;
+        }
+    }
+    Ok(finish_output(prep, dest_to_world, opts, shaded))
 }
 
 /// Flattened-texture bake: moves texels from host-flattened textures (one per source
@@ -576,5 +654,112 @@ mod tests {
             img.get(0, 0),
             img.get(3, 3)
         );
+    }
+
+    #[test]
+    fn source_points_match_the_destination_on_mirrored_instances() {
+        // A lopsided triangle, so swapped barycentrics land somewhere else, placed as is and
+        // mirrored. The destination is the flattened scene with new UVs.
+        let mut tri = Mesh::new(
+            vec![
+                Vec3::ZERO,
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 2.0, 0.0),
+            ],
+            vec![0, 1, 2],
+        );
+        tri.normals = Some(vec![Vec3::Z; 3]);
+        let mut source = Scene::from_mesh(tri);
+        let mut mirror = source.instances[0].clone();
+        mirror.transform = Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0))
+            * Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0));
+        source.instances.push(mirror);
+        let (flat, refs) = source.flatten();
+        let dest = crate::uv::parameterize(
+            &flat,
+            &crate::uv::ParamOptions {
+                atlas_size: 64,
+                ..crate::uv::ParamOptions::planar()
+            },
+        )
+        .unwrap()
+        .mesh;
+        let opts = BakeOptions {
+            width: 64,
+            height: 64,
+            supersample: 1,
+            max_distance: Some(0.1),
+            ..Default::default()
+        };
+        for copy in [false, true] {
+            let opts = BakeOptions {
+                source_triangles: copy.then(|| refs.clone()),
+                ..opts.clone()
+            };
+            let prep = prepare(&dest, Mat4::IDENTITY, &source, &opts).unwrap();
+            let mut seen = [0; 2];
+            for e in prep.corr.entries.iter().flatten() {
+                let [i0, i1, i2] = dest.triangle(e.dest_triangle as usize).map(|v| v as usize);
+                let b = e.dest_barycentrics;
+                let p =
+                    dest.positions[i0] * b.x + dest.positions[i1] * b.y + dest.positions[i2] * b.z;
+                let q = interpolate_sample(&source, e).position;
+                assert!((p - q).length() < 1e-3, "copy {copy}: {p} vs {q}");
+                if copy {
+                    assert_eq!(e.source, refs[e.dest_triangle as usize]);
+                }
+                seen[e.source.instance as usize] += 1;
+            }
+            assert!(seen[0] > 20 && seen[1] > 20, "{seen:?}");
+        }
+    }
+
+    #[test]
+    fn banded_bake_matches_one_request() {
+        // 1100² samples: two bands of rows.
+        struct Counting(u32);
+        impl RenderHost for Counting {
+            fn material_info(&self, m: MaterialId) -> MaterialInfo {
+                ProceduralHost.material_info(m)
+            }
+            fn bake_surface(&mut self, req: &SurfaceBakeRequest) -> Result<ChannelImages> {
+                self.0 += 1;
+                ProceduralHost.bake_surface(req)
+            }
+            fn render_views(&mut self, r: &ViewRenderRequest) -> Result<Vec<ViewImages>> {
+                ProceduralHost.render_views(r)
+            }
+            fn create_material(&mut self, d: &BakedMaterialDesc) -> Result<MaterialId> {
+                ProceduralHost.create_material(d)
+            }
+        }
+        let mut quad = Mesh::new(
+            vec![
+                Vec3::ZERO,
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![0, 1, 2, 0, 2, 3],
+        );
+        quad.normals = Some(vec![Vec3::Z; 4]);
+        quad.uvs = vec![vec![Vec2::ZERO, Vec2::X, Vec2::ONE, Vec2::Y]];
+        let source = Scene::from_mesh(quad.clone());
+        let opts = BakeOptions {
+            width: 1100,
+            height: 1100,
+            supersample: 1,
+            channels: vec![channels::BASE_COLOR.into(), channels::NORMAL.into()],
+            source_triangles: Some(source.flatten().1),
+            ..Default::default()
+        };
+        let mut host = Counting(0);
+        let banded = bake_with_host(&mut host, &quad, Mat4::IDENTITY, &source, &opts).unwrap();
+        assert_eq!(host.0, 2);
+        let prepared = prepare_bake(&quad, Mat4::IDENTITY, &source, &opts).unwrap();
+        let shaded = ProceduralHost.bake_surface(&prepared.request).unwrap();
+        let whole = finish_bake(prepared, shaded).unwrap();
+        assert_eq!(banded.textures, whole.textures);
+        assert!(banded.coverage > 0.99);
     }
 }

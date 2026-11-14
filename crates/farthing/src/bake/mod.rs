@@ -4,7 +4,8 @@
 //!
 //! 1. Rasterize the destination mesh in UV space ([`raster`]).
 //! 2. Ray-cast each sample to the source surface ([`correspondence`]) — the reusable,
-//!    serializable "where did this texel come from" buffer.
+//!    serializable "where did this texel come from" buffer. A destination that is a copy of
+//!    the source with new UVs skips the rays ([`BakeOptions::source_triangles`]).
 //! 3. Either ask the host to evaluate its real materials at those points
 //!    ([`bake_with_host`], point-evaluation mode) or move texels from host-flattened textures
 //!    ([`bake_flattened`], for hosts that pre-flatten materials to textures).
@@ -29,5 +30,7 @@ pub use cast::{
     bake_flattened, bake_with_host, finish_bake, prepare_bake, BakeOptions, BakeOutput,
     FlattenedTextures, PreparedBake, DISPLACEMENT,
 };
-pub use correspondence::{build_correspondence, Correspondence, CorrespondenceEntry};
+pub use correspondence::{
+    build_correspondence, copy_correspondence, Correspondence, CorrespondenceEntry,
+};
 pub use tangents::compute_tangents;

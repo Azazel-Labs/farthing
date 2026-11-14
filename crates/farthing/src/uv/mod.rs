@@ -22,4 +22,4 @@ mod param;
 pub mod sparse;
 
 pub use pack::{pack_rects, Placement};
-pub use param::{parameterize, ParamMethod, ParamOptions, ParamResult};
+pub use param::{parameterize, texel_density, ParamMethod, ParamOptions, ParamResult};

@@ -247,6 +247,11 @@ fn unorm8(c: f32) -> u8 {
 }
 
 impl Texture {
+    /// Whether `other` shares this texture's texels (a clone of it, or the same glTF image).
+    pub fn same_texels(&self, other: &Texture) -> bool {
+        Arc::ptr_eq(&self.texels, &other.texels)
+    }
+
     /// From tightly packed RGBA8 rows (`width · height · 4` bytes).
     pub fn from_rgba8(width: u32, height: u32, data: &[u8], srgb: bool) -> Result<Texture> {
         let need = width as usize * height as usize * 4;

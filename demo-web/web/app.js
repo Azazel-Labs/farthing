@@ -161,6 +161,24 @@ function adoptMaterials(gltf) {
   });
 }
 
+/** Shared levels after the first are exported without the atlas: draw them with its material. */
+function adoptShared(gltf, src) {
+  let material = null;
+  src?.traverse((o) => {
+    if (o.isMesh) material ??= o.material;
+  });
+  if (!material) return;
+  gltf.scene.traverse((o) => {
+    if (!o.isMesh || o.material === material) return;
+    o.material.dispose();
+    o.material = material;
+  });
+}
+
+/** Whether a level's object owns its materials (and their textures). */
+const ownsMaterials = (info) =>
+  info?.kind === "baked" || (info?.kind === "shared" && info.shared_textures === info.level);
+
 async function showOriginal(glb) {
   const gltf = await loader.parseAsync(glb, "");
   const materials = await gltf.parser.getDependencies("material");
@@ -459,7 +477,7 @@ function disposeLevel(l) {
   if (l.object.userData.dispose) {
     l.object.userData.dispose();
     l.object.removeFromParent();
-  } else dispose(l.object, l.info?.kind === "baked");
+  } else dispose(l.object, ownsMaterials(l.info));
   l.object = null;
 }
 
@@ -1354,18 +1372,25 @@ async function onLevel(info, glb, id) {
     l.stale = false;
     return renderRows();
   }
-  const gltf = await loader.parseAsync(glb, "");
-  if (id !== runId) return dispose(gltf.scene, info.kind === "baked");
+  const parsed = loader.parseAsync(glb, "");
+  l.loading = parsed;
+  // A shared level reuses the atlas of the level that carries it, which may still be decoding.
+  const src = info.kind === "shared" && info.shared_textures !== info.level ? info.shared_textures : null;
+  const gltf = await parsed;
+  if (src !== null) await levels[src]?.loading;
+  if (id !== runId) return dispose(gltf.scene, ownsMaterials(info));
   if (info.kind === "reduced") adoptMaterials(gltf);
+  if (src !== null) adoptShared(gltf, levels[src]?.object);
   disposeLevel(l);
-  if (info.kind !== "baked") l.tex = {};
+  if (src !== null) l.tex = levels[src]?.tex ?? {};
+  else if (info.kind !== "baked" && info.kind !== "shared") l.tex = {};
   l.object = gltf.scene;
   l.info = info;
   l.stale = false;
   root.add(gltf.scene);
   setWire(gltf.scene);
   renderRows();
-  if (info.kind === "baked" && (selected === info.level || !levels[selected]?.tex.base_color))
+  if (info.kind !== "reduced" && (selected === info.level || !levels[selected]?.tex.base_color))
     drawTextures(info.level);
 }
 
@@ -1430,12 +1455,13 @@ function renderRows() {
   const chain = m === "chain";
   const n = chain ? +form.elements.levels.value : MODE_LEVELS[m];
   const bakeFrom = +form.elements.bake_from.value || Infinity;
+  const near = form.elements.textures.value === "shared" ? "shared" : "reduced";
   const total = assetInfo?.triangles ?? 0;
   const out = [];
   for (let i = 0; i <= Math.max(n, levels.length - 1); i++) {
     const l = levels[i];
     const info = l?.info;
-    const kind = info?.kind ?? (i === 0 ? "original" : chain ? (i >= bakeFrom ? "baked" : "reduced") : MODE_KIND[m]);
+    const kind = info?.kind ?? (i === 0 ? "original" : chain ? (i >= bakeFrom ? "baked" : near) : MODE_KIND[m]);
     const pending = !info || l.stale;
     const live = kind === "clusters" || kind === "hlod";
     const of = info?.full_triangles || total;
@@ -1457,8 +1483,9 @@ function renderRows() {
               : info.switch_distance_1px.toPrecision(3),
           i === 0 ? "—" : `${info.ms.toFixed(0)} ms`,
           info.bytes ? fmtBytes(info.bytes) : "—",
+          info.texture_bytes != null ? texCell(info) : "—",
         ]
-      : ["…", "", "", "", "", ""];
+      : ["…", "", "", "", "", "", ""];
     const name = splats && info ? `${fmtInt(info.vertices)} splats` : (info?.label ?? (i === 0 && !chain ? "Original" : `LOD${i}`));
     const ext = kind === "splats" ? "ply" : "glb";
     const dl =
@@ -1473,6 +1500,13 @@ function renderRows() {
     );
   }
   rowsEl.innerHTML = out.join("");
+}
+
+/** A level's texture memory; shared levels after the first draw with the first's atlas. */
+function texCell(info) {
+  const bytes = fmtBytes(info.texture_bytes);
+  if (info.kind !== "shared" || info.shared_textures === info.level) return bytes;
+  return `<span title="The atlas LOD${info.shared_textures} carries, not a second copy">${bytes}</span>`;
 }
 
 const updateRow = () => renderRows();
@@ -1507,12 +1541,23 @@ function drawTextures(level) {
     c.height = img.height;
     c.getContext("2d").putImageData(img, 0, 0);
   }
-  $("#bake-title").textContent = `Baked textures · LOD${level}${l.stale ? " (updating)" : ""}`;
   const i = l.info;
-  $("#bake-stats").textContent =
-    i?.coverage != null
-      ? `coverage ${(i.coverage * 100).toFixed(1)}% · ${i.charts} charts · utilization ${(i.utilization * 100).toFixed(1)}%`
-      : "";
+  const shared = i?.kind === "shared";
+  const what = shared ? "Shared atlas" : "Baked textures";
+  $("#bake-title").textContent = `${what} · LOD${level}${l.stale ? " (updating)" : ""}`;
+  const parts = [];
+  if (shared)
+    parts.push(
+      `${i.atlas_width} × ${i.atlas_height}`,
+      `${(i.density_scale * 100).toFixed(0)}% of the artist's texel density`,
+    );
+  if (i?.coverage != null)
+    parts.push(
+      `coverage ${(i.coverage * 100).toFixed(1)}%`,
+      `${i.charts} charts`,
+      `utilization ${(i.utilization * 100).toFixed(1)}%`,
+    );
+  $("#bake-stats").textContent = parts.join(" · ");
 }
 
 rowsEl.addEventListener("click", (e) => {
@@ -1574,6 +1619,8 @@ function readOptions() {
     atlas: +f.atlas.value,
     supersample: +f.supersample.value,
     planar_uv: f.planar_uv.checked,
+    textures: f.textures.value,
+    shared_size: +f.shared_size.value,
     fast: f.fast.checked,
     strict_seams: f.strict_seams.checked,
     symmetry: f.symmetry.checked,
@@ -1596,6 +1643,7 @@ function readOptions() {
 function syncModeUi() {
   const m = form.elements.mode.value;
   for (const fs of form.querySelectorAll("fieldset[data-modes]")) fs.hidden = !fs.dataset.modes.split(" ").includes(m);
+  $("#shared-size").hidden = form.elements.textures.value !== "shared";
   $("#mode-hint").textContent = MODE_HINTS[m] ?? "";
 }
 

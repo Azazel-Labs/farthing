@@ -12,7 +12,8 @@ use rayon::prelude::*;
 pub struct CorrespondenceEntry {
     /// Source instance and triangle.
     pub source: TriRef,
-    /// Barycentrics on the source triangle.
+    /// Barycentrics on the source triangle, in the source mesh's corner order (also for
+    /// mirrored instances, whose world triangles swap corners 1 and 2).
     pub barycentrics: Vec3,
     /// Signed distance from the destination surface to the source along the destination
     /// normal (positive = source is outside).
@@ -60,6 +61,7 @@ pub fn build_correspondence(
     let (w, h) = (width * ss, height * ss);
     let samples = rasterize_uv(dest, uv_set, w, h);
     let (tris, refs) = source.world_triangles();
+    let flip = mirrored(source);
     let bvh = Bvh::build(tris);
     let nmat = glam::Mat3::from_mat4(dest_to_world).inverse().transpose();
     let face_n: Vec<Vec3> = (0..dest.triangle_count())
@@ -100,12 +102,92 @@ pub fn build_correspondence(
                     (c.triangle, c.barycentrics, (c.point - p).dot(n))
                 }
             };
+            let source = refs[src_tri as usize];
             Some(CorrespondenceEntry {
-                source: refs[src_tri as usize],
-                barycentrics: bary,
+                source,
+                barycentrics: mesh_order(bary, flip[source.instance as usize]),
                 distance: dist,
                 dest_triangle: s.triangle,
                 dest_barycentrics: b,
+            })
+        })
+        .collect();
+    Ok(Correspondence {
+        width: w,
+        height: h,
+        supersample: ss,
+        entries,
+    })
+}
+
+/// Per instance: does its transform mirror (and so swap corners 1 and 2 in world space)?
+fn mirrored(source: &Scene) -> Vec<bool> {
+    source
+        .instances
+        .iter()
+        .map(|i| i.transform.determinant() < 0.0)
+        .collect()
+}
+
+/// World-order barycentrics to the source mesh's corner order.
+fn mesh_order(b: Vec3, flip: bool) -> Vec3 {
+    if flip {
+        Vec3::new(b.x, b.z, b.y)
+    } else {
+        b
+    }
+}
+
+/// The correspondence for a destination that is a copy of the source (say
+/// [`Scene::flatten`]'s mesh with new UVs): `source_triangles[t]` is the source triangle that
+/// destination triangle `t` copies, corners in world order as `flatten` lays them out. Each
+/// sample reads the source at its own barycentrics, so the transfer is exact and needs no rays.
+pub fn copy_correspondence(
+    dest: &Mesh,
+    source: &Scene,
+    source_triangles: &[TriRef],
+    width: u32,
+    height: u32,
+    supersample: u32,
+    uv_set: usize,
+) -> Result<Correspondence> {
+    if dest.uvs.len() <= uv_set {
+        return Err(Error::InvalidMesh(format!(
+            "destination has no UV set {uv_set}"
+        )));
+    }
+    if source_triangles.len() != dest.triangle_count() {
+        return Err(Error::InvalidInput(format!(
+            "{} source triangles for {} destination triangles",
+            source_triangles.len(),
+            dest.triangle_count()
+        )));
+    }
+    for r in source_triangles {
+        let ok = source
+            .instances
+            .get(r.instance as usize)
+            .is_some_and(|i| (r.triangle as usize) < source.meshes[i.mesh].triangle_count());
+        if !ok {
+            return Err(Error::InvalidInput(format!(
+                "source triangle {r:?} does not exist"
+            )));
+        }
+    }
+    let ss = supersample.max(1);
+    let (w, h) = (width * ss, height * ss);
+    let flip = mirrored(source);
+    let entries = rasterize_uv(dest, uv_set, w, h)
+        .par_iter()
+        .map(|s| {
+            let s = (*s)?;
+            let source = source_triangles[s.triangle as usize];
+            Some(CorrespondenceEntry {
+                source,
+                barycentrics: mesh_order(s.barycentrics, flip[source.instance as usize]),
+                distance: 0.0,
+                dest_triangle: s.triangle,
+                dest_barycentrics: s.barycentrics,
             })
         })
         .collect();

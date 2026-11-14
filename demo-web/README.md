@@ -8,6 +8,15 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
   unique file name.
 - **Near levels** (LOD1 up to *Bake proxy from*) are reduced mesh by mesh. Each level is built
   from the previous one and keeps the original's UVs and materials.
+- **Near textures: Shared atlas** re-unwraps the whole scene once instead, with farthing
+  choosing the chart cuts. The original materials are baked into that one atlas by exact
+  transfer, at the artist's texel density (the densest texture on each surface), and every
+  near level is reduced from that mesh. Charts sit in whole 2ᵏ-texel cells, so mipmaps never
+  mix two charts. *Shared atlas up to* caps the side (2048 at most: a larger bake doesn't fit
+  in a browser's WebAssembly memory). When the artist's density doesn't fit the cap, every
+  chart shrinks by the same factor, which the panel shows. Every shared level's download
+  carries the atlas, but the page sends it once, with LOD1, and draws the later shared levels
+  with it. That one atlas is what the *Textures* column (GPU memory) counts.
 - **Far levels** merge the scene into one mesh and reduce it. The mesh is then unwrapped
   (LSCM, or planar charts) and the original's base color, normals (including normal maps) and
   roughness/metalness are baked into an atlas.
@@ -90,6 +99,7 @@ natively on a zipped `.gltf`.
   source normal maps) and roughness/metalness (texture × factor). Occlusion, emissive and
   other extensions are not baked.
 - Base color textures that use a second UV set are exported on the first set.
-- Baked proxies are static: skins and morph targets are dropped. Reduced levels keep them.
+- Baked proxies and shared-atlas levels are static: skins and morph targets are dropped.
+  Reduced levels keep them.
 - The wasm build is single-threaded (rayon falls back to the calling thread). A large model
   with a 2048² atlas takes a while.

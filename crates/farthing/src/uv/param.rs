@@ -72,10 +72,30 @@ pub struct ParamOptions {
     /// length for packing density.
     #[serde(default = "default_true")]
     pub split_sprawling: bool,
+    /// Per input triangle, the texel density (texels per world unit) it should get at least,
+    /// say the artist's ([`texel_density`]). Each chart is then scaled on its own to give its
+    /// triangles that density (ignoring the densest 2% of its area, mostly slivers), and the
+    /// atlas is sized to fit: the smallest power-of-two width up to `atlas_size` for which
+    /// the charts pack within `atlas_size` rows (the height rounded up to whole blocks). When
+    /// even `atlas_size × atlas_size` is too small, every chart shrinks by the same factor
+    /// ([`ParamResult::density_scale`]). Zero entries ask for nothing. Replaces
+    /// `texels_per_unit`.
+    #[serde(skip)]
+    pub texel_density: Option<Vec<f32>>,
+    /// Mipmap-safe packing: every chart owns whole `block × block` pixel cells (see
+    /// [`snugly::PackOptions::block`]), so mip level log2(`block`) and coarser never mix two
+    /// charts in a texel. Set `padding` to at least `block` to also keep a one-texel gutter at
+    /// that level. 1: pixel placement.
+    #[serde(default = "default_block")]
+    pub block: u32,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_block() -> u32 {
+    1
 }
 
 impl Default for ParamOptions {
@@ -88,6 +108,8 @@ impl Default for ParamOptions {
             texels_per_unit: None,
             fill_holes: true,
             split_sprawling: true,
+            texel_density: None,
+            block: 1,
         }
     }
 }
@@ -110,8 +132,17 @@ pub struct ParamResult {
     pub charts: usize,
     /// Charts flattened with LSCM (the rest are planar).
     pub lscm_charts: usize,
-    /// Texels per world unit used.
+    /// Texels per world unit used (with [`ParamOptions::texel_density`], the area-weighted
+    /// RMS over charts).
     pub texels_per_unit: f32,
+    /// Atlas width in pixels: `atlas_size`, or with [`ParamOptions::texel_density`] the width
+    /// chosen to fit. UVs span `0..1` over `width × height`.
+    pub width: u32,
+    /// Atlas height in pixels.
+    pub height: u32,
+    /// With [`ParamOptions::texel_density`]: the fraction of the requested density the charts
+    /// got (1 when they fit in `atlas_size`). Otherwise 1.
+    pub density_scale: f32,
     /// Fraction of the atlas covered by chart rectangles.
     pub utilization: f32,
     /// Area-weighted mean of max(σ1/σ2) − 1 over triangles (0 = no stretch).
@@ -739,6 +770,88 @@ fn split_sprawling(topo: &Topo, c: Chart, depth: u32) -> Vec<Chart> {
         .collect()
 }
 
+/// Texels per chart unit each chart needs so its triangles get `dens` (texels per world unit):
+/// the area-weighted 98th percentile over the chart's triangles of `dens / σ`, where σ is the
+/// triangle's chart-to-world scale. Charts asking for nothing get the mean of the rest.
+fn chart_densities(charts: &[Chart], topo: &Topo, dens: &[f32]) -> Vec<f32> {
+    let mut out: Vec<f32> = charts
+        .par_iter()
+        .map(|c| {
+            let mut need: Vec<(f32, f32)> = c
+                .faces
+                .iter()
+                .filter_map(|&f| {
+                    let q = [0, 1, 2].map(|k| c.uv[&(f, k)]);
+                    let a2 = 0.5 * (q[1] - q[0]).perp_dot(q[2] - q[0]).abs();
+                    let a3 = topo.areas[f];
+                    let d = dens[f];
+                    (a2 > 0.0 && a3 > 0.0 && d.is_finite() && d > 0.0)
+                        .then(|| (d / (a2 / a3).sqrt(), a3))
+                })
+                .collect();
+            if need.is_empty() {
+                return 0.0;
+            }
+            need.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let total: f32 = need.iter().map(|x| x.1).sum();
+            let mut acc = 0.0;
+            for &(d, a) in &need {
+                acc += a;
+                if acc >= 0.98 * total {
+                    return d;
+                }
+            }
+            need.last().map_or(0.0, |x| x.0)
+        })
+        .collect();
+    let set: Vec<f32> = out.iter().copied().filter(|&d| d > 0.0).collect();
+    let mean = if set.is_empty() {
+        1.0
+    } else {
+        set.iter().sum::<f32>() / set.len() as f32
+    };
+    for d in &mut out {
+        if *d <= 0.0 {
+            *d = mean;
+        }
+    }
+    out
+}
+
+/// [`texel_density`] skips triangles whose shape quality is below this.
+const SLIVER_QUALITY: f32 = 1e-3;
+
+/// Per triangle, the texel density (texels per world unit) of UV set `uv_set` on a texture of
+/// `sizes[material_id]` pixels: sqrt(UV area × width × height / world area). Triangles without
+/// a size, UVs or area get 0, and so do slivers (say the collapsed row at a sphere's pole), whose
+/// tiny world area makes the ratio meaningless. Feed it to [`ParamOptions::texel_density`] to
+/// re-unwrap a mesh without losing the artist's resolution.
+pub fn texel_density(mesh: &Mesh, uv_set: usize, sizes: &[(u32, u32)]) -> Vec<f32> {
+    let Some(uv) = mesh.uvs.get(uv_set) else {
+        return vec![0.0; mesh.triangle_count()];
+    };
+    (0..mesh.triangle_count())
+        .map(|t| {
+            let m = mesh.material_ids.get(t).copied().unwrap_or(0) as usize;
+            let Some(&(w, h)) = sizes.get(m) else {
+                return 0.0;
+            };
+            let [a, b, c] = mesh.triangle(t).map(|v| uv[v as usize]);
+            let a2 = 0.5 * (b - a).perp_dot(c - a).abs();
+            let [p, q, r] = mesh.triangle_positions(t);
+            let a3 = triangle_area(p, q, r);
+            // Shape quality: 1 for an equilateral triangle, 0 for a degenerate one.
+            let edges =
+                (q - p).length_squared() + (r - q).length_squared() + (p - r).length_squared();
+            if a3 > 0.0 && 4.0 * 3f32.sqrt() * a3 >= SLIVER_QUALITY * edges {
+                (a2 * w as f32 * h as f32 / a3).sqrt()
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 /// Generates a fresh UV atlas for `mesh`.
 pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
     mesh.validate()?;
@@ -774,27 +887,31 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
         }
     }
 
-    // Find the largest texel density whose chart footprints pack into the atlas.
     let atlas = opts.atlas_size;
     let pad = opts.padding;
-    let uv_area: f32 = charts
-        .iter()
-        .map(|c| {
-            c.faces
-                .iter()
-                .map(|&f| {
-                    let q = [0, 1, 2].map(|k| c.uv[&(f, k)]);
-                    0.5 * (q[1] - q[0]).perp_dot(q[2] - q[0]).abs()
-                })
-                .sum::<f32>()
-        })
-        .sum();
-    // Packs at `density` into the atlas width with unbounded height; returns the used height.
-    let try_pack = |density: f32| -> Option<(Vec<MaskPlacement>, Vec<(u32, u32)>, u32)> {
+    let block = opts.block.max(1);
+    let areas: Vec<f32> = charts.iter().map(chart_area).collect();
+    // Each chart is drawn at `d × rel[c]` texels per chart unit.
+    let rel: Vec<f32> = match &opts.texel_density {
+        Some(dens) => {
+            if dens.len() != tri_count {
+                return Err(Error::InvalidInput(format!(
+                    "texel_density has {} entries for {tri_count} triangles",
+                    dens.len()
+                )));
+            }
+            chart_densities(&charts, &topo, dens)
+        }
+        None => vec![1.0; charts.len()],
+    };
+    // Packs at `d` into an atlas `width` wide; returns the placements, frames and used height.
+    let try_pack = |d: f32, width: u32| -> Option<(Vec<MaskPlacement>, Vec<(u32, u32)>, u32)> {
         let masks: Vec<ChartMask> = charts
             .par_iter()
-            .map(|c| {
-                let e = (c.max - c.min) * density;
+            .zip(&rel)
+            .map(|(c, &r)| {
+                let s = d * r;
+                let e = (c.max - c.min) * s;
                 let (w, h) = (
                     e.x.ceil() as u32 + 2 * pad + 1,
                     e.y.ceil() as u32 + 2 * pad + 1,
@@ -803,8 +920,7 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
                     .faces
                     .iter()
                     .map(|&f| {
-                        [0, 1, 2]
-                            .map(|k| (c.uv[&(f, k)] - c.min) * density + Vec2::splat(pad as f32))
+                        [0, 1, 2].map(|k| (c.uv[&(f, k)] - c.min) * s + Vec2::splat(pad as f32))
                     })
                     .collect();
                 ChartMask::from_triangles(&tris, w, h, pad)
@@ -817,28 +933,24 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
             } else {
                 HoleFill::Never
             },
-            ..PackOptions::width(atlas)
+            block,
+            ..PackOptions::width(width)
         };
         let best = pack(&masks, &popts).ok().map(|p| (p.placements, p.height));
         best.map(|(p, used)| (p, frames, used))
     };
-    let (density, placements, frames) = if let Some(d) = opts.texels_per_unit {
-        match try_pack(d) {
-            Some((p, f, used)) if used <= atlas => (d, p, f),
-            _ => {
-                return Err(Error::InvalidInput(format!(
-                    "charts do not fit a {atlas}px atlas at {d} texels/unit"
-                )))
-            }
-        }
-    } else {
-        // Height scales with density²: jump towards the density that fills the atlas exactly,
-        // then keep the densest packing that fits.
-        let mut d = (0.7 * (atlas as f32).powi(2) / uv_area.max(1e-12)).sqrt();
+    // Texel area of the charts at d = 1.
+    let need: f32 = areas.iter().zip(&rel).map(|(a, r)| a * r * r).sum();
+    // The largest d ≤ `d_max` whose packing fits `atlas × atlas`. Height scales with d²: jump
+    // towards the d that fills the atlas exactly, then keep the densest packing that fits.
+    let search = |d_max: f32| -> Result<(f32, Vec<MaskPlacement>, Vec<(u32, u32)>)> {
+        let mut d = (0.7 * (atlas as f32).powi(2) / need.max(1e-12))
+            .sqrt()
+            .min(d_max);
         let mut best: Option<(f32, Vec<MaskPlacement>, Vec<(u32, u32)>)> = None;
         let mut fail = f32::INFINITY;
         for _ in 0..10 {
-            let Some((p, f, used)) = try_pack(d) else {
+            let Some((p, f, used)) = try_pack(d, atlas) else {
                 d *= 0.8; // a chart is wider than the atlas at this density
                 fail = fail.min(d / 0.8);
                 continue;
@@ -850,7 +962,7 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
                 fail = fail.min(d);
             }
             let lo = best.as_ref().map_or(0.0, |b| b.0);
-            if fail.is_finite() && fail / lo.max(1e-12) < 1.006 {
+            if (fits && d >= d_max) || (fail.is_finite() && fail / lo.max(1e-12) < 1.006) {
                 break;
             }
             let mut next = d
@@ -859,11 +971,50 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
             if next <= lo || next >= fail {
                 next = 0.5 * (lo + fail.min(lo * 1.1 + 1e-6));
             }
-            d = next;
+            d = next.min(d_max);
         }
-        let (d, p, f) = best.ok_or_else(|| Error::InvalidInput("could not pack charts".into()))?;
-        (d, p, f)
+        best.ok_or_else(|| Error::InvalidInput("could not pack charts".into()))
     };
+    let (density, placements, frames, width, height) = if opts.texel_density.is_some() {
+        // Full density in the smallest atlas: power-of-two widths around the square that
+        // holds the charts, each with the height it needs.
+        let w0 = ((need / 0.75).sqrt().ceil() as u32)
+            .next_power_of_two()
+            .clamp(block.max(16), atlas.max(16));
+        let mut best: Option<(Vec<MaskPlacement>, Vec<(u32, u32)>, u32, u32)> = None;
+        for w in [w0 / 2, w0, w0 * 2] {
+            if w < block.max(16) || w > atlas {
+                continue;
+            }
+            let Some((p, f, used)) = try_pack(1.0, w) else {
+                continue;
+            };
+            let h = used.max(1).next_multiple_of(block.max(4));
+            if h <= atlas && best.as_ref().is_none_or(|b| w * h < b.2 * b.3) {
+                best = Some((p, f, w, h));
+            }
+        }
+        match best {
+            Some((p, f, w, h)) => (1.0, p, f, w, h),
+            None => {
+                let (d, p, f) = search(1.0)?;
+                (d, p, f, atlas, atlas)
+            }
+        }
+    } else if let Some(d) = opts.texels_per_unit {
+        match try_pack(d, atlas) {
+            Some((p, f, used)) if used <= atlas => (d, p, f, atlas, atlas),
+            _ => {
+                return Err(Error::InvalidInput(format!(
+                    "charts do not fit a {atlas}px atlas at {d} texels/unit"
+                )))
+            }
+        }
+    } else {
+        let (d, p, f) = search(f32::INFINITY)?;
+        (d, p, f, atlas, atlas)
+    };
+    let scale = Vec2::new(width as f32, height as f32);
 
     let mut vmap: HashMap<(usize, u32), u32> = HashMap::default();
     let mut source_vertex = Vec::new();
@@ -876,10 +1027,11 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
             for c in 0..3 {
                 let v = tri[c];
                 let id = *vmap.entry((ci, v)).or_insert_with(|| {
-                    let local = (chart.uv[&(f, c)] - chart.min) * density + Vec2::splat(pad as f32);
+                    let local = (chart.uv[&(f, c)] - chart.min) * (density * rel[ci])
+                        + Vec2::splat(pad as f32);
                     let (fw, fh) = frames[ci];
                     let px = rotate_point(local, fw, fh, pl.rotation);
-                    new_uv.push((Vec2::new(pl.x as f32, pl.y as f32) + px) / atlas as f32);
+                    new_uv.push((Vec2::new(pl.x as f32, pl.y as f32) + px) / scale);
                     source_vertex.push(v);
                     source_vertex.len() as u32 - 1
                 });
@@ -892,14 +1044,30 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
     out.tangents = None;
     out.indices = indices;
     out.material_ids = mesh.material_ids.clone();
-    let used = uv_area * density * density;
+    let used: f32 = areas
+        .iter()
+        .zip(&rel)
+        .map(|(a, r)| a * (density * r).powi(2))
+        .sum();
+    let area3d: f32 = topo.areas.iter().sum();
     let mean_stretch = atlas_l2_stretch(&out) - 1.0;
     Ok(ParamResult {
         mesh: out,
         charts: charts.len(),
         lscm_charts: charts.iter().filter(|c| c.lscm).count(),
-        texels_per_unit: density,
-        utilization: used / (atlas as f32 * atlas as f32),
+        texels_per_unit: if opts.texel_density.is_some() {
+            (used / area3d.max(1e-12)).sqrt()
+        } else {
+            density
+        },
+        width,
+        height,
+        density_scale: if opts.texel_density.is_some() {
+            density
+        } else {
+            1.0
+        },
+        utilization: used / (width as f32 * height as f32),
         mean_stretch,
         source_vertex,
     })
@@ -1086,5 +1254,174 @@ mod tests {
             planar.mean_stretch
         );
         assert!(lscm.utilization > 0.5, "utilization {}", lscm.utilization);
+    }
+
+    /// Two cubes, material 0 asking for 100 texels per unit and material 1 for 300.
+    fn two_density_cubes() -> (Mesh, Vec<f32>) {
+        let mut m = cube();
+        let mut c = cube();
+        for p in &mut c.positions {
+            *p += Vec3::new(2.0, 0.0, 0.0);
+        }
+        m.append(&c, 1);
+        let dens = m
+            .material_ids
+            .iter()
+            .map(|&id| if id == 0 { 100.0 } else { 300.0 })
+            .collect();
+        (m, dens)
+    }
+
+    /// Output charts: connected components of the index graph (vertices are split per chart).
+    fn chart_of_triangle(m: &Mesh) -> Vec<usize> {
+        let mut parent: Vec<usize> = (0..m.vertex_count()).collect();
+        fn find(p: &mut [usize], mut x: usize) -> usize {
+            while p[x] != x {
+                p[x] = p[p[x]];
+                x = p[x];
+            }
+            x
+        }
+        for t in 0..m.triangle_count() {
+            let [a, b, c] = m.triangle(t).map(|v| v as usize);
+            for y in [b, c] {
+                let (ra, ry) = (find(&mut parent, a), find(&mut parent, y));
+                parent[ra] = ry;
+            }
+        }
+        (0..m.triangle_count())
+            .map(|t| find(&mut parent, m.triangle(t)[0] as usize))
+            .collect()
+    }
+
+    #[test]
+    fn texel_density_keeps_the_requested_resolution() {
+        let (m, dens) = two_density_cubes();
+        let opts = ParamOptions {
+            atlas_size: 4096,
+            padding: 8,
+            block: 8,
+            texel_density: Some(dens.clone()),
+            ..ParamOptions::planar()
+        };
+        let r = parameterize(&m, &opts).unwrap();
+        assert_valid_atlas(&r);
+        assert_eq!(r.density_scale, 1.0);
+        assert!(r.width.is_power_of_two() && r.width <= 4096, "{}", r.width);
+        assert!(
+            r.height.is_multiple_of(8) && r.height <= 4096,
+            "{}",
+            r.height
+        );
+        // Six 100² faces and six 300² faces: 600 000 texels, so not much more than that.
+        let texels = r.width as f32 * r.height as f32;
+        assert!(texels < 4.0 * 600_000.0, "{}×{}", r.width, r.height);
+        // Measured on the output: every triangle gets what it asked for.
+        let sizes = [(r.width, r.height); 2];
+        let got = texel_density(&r.mesh, 0, &sizes);
+        let src = &r.source_vertex;
+        for t in 0..r.mesh.triangle_count() {
+            let want = dens[t];
+            assert!(
+                (got[t] / want - 1.0).abs() < 0.01,
+                "triangle {t}: {} for {want} (source vertex {})",
+                got[t],
+                src[r.mesh.triangle(t)[0] as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn texel_density_skips_slivers() {
+        // A right triangle and a sliver with the same UVs.
+        let mut m = Mesh::new(
+            vec![
+                Vec3::ZERO,
+                Vec3::X,
+                Vec3::Y,
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(0.5, 1e-5, 1.0),
+            ],
+            vec![0, 1, 2, 3, 4, 5],
+        );
+        m.uvs = vec![vec![
+            Vec2::ZERO,
+            Vec2::X,
+            Vec2::Y,
+            Vec2::ZERO,
+            Vec2::X,
+            Vec2::Y,
+        ]];
+        let d = texel_density(&m, 0, &[(64, 64)]);
+        assert!((d[0] - 64.0).abs() < 1e-3, "{d:?}");
+        assert_eq!(d[1], 0.0);
+    }
+
+    #[test]
+    fn texel_density_shrinks_uniformly_when_the_atlas_is_too_small() {
+        let (m, dens) = two_density_cubes();
+        let opts = ParamOptions {
+            atlas_size: 256,
+            padding: 2,
+            texel_density: Some(dens.clone()),
+            ..ParamOptions::planar()
+        };
+        let r = parameterize(&m, &opts).unwrap();
+        assert_valid_atlas(&r);
+        assert!(
+            r.density_scale < 0.5 && r.density_scale > 0.1,
+            "{}",
+            r.density_scale
+        );
+        assert_eq!((r.width, r.height), (256, 256));
+        let got = texel_density(&r.mesh, 0, &[(256, 256); 2]);
+        for (t, (g, d)) in got.iter().zip(&dens).enumerate() {
+            let ratio = g / (d * r.density_scale);
+            assert!((ratio - 1.0).abs() < 0.01, "triangle {t}: ratio {ratio}");
+        }
+        assert!(parameterize(
+            &m,
+            &ParamOptions {
+                texel_density: Some(vec![1.0; 3]),
+                ..opts
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn block_packing_keeps_charts_in_their_own_cells() {
+        let s = sphere(24, 12);
+        let block = 8;
+        let r = parameterize(
+            &s,
+            &ParamOptions {
+                atlas_size: 512,
+                padding: block,
+                block,
+                ..ParamOptions::default()
+            },
+        )
+        .unwrap();
+        assert_valid_atlas(&r);
+        let chart = chart_of_triangle(&r.mesh);
+        let uv = &r.mesh.uvs[0];
+        let scale = Vec2::new(r.width as f32, r.height as f32);
+        let mut owner: HashMap<(u32, u32), usize> = HashMap::default();
+        for t in 0..r.mesh.triangle_count() {
+            let q = r.mesh.triangle(t).map(|v| uv[v as usize] * scale);
+            // Dense barycentric samples inside the triangle.
+            let n = 24;
+            for i in 0..=n {
+                for j in 0..=n - i {
+                    let (a, b) = (i as f32 / n as f32, j as f32 / n as f32);
+                    let p = q[0] * (1.0 - a - b) + q[1] * a + q[2] * b;
+                    let cell = ((p.x / block as f32) as u32, (p.y / block as f32) as u32);
+                    let o = *owner.entry(cell).or_insert(chart[t]);
+                    assert_eq!(o, chart[t], "cell {cell:?} shared by two charts");
+                }
+            }
+        }
     }
 }

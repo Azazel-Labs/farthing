@@ -234,6 +234,7 @@ tbody tr.selected { background: var(--sel); }
 tbody tr.pending td { color: var(--muted); font-style: italic; }
 .kind { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); }
 .kind.baked { border-color: var(--accent); color: var(--accent); }
+.kind.shared { border-color: var(--accent); color: var(--accent); border-style: dashed; }
 .kind.clusters { border-color: var(--k-clusters); color: var(--k-clusters); }
 .kind.hlod { border-color: var(--k-hlod); color: var(--k-hlod); }
 .kind.splats { border-color: var(--k-splats); color: var(--k-splats); }

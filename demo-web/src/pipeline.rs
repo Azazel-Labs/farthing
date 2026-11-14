@@ -3,7 +3,8 @@
 //! * [`Demo::load`]: glTF / GLB from dropped files or a zip (external buffers and textures
 //!   resolved by relative path).
 //! * [`Demo::run`]: a LOD chain. Near levels are reduced per mesh and keep the original
-//!   materials; far levels (from `bake_from`) are geometry-only proxies of the whole scene with
+//!   materials, or ([`TextureMode::Shared`]) are reduced from one re-unwrapped copy of the
+//!   whole scene whose atlas holds the original materials at the artist's resolution; far levels (from `bake_from`) are geometry-only proxies of the whole scene with
 //!   fresh UVs and base color, normal and roughness/metalness maps baked from the original. Every finished level and
 //!   baked texture is reported through an [`Event`] as soon as it exists.
 //! * The other example modes ([`DemoMode`]: option examples, cluster DAG, HLOD tree, splats)
@@ -20,7 +21,7 @@ use farthing::image::{linear_to_srgb, Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
 use farthing::metrics::surface_distance;
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
-use farthing::uv::{parameterize, ParamOptions};
+use farthing::uv::{parameterize, texel_density, ParamOptions};
 use farthing::{Error, MaterialId, Mesh, Scene};
 use glam::{Mat4, Vec4};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,23 @@ pub enum DemoMode {
     Splats,
 }
 
+/// Largest shared atlas side: a 2048² bake peaks around half a gigabyte, and 4096² would need
+/// four times that, more than a browser gives WebAssembly.
+pub const MAX_SHARED_SIZE: u32 = 2048;
+
+/// Which textures the chain's near levels use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureMode {
+    /// Each mesh reduced on its own, keeping the original UVs and materials.
+    #[default]
+    Original,
+    /// The whole scene re-unwrapped once (charts cut where farthing wants them, mip-safe
+    /// 8 × 8 blocks), the original materials baked into that one atlas at the artist's
+    /// texel density, and every near level reduced from that mesh.
+    Shared,
+}
+
 /// Options the page exposes. Unknown or missing fields take the defaults.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -72,8 +90,12 @@ pub struct LodOptions {
     pub atlas: u32,
     /// Bake samples per texel along each axis (1–4).
     pub supersample: u32,
-    /// Planar charts instead of LSCM for baked levels.
+    /// Planar charts instead of LSCM for baked levels and the shared atlas.
     pub planar_uv: bool,
+    pub textures: TextureMode,
+    /// Shared atlas: largest side (at most [`MAX_SHARED_SIZE`]). The atlas keeps the artist's
+    /// texel density when that fits, and shrinks every chart by the same factor when it does not.
+    pub shared_size: u32,
 
     pub mode: DemoMode,
     /// Option examples: triangle fraction every configuration reduces to.
@@ -111,6 +133,8 @@ impl Default for LodOptions {
             atlas: 512,
             supersample: 2,
             planar_uv: false,
+            textures: TextureMode::Original,
+            shared_size: 2048,
             mode: DemoMode::Chain,
             preset_ratio: 0.25,
             cluster_layout: "nanite".into(),
@@ -168,6 +192,8 @@ pub struct SceneInfo {
 pub enum LevelKind {
     Original,
     Reduced,
+    /// Reduced from the re-unwrapped scene; textures in the shared atlas.
+    Shared,
     Baked,
     Splats,
 }
@@ -197,6 +223,16 @@ pub struct LevelInfo {
     pub note: Option<String>,
     /// Size of the level's download (GLB, or PLY for splats).
     pub bytes: Option<usize>,
+    /// GPU memory of the textures the level is drawn with: RGBA8 with full mip chains, each
+    /// texture counted once.
+    pub texture_bytes: Option<usize>,
+    /// Shared and baked levels: atlas size.
+    pub atlas_width: Option<u32>,
+    pub atlas_height: Option<u32>,
+    /// Shared levels: the fraction of the artist's texel density the atlas keeps.
+    pub density_scale: Option<f32>,
+    /// Shared levels: the level whose GLB carries the atlas (the others reuse its material).
+    pub shared_textures: Option<usize>,
 }
 
 impl LevelInfo {
@@ -217,6 +253,11 @@ impl LevelInfo {
             label: None,
             note: None,
             bytes: None,
+            texture_bytes: None,
+            atlas_width: None,
+            atlas_height: None,
+            density_scale: None,
+            shared_textures: None,
         }
     }
 }
@@ -426,7 +467,9 @@ impl Demo {
             }
         };
 
-        let info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0);
+        let original_bytes = texture_bytes(&original_textures(&self.materials));
+        let mut info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0);
+        info.texture_bytes = Some(original_bytes);
         emit(Event::Level {
             info: &info,
             glb: &[],
@@ -437,7 +480,12 @@ impl Demo {
         let mut prev: Vec<(Mesh, f32)> =
             self.scene.meshes.iter().map(|m| (m.clone(), 0.0)).collect();
         let mesh_scale = crate::modes::mesh_scales(&self.scene);
-        for level in 1..bake_from {
+        let shared = opts.textures == TextureMode::Shared;
+        if shared && bake_from > 1 {
+            self.shared_levels(opts, bake_from, now, emit)?;
+        }
+        let first_reduced = if shared { bake_from } else { 1 };
+        for level in first_reduced..bake_from {
             emit(Event::Stage(&format!("LOD{level}: reducing")));
             let t0 = now();
             let ratio = step.powi(level as i32);
@@ -469,6 +517,7 @@ impl Demo {
             let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
             let mut info = level_info(level, LevelKind::Reduced, &s, bound, now() - t0);
             info.bytes = Some(glb.len());
+            info.texture_bytes = Some(original_bytes);
             emit(Event::Level {
                 info: &info,
                 glb: &glb,
@@ -546,32 +595,7 @@ impl Demo {
                 },
             )
             .map_err(err)?;
-            let mut tex = ExportTextures::default();
-            for (name, ch) in &bake.textures {
-                let rgba = to_rgba8(&ch.image, ch.encoding);
-                emit(Event::Texture {
-                    level,
-                    channel: name,
-                    width: ch.image.width,
-                    height: ch.image.height,
-                    rgba: &rgba,
-                });
-                match name.as_str() {
-                    channels::BASE_COLOR => {
-                        tex.base_color
-                            .insert(0, Texture::from_image(&ch.image, true));
-                    }
-                    channels::NORMAL => {
-                        tex.normal
-                            .insert(0, Texture::from_signed_normals(&ch.image));
-                    }
-                    channels::ORM => {
-                        tex.metallic_roughness
-                            .insert(0, Texture::from_image(&ch.image, false));
-                    }
-                    _ => {}
-                }
-            }
+            let tex = bake_textures(&bake.textures, level, emit);
             let mut s = Scene::from_mesh(mesh);
             s.materials[0].name = "baked".into();
             let glb = glb_bytes(&s, &tex).map_err(err)?;
@@ -580,6 +604,9 @@ impl Demo {
             info.charts = Some(p.charts);
             info.utilization = Some(p.utilization);
             info.bytes = Some(glb.len());
+            info.texture_bytes = Some(texture_bytes(&tex));
+            info.atlas_width = Some(opts.atlas);
+            info.atlas_height = Some(opts.atlas);
             emit(Event::Level {
                 info: &info,
                 glb: &glb,
@@ -589,6 +616,248 @@ impl Demo {
         emit(Event::Stage("done"));
         Ok(())
     }
+
+    /// Shared-atlas near levels (1 until `bake_from`): the whole scene as one mesh, re-unwrapped
+    /// at the artist's texel density (up to `opts.shared_size` per side) and baked by exact
+    /// transfer, then reduced level by level. Level 1's GLB carries the atlas.
+    fn shared_levels(
+        &mut self,
+        opts: &LodOptions,
+        bake_from: usize,
+        now: &dyn Fn() -> f64,
+        emit: &mut dyn FnMut(Event),
+    ) -> Result<(), String> {
+        let err = |e: Error| e.to_string();
+        let mut t0 = now();
+        emit(Event::Stage("Shared atlas: merging the scene"));
+        let (flat, refs) = self.scene.flatten();
+        // The artist's density per triangle, from the largest texture of its material.
+        let largest: Vec<Option<(u32, u32, u32)>> = (0..self.scene.materials.len())
+            .map(|slot| {
+                let m = self
+                    .materials
+                    .get(self.scene.material_id(slot as u32).0 as usize)?;
+                [
+                    m.base_color_texture.as_ref().map(|(t, s)| (t, *s)),
+                    m.metallic_roughness_texture.as_ref().map(|(t, s)| (t, *s)),
+                    m.normal_texture.as_ref().map(|(t, s, _)| (t, *s)),
+                ]
+                .into_iter()
+                .flatten()
+                .max_by_key(|(t, _)| u64::from(t.width) * u64::from(t.height))
+                .map(|(t, s)| (t.width, t.height, s))
+            })
+            .collect();
+        let sizes = |set: u32| -> Vec<(u32, u32)> {
+            largest
+                .iter()
+                .map(|x| match x {
+                    Some((w, h, s)) if *s == set => (*w, *h),
+                    _ => (0, 0),
+                })
+                .collect()
+        };
+        let dens: Vec<f32> = texel_density(&flat, 0, &sizes(0))
+            .into_iter()
+            .zip(texel_density(&flat, 1, &sizes(1)))
+            .map(|(a, b)| a.max(b))
+            .collect();
+        let textured = dens.iter().any(|&d| d > 0.0);
+        let source = flat.clone();
+        let mut mesh = flat;
+        mesh.uvs.clear();
+        mesh.tangents = None;
+        mesh.colors = None;
+        mesh.skin = None;
+        mesh.morph_targets.clear();
+        mesh.material_ids.iter_mut().for_each(|s| *s = 0);
+        if mesh.normals.is_none() {
+            mesh.compute_normals(60.0);
+        }
+        // Copies of a vertex on the original's UV seams become one (triangles keep their order).
+        repair::weld(&mut mesh, 0.0);
+
+        emit(Event::Stage("Shared atlas: unwrapping UVs"));
+        let size = opts.shared_size.clamp(64, MAX_SHARED_SIZE);
+        let size = if textured { size } else { size.min(512) };
+        // Charts sit in their own block × block cells, `block` texels apart, so mips stay inside
+        // a chart down to the level where a block is one texel: mip 3 of a 2048 atlas, mip 2 of
+        // a 1024 one. Scenes with many charts get smaller blocks when those do not fit.
+        let mut block = (size / 256).clamp(2, 8);
+        let p = loop {
+            let r = parameterize(
+                &mesh,
+                &ParamOptions {
+                    atlas_size: size,
+                    padding: block,
+                    block,
+                    texel_density: textured.then(|| dens.clone()),
+                    ..if opts.planar_uv {
+                        ParamOptions::planar()
+                    } else {
+                        ParamOptions::default()
+                    }
+                },
+            );
+            match r {
+                Ok(p) => break p,
+                Err(_) if block > 1 => block /= 2,
+                Err(e) => return Err(err(e)),
+            }
+        };
+        let (w, h) = (p.width, p.height);
+        emit(Event::Stage(&format!("Shared atlas: baking {w}×{h}")));
+        let mut mesh = p.mesh;
+        compute_tangents(&mut mesh, 0).map_err(err)?;
+        // The correspondence (about 45 bytes a texel) goes as soon as the bake returns.
+        let (textures, coverage) = bake_with_host(
+            &mut MaterialHost::new(&self.materials, false),
+            &mesh,
+            Mat4::IDENTITY,
+            &self.scene,
+            &BakeOptions {
+                width: w,
+                height: h,
+                supersample: 1,
+                gutter: block,
+                channels: vec![
+                    channels::BASE_COLOR.into(),
+                    channels::NORMAL.into(),
+                    channels::ORM.into(),
+                ],
+                source_triangles: Some(refs),
+                ..Default::default()
+            },
+        )
+        .map(|b| (b.textures, b.coverage))
+        .map_err(err)?;
+        let mut tex = bake_textures(&textures, 1, emit);
+        drop(textures);
+        let cutoff = self
+            .materials
+            .iter()
+            .filter_map(|m| match m.info.class {
+                MaterialClass::Masked { cutoff } => Some(cutoff),
+                _ => None,
+            })
+            .reduce(f32::min);
+        if let Some(c) = cutoff {
+            tex.alpha_cutoff.insert(0, c);
+        }
+        let tex_bytes = texture_bytes(&tex);
+
+        let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
+        let input_tris = self.scene.triangle_count();
+        let base = opts.simplify_options();
+        let step = opts.step.clamp(0.05, 0.95);
+        let mut error_bound = 0.0;
+        for level in 1..bake_from {
+            emit(Event::Stage(&format!("LOD{level}: reducing")));
+            let target = ((input_tris as f32 * step.powi(level as i32)) as usize).max(4);
+            let r = simplify(
+                &mesh,
+                &SimplifyOptions {
+                    target_triangles: Some(target),
+                    ..base.clone()
+                },
+            )
+            .map_err(err)?;
+            mesh = r.mesh;
+            error_bound += r.error;
+            let mut m = mesh.clone();
+            compute_tangents(&mut m, 0).map_err(err)?;
+            let mut s = Scene::from_mesh(m);
+            s.materials[0].name = "shared".into();
+            let glb = if level == 1 {
+                glb_bytes(&s, &tex)
+            } else {
+                glb_bytes(&s, &ExportTextures::default())
+            }
+            .map_err(err)?;
+            let ms = now() - t0;
+            let error = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
+            let info = LevelInfo {
+                triangles: s.triangle_count(),
+                vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
+                error,
+                relative_error: error / diag,
+                error_bound,
+                switch_distance_1px: error * reference_ppr(),
+                ms,
+                coverage: Some(coverage),
+                charts: Some(p.charts),
+                utilization: Some(p.utilization),
+                bytes: Some(glb.len()),
+                texture_bytes: Some(tex_bytes),
+                atlas_width: Some(w),
+                atlas_height: Some(h),
+                density_scale: Some(p.density_scale),
+                shared_textures: Some(1),
+                ..LevelInfo::new(level, LevelKind::Shared)
+            };
+            emit(Event::Level {
+                info: &info,
+                glb: &glb,
+            });
+            self.levels.push((s, tex.clone()));
+            t0 = now();
+        }
+        Ok(())
+    }
+}
+
+/// Emits a bake's textures for `level` and returns them for export (slot 0).
+fn bake_textures(
+    textures: &ChannelImages,
+    level: usize,
+    emit: &mut dyn FnMut(Event),
+) -> ExportTextures {
+    let mut tex = ExportTextures::default();
+    for (name, ch) in textures {
+        let rgba = to_rgba8(&ch.image, ch.encoding);
+        emit(Event::Texture {
+            level,
+            channel: name,
+            width: ch.image.width,
+            height: ch.image.height,
+            rgba: &rgba,
+        });
+        match name.as_str() {
+            channels::BASE_COLOR => {
+                tex.base_color
+                    .insert(0, Texture::from_image(&ch.image, true));
+            }
+            channels::NORMAL => {
+                tex.normal
+                    .insert(0, Texture::from_signed_normals(&ch.image));
+            }
+            channels::ORM => {
+                tex.metallic_roughness
+                    .insert(0, Texture::from_image(&ch.image, false));
+            }
+            _ => {}
+        }
+    }
+    tex
+}
+
+/// GPU memory of export textures: RGBA8 with a full mip chain (4/3), each texture counted
+/// once however many slots share it.
+pub(crate) fn texture_bytes(t: &ExportTextures) -> usize {
+    let mut seen: Vec<&Texture> = Vec::new();
+    for tex in t
+        .base_color
+        .values()
+        .chain(t.normal.values())
+        .chain(t.metallic_roughness.values())
+    {
+        if !seen.iter().any(|s| s.same_texels(tex)) {
+            seen.push(tex);
+        }
+    }
+    seen.iter()
+        .map(|t| t.width as usize * t.height as usize * 16 / 3)
+        .sum()
 }
 
 fn expand_zips(files: Vec<(String, Vec<u8>)>) -> Result<Vec<(String, Vec<u8>)>, String> {
