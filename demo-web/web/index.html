@@ -19,7 +19,7 @@
   <aside id="side">
     <header>
       <h1>farthing</h1>
-      <p>LOD chain and proxy bake, running in WebAssembly in your browser. Nothing is uploaded.</p>
+      <p>LOD chains, cluster DAGs, HLOD cells and splats, running in WebAssembly in your browser. Nothing is uploaded.</p>
     </header>
 
     <section id="drop" tabindex="0">
@@ -46,6 +46,81 @@
 
     <form id="opts" autocomplete="off">
       <fieldset>
+        <legend>Example</legend>
+        <label class="select">Mode
+          <select name="mode">
+            <option value="chain" selected>Classic LOD chain</option>
+            <option value="presets">Option examples</option>
+            <option value="clusters">Cluster DAG</option>
+            <option value="hlod">HLOD cells</option>
+            <option value="splats">Gaussian splats</option>
+          </select>
+        </label>
+        <p class="hint" id="mode-hint"></p>
+      </fieldset>
+
+      <fieldset data-modes="presets">
+        <legend>Option examples</legend>
+        <label class="range" title="Every configuration reduces each mesh to this fraction of its triangles (except Pixel-error bound, which has no target)">
+          Keep <output name="preset_ratio_out"></output>
+          <input type="range" name="preset_ratio" min="0.05" max="0.75" step="0.05" value="0.25">
+        </label>
+        <p class="hint">farthing has no per-engine presets. Each row is the same reduction with one
+          <code>SimplifyOptions</code> choice changed, the kind an engine integration makes. Hover a
+          row's name for the exact option.</p>
+      </fieldset>
+
+      <fieldset data-modes="clusters">
+        <legend>Cluster DAG</legend>
+        <label class="select" title="Cluster size limits">Layout
+          <select name="cluster_layout">
+            <option value="nanite" selected>Nanite: 128 tris, 255 verts</option>
+            <option value="meshlet">Meshlet: 124 tris, 64 verts</option>
+          </select>
+        </label>
+        <label class="check" title="ClusterOptions::fast(): quicker build, coarser simplification"><input type="checkbox" name="cluster_fast"> Fast build</label>
+      </fieldset>
+
+      <fieldset data-modes="hlod">
+        <legend>HLOD</legend>
+        <label class="select" title="The model is tiled on a grid so the tree has cells to merge">Copies
+          <select name="hlod_copies">
+            <option value="1">1 (the model)</option>
+            <option value="3" selected>3 × 3</option>
+            <option value="5">5 × 5</option>
+          </select>
+        </label>
+        <label class="select" title="Leaf cells across one copy">Cells per copy
+          <select name="hlod_split">
+            <option value="1" selected>1</option>
+            <option value="2">2 × 2</option>
+          </select>
+        </label>
+        <label class="select" title="Triangle budget of a leaf cell's proxy">Leaf proxy
+          <select name="hlod_triangles">
+            <option value="500">500 tris</option>
+            <option value="1000">1,000 tris</option>
+            <option value="2000" selected>2,000 tris</option>
+            <option value="5000">5,000 tris</option>
+          </select>
+        </label>
+        <label class="check" title="Unwrap every proxy and bake its materials into a 256 × 256 atlas"><input type="checkbox" name="hlod_bake" checked> Bake proxy textures</label>
+      </fieldset>
+
+      <fieldset data-modes="splats">
+        <legend>Splats</legend>
+        <label class="select" title="Surfels in the full cloud; the other levels are its first quarter and sixteenth">Surfels
+          <select name="splat_count">
+            <option value="5000">5,000</option>
+            <option value="10000">10,000</option>
+            <option value="20000" selected>20,000</option>
+            <option value="50000">50,000</option>
+          </select>
+        </label>
+        <label class="check" title="Shape each Gaussian from the surface patch it covers, instead of a round disc"><input type="checkbox" name="splat_footprints" checked> Footprint shapes</label>
+      </fieldset>
+
+      <fieldset data-modes="chain">
         <legend>Chain</legend>
         <label class="range">Levels <output name="levels_out"></output>
           <input type="range" name="levels" min="1" max="8" value="4">
@@ -59,7 +134,7 @@
         </label>
       </fieldset>
 
-      <fieldset>
+      <fieldset data-modes="chain">
         <legend>Reduction</legend>
         <label class="check" title="Faster, lower-quality reduction"><input type="checkbox" name="fast"> Fast quality</label>
         <label class="check" title="Never collapse across UV and normal seams"><input type="checkbox" name="strict_seams"> Strict seams</label>
@@ -67,7 +142,7 @@
         <label class="check" title="Do not move vertices on open borders"><input type="checkbox" name="lock_border"> Lock borders</label>
       </fieldset>
 
-      <fieldset>
+      <fieldset data-modes="chain">
         <legend>Bake</legend>
         <label class="select">Atlas
           <select name="atlas">
@@ -129,11 +204,36 @@
               <th>Level</th><th>Kind</th><th class="n">Triangles</th><th class="n">%</th>
               <th class="n" title="Measured deviation from LOD0 (sampled Hausdorff distance), relative to the scene's bounding-box diagonal">Error</th>
               <th class="n" title="Camera distance where the error is under 1 pixel at 1080p, 60° FOV">Switch at</th>
-              <th class="n">Time</th><th></th>
+              <th class="n">Time</th><th class="n" title="Download size (GLB, PLY, or the packed GPU cluster format)">Size</th><th></th>
             </tr>
           </thead>
           <tbody id="level-rows"></tbody>
         </table>
+      </div>
+      <div id="cut" hidden>
+        <h3 id="cut-title">View-dependent cut</h3>
+        <div class="controls">
+          <label class="range" data-cut="clusters hlod" title="Largest error allowed on screen, in pixels. The cut follows the camera.">
+            Max error <output id="threshold-out"></output>
+            <input type="range" id="threshold" min="-2" max="4" step="0.25" value="0">
+          </label>
+          <label class="select" data-cut="clusters">Color
+            <select id="shading">
+              <option value="materials">Materials</option>
+              <option value="clusters">Per cluster</option>
+              <option value="levels">Per DAG level</option>
+            </select>
+          </label>
+          <label class="check" data-cut="hlod"><input type="checkbox" id="tint"> Tint proxies by tree level</label>
+          <label class="check" data-cut="clusters hlod" title="Keep the current cut while you move the camera, to look at it from elsewhere"><input type="checkbox" id="freeze"> Freeze cut</label>
+          <label class="select" data-cut="splats">Draw
+            <select id="splat-draw">
+              <option value="gauss">Gaussians (sorted)</option>
+              <option value="disc">Opaque discs</option>
+            </select>
+          </label>
+        </div>
+        <dl id="cut-stats"></dl>
       </div>
       <div id="bake">
         <h3 id="bake-title">Baked textures</h3>

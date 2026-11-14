@@ -24,6 +24,38 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 - Changing an option restarts the run. A wasm call can't be interrupted, so the page replaces
   the worker.
 
+## Examples
+
+The *Example* picker runs the other ways farthing builds LODs on the same model. The table
+gains a *Size* column (GLB, PLY or packed GPU bytes).
+
+- **Classic LOD chain.** Everything described above.
+- **Option examples.** Ten rows, each one the same reduction with one `SimplifyOptions`
+  choice changed: library defaults, strict seams, fast quality, preserve symmetry, lock
+  borders, classic QEM ranking, no silhouette weight, keep all parts, geometry only
+  (`repair::geometry_only` first), and a pixel-error bound (`screen_size_to_max_error`).
+  farthing has no per-engine presets. These are the option differences an engine integration
+  would choose between. Hover a row's name to see the exact option.
+- **Cluster DAG.** `build_cluster_dag` per mesh (Nanite or meshlet cluster limits, optionally
+  `ClusterOptions::fast()`), packed with `GpuClusterDag`. The *Cut* row is the view-dependent
+  selection at the current camera: every cluster is drawn or replaced by its coarser parent
+  depending on its own error on screen, so moving the camera changes it. The worker runs both
+  the CPU `LodView` cut and the GPU-format `select` and reports whether they agree. You can
+  color the cut by material, by cluster or by DAG level, set the pixel threshold, and freeze
+  the cut so you can inspect it from another angle.
+- **HLOD cells.** The model is tiled on a grid (1, 3×3 or 5×5 copies) so there are cells to
+  merge. `build_hlod_tree_with` gives each cell, and each group of cells above it, a merged
+  proxy, which is reduced and can have its textures baked. *Full* draws every copy. *Cut* is
+  `HlodTree::select` at the current camera: far cells are drawn as their proxy and near cells
+  as the source instances. You can tint proxies by tree level. The bake panel shows the root
+  proxy's atlas. The panel also says how far away the nearest leaf proxy takes over. Node
+  errors add up the tree (a parent's error includes its children's), so on a dense model with
+  thin parts this can be far away. Zoom out further or raise *Max error*.
+- **Gaussian splats.** `progressive_surfel_cloud` → `surfels_to_splats`. The full cloud plus
+  its first quarter and first sixteenth (a progressive cloud's prefixes are its LODs), each
+  shaped from its surface footprint. They are drawn as screen-space Gaussians, blended
+  back to front, or as opaque discs. Each level downloads as a 3DGS-layout `.ply`.
+
 ## Build and run
 
 ```sh

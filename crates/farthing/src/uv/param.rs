@@ -807,6 +807,15 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
                             .map(|k| (c.uv[&(f, k)] - c.min) * density + Vec2::splat(pad as f32))
                     })
                     .collect();
+                // A chart of zero-area triangles rasterizes to nothing, which snugly 0.1 can't
+                // place (it panics); reserve its frame as a rectangle instead.
+                let area: f32 = tris
+                    .iter()
+                    .map(|t| (t[1] - t[0]).perp_dot(t[2] - t[0]).abs())
+                    .sum();
+                if area < 1e-3 {
+                    return ChartMask::rect(w, h);
+                }
                 ChartMask::from_triangles(&tris, w, h, pad)
             })
             .collect();
@@ -1011,6 +1020,31 @@ mod tests {
         let (a, b) = (run(1), run(4));
         assert_eq!(a.mesh.uvs, b.mesh.uvs);
         assert_eq!(a.mesh.indices, b.mesh.indices);
+    }
+
+    #[test]
+    fn zero_area_chart_does_not_stop_packing() {
+        // A collinear triangle off to the side becomes a chart that covers no pixels.
+        let mut m = cube();
+        let b = m.positions.len() as u32;
+        m.positions.extend([
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(3.2, 0.0, 0.0),
+            Vec3::new(3.4, 0.0, 0.0),
+        ]);
+        m.indices.extend([b, b + 1, b + 2]);
+        m.material_ids.push(0);
+        for opts in [ParamOptions::default(), ParamOptions::planar()] {
+            let r = parameterize(
+                &m,
+                &ParamOptions {
+                    atlas_size: 256,
+                    ..opts
+                },
+            )
+            .unwrap();
+            assert_eq!(r.mesh.triangle_count(), m.triangle_count());
+        }
     }
 
     #[test]

@@ -6,7 +6,10 @@
 //!   materials; far levels (from `bake_from`) are geometry-only proxies of the whole scene with
 //!   fresh UVs and base color, normal and roughness/metalness maps baked from the original. Every finished level and
 //!   baked texture is reported through an [`Event`] as soon as it exists.
+//! * The other example modes ([`DemoMode`]: option examples, cluster DAG, HLOD tree, splats)
+//!   live in [`crate::modes`]; [`Demo::run`] dispatches on [`LodOptions::mode`].
 
+use crate::modes::Extra;
 use farthing::bake::{bake_with_host, compute_tangents, BakeOptions};
 use farthing::host::{
     channels, BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, MaterialClass,
@@ -24,7 +27,31 @@ use std::collections::HashMap;
 use std::io::{Cursor, Read};
 
 /// Surface samples per mesh when measuring a level against LOD0.
-const MEASURE_SAMPLES: usize = 20_000;
+pub(crate) const MEASURE_SAMPLES: usize = 20_000;
+
+/// Pixels per radian of the reference view the switch distances are given for: 1080 pixels
+/// high, 60 degree vertical field of view.
+pub(crate) fn reference_ppr() -> f32 {
+    1080.0 / (2.0 * 30f32.to_radians().tan())
+}
+
+/// Which example the page runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DemoMode {
+    /// Classic LOD chain: reduced levels, then baked proxies.
+    #[default]
+    Chain,
+    /// One reduction target under several named [`SimplifyOptions`] configurations.
+    Presets,
+    /// A cluster DAG per mesh with a view-dependent cut ([`farthing::cluster`]).
+    Clusters,
+    /// An HLOD tree over the scene, optionally tiled into a grid of copies
+    /// ([`farthing::hlod::build_hlod_tree`]).
+    Hlod,
+    /// Progressive surfel cloud turned into Gaussian splats ([`farthing::impostor`]).
+    Splats,
+}
 
 /// Options the page exposes. Unknown or missing fields take the defaults.
 #[derive(Clone, Debug, Deserialize)]
@@ -46,6 +73,26 @@ pub struct LodOptions {
     pub supersample: u32,
     /// Planar charts instead of LSCM for baked levels.
     pub planar_uv: bool,
+
+    pub mode: DemoMode,
+    /// Option examples: triangle fraction every configuration reduces to.
+    pub preset_ratio: f32,
+    /// Cluster DAG: `"nanite"` (128 triangles, 255 vertices) or `"meshlet"` (124, 64).
+    pub cluster_layout: String,
+    /// Cluster DAG: [`ClusterOptions::fast`](farthing::cluster::ClusterOptions::fast).
+    pub cluster_fast: bool,
+    /// HLOD: copies of the scene along x and z (1 = the scene itself).
+    pub hlod_copies: u32,
+    /// HLOD: leaf cells across one copy (1 or 2).
+    pub hlod_split: u32,
+    /// HLOD: triangle budget of a leaf proxy.
+    pub hlod_triangles: usize,
+    /// HLOD: unwrap and bake every proxy (256 x 256 atlas) instead of geometry only.
+    pub hlod_bake: bool,
+    /// Splats: surfels in the full cloud.
+    pub splat_count: usize,
+    /// Splats: shape each Gaussian from its surface patch (footprints) instead of a round disc.
+    pub splat_footprints: bool,
 }
 
 impl Default for LodOptions {
@@ -61,6 +108,16 @@ impl Default for LodOptions {
             atlas: 512,
             supersample: 2,
             planar_uv: false,
+            mode: DemoMode::Chain,
+            preset_ratio: 0.25,
+            cluster_layout: "nanite".into(),
+            cluster_fast: false,
+            hlod_copies: 3,
+            hlod_split: 1,
+            hlod_triangles: 2000,
+            hlod_bake: true,
+            splat_count: 20_000,
+            splat_footprints: true,
         }
     }
 }
@@ -108,6 +165,7 @@ pub enum LevelKind {
     Original,
     Reduced,
     Baked,
+    Splats,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,6 +188,41 @@ pub struct LevelInfo {
     pub coverage: Option<f32>,
     pub charts: Option<usize>,
     pub utilization: Option<f32>,
+    /// Option examples: the configuration's name and what it changes.
+    pub label: Option<String>,
+    pub note: Option<String>,
+    /// Size of the level's download (GLB, or PLY for splats).
+    pub bytes: Option<usize>,
+}
+
+impl LevelInfo {
+    pub(crate) fn new(level: usize, kind: LevelKind) -> LevelInfo {
+        LevelInfo {
+            level,
+            kind,
+            triangles: 0,
+            vertices: 0,
+            error: 0.0,
+            relative_error: 0.0,
+            error_bound: 0.0,
+            switch_distance_1px: 0.0,
+            ms: 0.0,
+            coverage: None,
+            charts: None,
+            utilization: None,
+            label: None,
+            note: None,
+            bytes: None,
+        }
+    }
+}
+
+/// A typed array for the page.
+#[derive(Clone, Debug)]
+pub enum Buffer {
+    F32(Vec<f32>),
+    U32(Vec<u32>),
+    U8(Vec<u8>),
 }
 
 pub enum Event<'a> {
@@ -147,6 +240,12 @@ pub enum Event<'a> {
         height: u32,
         rgba: &'a [u8],
     },
+    /// Mode-specific results (see [`crate::modes`]): a JSON description and typed arrays.
+    Data {
+        kind: &'a str,
+        json: String,
+        buffers: Vec<Buffer>,
+    },
 }
 
 pub struct Demo {
@@ -156,7 +255,9 @@ pub struct Demo {
     /// materials holds references, not copies.
     pub materials: Vec<GltfMaterial>,
     /// Results of the last run, by level (0 = original), with the textures to export.
-    levels: Vec<(Scene, ExportTextures)>,
+    pub(crate) levels: Vec<(Scene, ExportTextures)>,
+    /// What the last cluster, HLOD or splat run keeps for selection and downloads.
+    pub(crate) extra: Extra,
 }
 
 impl Demo {
@@ -226,6 +327,7 @@ impl Demo {
             levels: vec![(scene.clone(), original_textures(&materials))],
             scene,
             materials,
+            extra: Extra::None,
         })
     }
 
@@ -264,8 +366,27 @@ impl Demo {
         glb_bytes(s, t).map_err(|e| e.to_string())
     }
 
-    /// Builds the chain, reporting each level as it finishes. `now` returns milliseconds.
+    /// Runs `opts.mode`, reporting each result as it finishes. `now` returns milliseconds.
+    /// Starting a run drops the previous run's results, whatever its mode.
     pub fn run(
+        &mut self,
+        opts: &LodOptions,
+        now: &dyn Fn() -> f64,
+        emit: &mut dyn FnMut(Event),
+    ) -> Result<(), String> {
+        self.levels.truncate(1);
+        self.extra = Extra::None;
+        match opts.mode {
+            DemoMode::Chain => self.run_chain(opts, now, emit),
+            DemoMode::Presets => crate::modes::run_presets(self, opts, now, emit),
+            DemoMode::Clusters => crate::modes::run_clusters(self, opts, now, emit),
+            DemoMode::Hlod => crate::modes::run_hlod(self, opts, now, emit),
+            DemoMode::Splats => crate::modes::run_splats(self, opts, now, emit),
+        }
+    }
+
+    /// The classic LOD chain.
+    fn run_chain(
         &mut self,
         opts: &LodOptions,
         now: &dyn Fn() -> f64,
@@ -281,7 +402,7 @@ impl Demo {
         let base = opts.simplify_options();
         let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
         let input_tris = self.scene.triangle_count();
-        let switch = |e: f32| e * 1080.0 / (2.0 * 30f32.to_radians().tan());
+        let switch = |e: f32| e * reference_ppr();
         let source = self.scene.flatten().0;
         let level_info = |level, kind, s: &Scene, bound: f32, ms| {
             let error = if level == 0 {
@@ -290,8 +411,6 @@ impl Demo {
                 surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff
             };
             LevelInfo {
-                level,
-                kind,
                 triangles: s.triangle_count(),
                 vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
                 error,
@@ -299,13 +418,10 @@ impl Demo {
                 error_bound: bound,
                 switch_distance_1px: switch(error),
                 ms,
-                coverage: None,
-                charts: None,
-                utilization: None,
+                ..LevelInfo::new(level, kind)
             }
         };
 
-        self.levels.truncate(1);
         let info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0);
         emit(Event::Level {
             info: &info,
@@ -316,16 +432,7 @@ impl Demo {
         // keeping UVs and material slots.
         let mut prev: Vec<(Mesh, f32)> =
             self.scene.meshes.iter().map(|m| (m.clone(), 0.0)).collect();
-        let mut mesh_scale = vec![0.0f32; self.scene.meshes.len()];
-        for inst in &self.scene.instances {
-            let m = glam::Mat3::from_mat4(inst.transform);
-            let s = m
-                .x_axis
-                .length()
-                .max(m.y_axis.length())
-                .max(m.z_axis.length());
-            mesh_scale[inst.mesh] = mesh_scale[inst.mesh].max(s);
-        }
+        let mesh_scale = crate::modes::mesh_scales(&self.scene);
         for level in 1..bake_from {
             emit(Event::Stage(&format!("LOD{level}: reducing")));
             let t0 = now();
@@ -356,7 +463,8 @@ impl Demo {
                 .map(|(mi, p)| p.1 * mesh_scale[mi])
                 .fold(0.0, f32::max);
             let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
-            let info = level_info(level, LevelKind::Reduced, &s, bound, now() - t0);
+            let mut info = level_info(level, LevelKind::Reduced, &s, bound, now() - t0);
+            info.bytes = Some(glb.len());
             emit(Event::Level {
                 info: &info,
                 glb: &glb,
@@ -378,9 +486,7 @@ impl Demo {
             m
         };
         let mut geo_error = 0.0;
-        let mut host = MaterialHost {
-            materials: &self.materials,
-        };
+        let mut host = MaterialHost::new(&self.materials);
         for level in bake_from..=levels {
             let t0 = now();
             emit(Event::Stage(&format!("LOD{level}: reducing")));
@@ -469,6 +575,7 @@ impl Demo {
             info.coverage = Some(bake.coverage);
             info.charts = Some(p.charts);
             info.utilization = Some(p.utilization);
+            info.bytes = Some(glb.len());
             emit(Event::Level {
                 info: &info,
                 glb: &glb,
@@ -524,7 +631,7 @@ fn normalize(path: &str) -> String {
 }
 
 /// The materials' textures and factors for export (the textures are shared, not copied).
-fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
+pub(crate) fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
     let mut t = ExportTextures::default();
     for (i, m) in materials.iter().enumerate() {
         let i = i as u32;
@@ -547,7 +654,7 @@ fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
     t
 }
 
-fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
+pub(crate) fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
     let q = |c: f32| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     let mut out = Vec::with_capacity(img.pixels.len() * 4);
     for p in &img.pixels {
@@ -570,21 +677,47 @@ fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
 /// What a browser demo can know about glTF materials: base color texture × factor × vertex
 /// color, metallic-roughness texture × factors, and the source's normal with its normal map
 /// applied (when the source has tangents).
-struct MaterialHost<'a> {
+///
+/// Materials farthing creates ([`RenderHost::create_material`], HLOD proxies) get ids after
+/// the glTF's, and their baked textures are kept (as 8-bit textures) so a parent proxy can be
+/// baked from its children's materials.
+pub(crate) struct MaterialHost<'a> {
     materials: &'a [GltfMaterial],
+    baked: Vec<BakedMaterial>,
 }
 
-impl MaterialHost<'_> {
-    /// World-space shading normal: the interpolated normal, perturbed by the material's
-    /// tangent-space normal map when the source mesh has tangents.
-    fn shading_normal(&self, s: &farthing::host::SurfaceSample) -> glam::Vec3 {
+/// A material made from a bake: base color (sRGB), tangent-space normal and glTF ORM, all in
+/// UV set 0.
+struct BakedMaterial {
+    base_color: Option<Texture>,
+    normal: Option<Texture>,
+    orm: Option<Texture>,
+}
+
+/// What [`MaterialHost`] evaluates at a surface point.
+struct Shaded {
+    color: Vec4,
+    normal: glam::Vec3,
+    orm: Vec4,
+}
+
+impl<'a> MaterialHost<'a> {
+    pub(crate) fn new(materials: &'a [GltfMaterial]) -> MaterialHost<'a> {
+        MaterialHost {
+            materials,
+            baked: Vec::new(),
+        }
+    }
+
+    /// World-space shading normal: the interpolated normal, perturbed by a tangent-space normal
+    /// map when the source mesh has tangents.
+    fn shading_normal(
+        s: &farthing::host::SurfaceSample,
+        map: Option<(&Texture, u32, f32)>,
+    ) -> glam::Vec3 {
         let n = s.normal.normalize_or_zero();
         let t = s.tangent.truncate();
-        let Some((tex, set, scale)) = self
-            .materials
-            .get(s.material.0 as usize)
-            .and_then(|m| m.normal_texture.as_ref())
-        else {
+        let Some((tex, set, scale)) = map else {
             return n;
         };
         if t.length_squared() < 1e-12 || n == glam::Vec3::ZERO {
@@ -592,13 +725,62 @@ impl MaterialHost<'_> {
         }
         let t = (t - n * n.dot(t)).normalize_or_zero();
         let b = n.cross(t) * if s.tangent.w < 0.0 { -1.0 } else { 1.0 };
-        let m = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
+        let m = tex.sample_bilinear(s.uv[(set as usize).min(1)], true);
         let (x, y, z) = (
             (m.x * 2.0 - 1.0) * scale,
             (m.y * 2.0 - 1.0) * scale,
             m.z * 2.0 - 1.0,
         );
         (t * x + b * y + n * z).try_normalize().unwrap_or(n)
+    }
+
+    fn shade(&self, s: &farthing::host::SurfaceSample) -> Shaded {
+        let id = s.material.0 as usize;
+        if let Some(m) = self.materials.get(id) {
+            let uv = |set: u32| s.uv[(set as usize).min(1)];
+            let mut color = s.color * m.base_color_factor;
+            if let Some((tex, set)) = &m.base_color_texture {
+                color *= tex.sample_bilinear(uv(*set), true);
+            }
+            if m.info.class == MaterialClass::Opaque {
+                color.w = 1.0;
+            }
+            // glTF layout: R occlusion (unused here), G roughness, B metalness.
+            let mut orm = Vec4::new(1.0, m.roughness_factor, m.metallic_factor, 1.0);
+            if let Some((tex, set)) = &m.metallic_roughness_texture {
+                let t = tex.sample_bilinear(uv(*set), true);
+                orm.y *= t.y;
+                orm.z *= t.z;
+            }
+            let map = m.normal_texture.as_ref().map(|(t, set, k)| (t, *set, *k));
+            return Shaded {
+                color,
+                normal: Self::shading_normal(s, map),
+                orm,
+            };
+        }
+        if let Some(b) = id
+            .checked_sub(self.materials.len())
+            .and_then(|i| self.baked.get(i))
+        {
+            let sample = |t: &Option<Texture>, fallback: Vec4| {
+                t.as_ref()
+                    .map_or(fallback, |t| t.sample_bilinear(s.uv[0], false))
+            };
+            let mut color = sample(&b.base_color, Vec4::ONE);
+            color.w = 1.0;
+            return Shaded {
+                color,
+                normal: Self::shading_normal(s, b.normal.as_ref().map(|t| (t, 0, 1.0))),
+                orm: sample(&b.orm, Vec4::new(1.0, 0.8, 0.0, 1.0)),
+            };
+        }
+        // Unbaked child proxies (`hlod::PROXY_MATERIAL`) and unknown slots: plain grey.
+        Shaded {
+            color: Vec4::new(0.7, 0.7, 0.7, 1.0),
+            normal: s.normal.normalize_or_zero(),
+            orm: Vec4::new(1.0, 0.8, 0.0, 1.0),
+        }
     }
 }
 
@@ -616,31 +798,10 @@ impl RenderHost for MaterialHost<'_> {
         let mut orm = vec![Vec4::ZERO; n];
         for (i, s) in req.samples.iter().enumerate() {
             let Some(s) = s else { continue };
-            let mut c = s.color;
-            if let Some(m) = self.materials.get(s.material.0 as usize) {
-                c *= m.base_color_factor;
-                if let Some((tex, set)) = &m.base_color_texture {
-                    c *= tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
-                }
-                if m.info.class == MaterialClass::Opaque {
-                    c.w = 1.0;
-                }
-            }
-            color[i] = c;
-            normal[i] = self.shading_normal(s).extend(1.0);
-            // glTF layout: R occlusion (unused here), G roughness, B metalness.
-            orm[i] = self.materials.get(s.material.0 as usize).map_or(
-                Vec4::new(1.0, 0.8, 0.0, 1.0),
-                |m| {
-                    let mut v = Vec4::new(1.0, m.roughness_factor, m.metallic_factor, 1.0);
-                    if let Some((tex, set)) = &m.metallic_roughness_texture {
-                        let t = tex.sample_bilinear(s.uv[(*set as usize).min(1)], true);
-                        v.y *= t.y;
-                        v.z *= t.z;
-                    }
-                    v
-                },
-            );
+            let sh = self.shade(s);
+            color[i] = sh.color;
+            normal[i] = sh.normal.extend(1.0);
+            orm[i] = sh.orm;
         }
         let image = |pixels: &mut Vec<Vec4>| Image {
             width: req.width,
@@ -674,7 +835,15 @@ impl RenderHost for MaterialHost<'_> {
         Err(Error::Unsupported("render_views"))
     }
 
-    fn create_material(&mut self, _desc: &BakedMaterialDesc) -> farthing::Result<MaterialId> {
-        Err(Error::Unsupported("create_material"))
+    fn create_material(&mut self, desc: &BakedMaterialDesc) -> farthing::Result<MaterialId> {
+        let get = |name: &str| desc.textures.get(name);
+        self.baked.push(BakedMaterial {
+            base_color: get(channels::BASE_COLOR).map(|c| Texture::from_image(&c.image, true)),
+            normal: get(channels::NORMAL).map(|c| Texture::from_signed_normals(&c.image)),
+            orm: get(channels::ORM).map(|c| Texture::from_image(&c.image, false)),
+        });
+        Ok(MaterialId(
+            (self.materials.len() + self.baked.len() - 1) as u32,
+        ))
     }
 }

@@ -4,7 +4,8 @@
 use farthing::image::Image;
 use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
 use farthing::{Mesh, Scene};
-use farthing_demo_web::pipeline::{Demo, Event, LodOptions};
+use farthing_demo_web::modes::ViewRequest;
+use farthing_demo_web::pipeline::{Buffer, Demo, DemoMode, Event, LevelInfo, LodOptions};
 use glam::{Vec2, Vec3, Vec4};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
@@ -137,6 +138,7 @@ fn zipped_gltf_reduces_and_bakes() {
                 assert_eq!(rgba.len(), (width * height * 4) as usize);
                 textures.push((channel.to_owned(), rgba.to_vec()));
             }
+            Event::Data { .. } => panic!("the chain reports levels, not data"),
         },
     )
     .unwrap();
@@ -238,5 +240,165 @@ fn samples_reduce_and_bake() {
             "{file}: peak heap {} MB would not fit wasm32",
             peak >> 20
         );
+
+        // The other modes with the page's defaults, each held to the same budget.
+        for mode in [
+            DemoMode::Presets,
+            DemoMode::Clusters,
+            DemoMode::Hlod,
+            DemoMode::Splats,
+        ] {
+            let t0 = std::time::Instant::now();
+            PEAK.store(LIVE.load(Relaxed), Relaxed);
+            let run = run_mode(&mut demo, mode, LodOptions::default());
+            let peak = PEAK.load(Relaxed);
+            eprintln!(
+                "{file}: {mode:?} {} results, {:.1}s, peak heap {} MB",
+                run.levels.len() + run.data.len(),
+                t0.elapsed().as_secs_f64(),
+                peak >> 20
+            );
+            assert!(
+                peak < WASM_HEAP_BUDGET,
+                "{file}: {mode:?} peak heap {} MB would not fit wasm32",
+                peak >> 20
+            );
+            check_mode(&demo, mode, &run, info.diagonal);
+        }
     }
+}
+
+/// What a run reported.
+#[derive(Default)]
+struct Run {
+    levels: Vec<(LevelInfo, usize)>,
+    data: Vec<(String, serde_json::Value, Vec<Buffer>)>,
+}
+
+fn run_mode(demo: &mut Demo, mode: DemoMode, opts: LodOptions) -> Run {
+    let mut run = Run::default();
+    demo.run(&LodOptions { mode, ..opts }, &|| 0.0, &mut |e| match e {
+        Event::Level { info, glb } => run.levels.push((info.clone(), glb.len())),
+        Event::Data {
+            kind,
+            json,
+            buffers,
+        } => run.data.push((
+            kind.to_owned(),
+            serde_json::from_str(&json).unwrap(),
+            buffers,
+        )),
+        _ => {}
+    })
+    .unwrap_or_else(|e| panic!("{mode:?}: {e}"));
+    run
+}
+
+fn u32s(b: &Buffer) -> &[u32] {
+    match b {
+        Buffer::U32(v) => v,
+        _ => panic!("expected u32s"),
+    }
+}
+
+/// What every mode must report, whatever the asset.
+fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
+    let original = run.levels[0].0.triangles;
+    match mode {
+        DemoMode::Chain => {}
+        DemoMode::Presets => {
+            assert_eq!(run.levels.len(), 11, "original + 10 configurations");
+            for (info, glb) in &run.levels[1..] {
+                assert!(info.label.is_some() && info.note.is_some(), "{info:?}");
+                assert!(info.triangles < original, "{info:?}");
+                assert_eq!(info.bytes, Some(*glb));
+                assert!(info.relative_error < 0.5, "{info:?}");
+                demo.level_glb(info.level).unwrap();
+            }
+        }
+        DemoMode::Clusters => {
+            let (kind, json, buffers) = &run.data[0];
+            assert_eq!(kind, "clusters");
+            let meshes = json["meshes"].as_array().unwrap();
+            assert_eq!(buffers.len(), 2 + 7 * meshes.len());
+            assert!(json["gpu_bytes"].as_u64().unwrap() > 0);
+            // Close up shows full detail, far away a coarser cut; the packed GPU form picks
+            // the same clusters.
+            let view = |d: f32, threshold| ViewRequest {
+                eye: [0.0, 0.0, d * diagonal],
+                ppr: 935.0,
+                threshold,
+            };
+            let cut = |v: &ViewRequest| {
+                let (j, b) = demo.select(v).unwrap();
+                let j: serde_json::Value = serde_json::from_str(&j).unwrap();
+                assert!(j["gpu_agrees"].as_bool().unwrap(), "{j}");
+                assert!(!u32s(&b[0]).is_empty());
+                j["triangles"].as_u64().unwrap()
+            };
+            let near = cut(&view(0.01, 0.1));
+            let far = cut(&view(50.0, 1.0));
+            assert!(far < near, "far {far} near {near}");
+        }
+        DemoMode::Hlod => {
+            let nodes = run.data.iter().filter(|d| d.0 == "hlod_node").count();
+            let (kind, json, _) = run.data.last().unwrap();
+            assert_eq!(kind, "hlod_tree");
+            assert_eq!(nodes, json["nodes"].as_array().unwrap().len(), "{json}");
+            let at = |d: f32| {
+                demo.select(&ViewRequest {
+                    eye: [0.0, 0.0, d * diagonal],
+                    ppr: 935.0,
+                    threshold: 1.0,
+                })
+                .unwrap()
+            };
+            let far = at(1000.0);
+            let near = at(0.0);
+            assert!(!u32s(&far.1[0]).is_empty(), "far away draws proxies");
+            assert!(
+                !u32s(&near.1[1]).is_empty(),
+                "inside draws source instances"
+            );
+        }
+        DemoMode::Splats => {
+            assert_eq!(run.data.len(), 3);
+            for (i, (kind, json, buffers)) in run.data.iter().enumerate() {
+                assert_eq!(kind, "splats");
+                let k = json["vertices"].as_u64().unwrap() as usize;
+                let Buffer::F32(v) = &buffers[0] else {
+                    panic!("expected f32s")
+                };
+                assert_eq!(v.len(), k * farthing_demo_web::modes::SPLAT_FLOATS);
+                assert!(v.iter().all(|x| x.is_finite()));
+                let ply = demo.level_ply(i + 1).unwrap();
+                assert_eq!(Some(ply.len() as u64), json["bytes"].as_u64());
+            }
+        }
+    }
+}
+
+/// Every mode on the textured sphere, with small settings.
+#[test]
+fn sphere_runs_every_mode() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let diag = demo.info().diagonal;
+    let small = LodOptions {
+        hlod_copies: 3,
+        hlod_triangles: 300,
+        splat_count: 4000,
+        ..Default::default()
+    };
+    for mode in [
+        DemoMode::Presets,
+        DemoMode::Clusters,
+        DemoMode::Hlod,
+        DemoMode::Splats,
+    ] {
+        let run = run_mode(&mut demo, mode, small.clone());
+        check_mode(&demo, mode, &run, diag);
+    }
+    // A splat run keeps PLYs but no GLB levels.
+    assert!(demo.level_glb(1).is_err());
+    assert!(demo.level_ply(1).is_ok());
 }

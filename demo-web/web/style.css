@@ -10,6 +10,9 @@
   --warn: #a8551c;
   --sel: #e5eefc;
   --mono: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  --k-clusters: #2a8a5a;
+  --k-hlod: #9a5cc6;
+  --k-splats: #c0702a;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -24,6 +27,9 @@
     --accent-ink: #0d1626;
     --warn: #e39a62;
     --sel: #23324a;
+    --k-clusters: #5cc492;
+    --k-hlod: #c194ea;
+    --k-splats: #eda366;
     color-scheme: dark;
   }
 }
@@ -116,6 +122,8 @@ label.range output { font-family: var(--mono); font-size: 12px; }
 label.select { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 label.check { display: flex; gap: 6px; align-items: center; }
 label.check input { accent-color: var(--accent); }
+.hint { margin: 0 0 6px; font-size: 12px; color: var(--muted); }
+.hint code { font-size: 11px; }
 form:disabled, form[aria-disabled="true"] { opacity: 0.5; pointer-events: none; }
 
 /* Main */
@@ -210,11 +218,12 @@ main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0;
 }
 
 #panel {
-  display: grid; grid-template-columns: 1fr auto; gap: 16px;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px 16px; align-items: start;
   border-top: 1px solid var(--line); background: var(--panel);
   padding: 10px 16px; max-height: 42vh; overflow: auto;
 }
-#levels { overflow-x: auto; }
+/* The cut panel and the bake panel share the right column (both show in HLOD mode). */
+#levels { overflow-x: auto; grid-row: 1 / span 2; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 td { padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -225,7 +234,20 @@ tbody tr.selected { background: var(--sel); }
 tbody tr.pending td { color: var(--muted); font-style: italic; }
 .kind { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); }
 .kind.baked { border-color: var(--accent); color: var(--accent); }
+.kind.clusters { border-color: var(--k-clusters); color: var(--k-clusters); }
+.kind.hlod { border-color: var(--k-hlod); color: var(--k-hlod); }
+.kind.splats { border-color: var(--k-splats); color: var(--k-splats); }
+td.label { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 td button { padding: 0 8px; font-size: 12px; }
+
+#cut { width: 280px; display: flex; flex-direction: column; gap: 8px; }
+#cut h3 { margin: 0; font-size: 13px; }
+#cut .controls { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+#cut dl { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 0; font-size: 12px; }
+#cut dt { color: var(--muted); }
+#cut dd { margin: 0; text-align: right; font-family: var(--mono); font-size: 12px; }
+#cut dd.ok { color: var(--k-clusters); }
+#cut dd.bad { color: var(--warn); }
 
 #bake { width: 300px; }
 #bake h3 { margin: 0 0 6px; font-size: 13px; }
@@ -245,5 +267,5 @@ td button { padding: 0 8px; font-size: 12px; }
   #side { border-right: 0; border-bottom: 1px solid var(--line); }
   main { height: auto; grid-template-rows: 70vh auto; }
   #panel { grid-template-columns: 1fr; max-height: none; }
-  #bake { width: auto; }
+  #bake, #cut { width: auto; }
 }
