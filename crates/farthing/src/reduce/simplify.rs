@@ -81,8 +81,9 @@ pub struct SimplifyOptions {
     /// Weight of the constraint planes along open borders.
     pub border_weight: f32,
     /// How collapse error is normalized by the surface area a vertex represents: 0 ranks by
-    /// area-weighted error (the default; best mean, UV and normal fidelity), 1 by mean distance
-    /// (classic QEM; protects tiny features at the cost of overall fidelity).
+    /// area-weighted error plus mean distance (the default; best mean, UV and normal fidelity,
+    /// while the mean term keeps vertices with little surface from drifting far), 1 by mean
+    /// distance alone (classic QEM; protects tiny features at the cost of overall fidelity).
     pub error_normalization: f32,
     /// Meshes with at least this many triangles are reduced cluster-parallel: fixed-size spatial
     /// clusters are reduced concurrently with their borders locked, then one exact pass cleans
@@ -236,6 +237,13 @@ const TEAR_SAME_UV: f64 = 1e-4;
 const DRIFT_UV: f64 = 1.0 / 2048.0;
 /// Points sampled per edge when measuring how far a UV spill reaches (see `State::uv_merge_ok`).
 const SPILL_SAMPLES: usize = 8;
+/// Weight of the constraint planes along creases, relative to open borders' `border_weight`:
+/// each face adds a plane through each of its edges, perpendicular to the face, weighted by
+/// edge length² × this × (1 − cos dihedral) / 2. Without them a vertex sliding along a sharp
+/// edge costs only the area of the faces beside it, so the outline of a thin closed part (a
+/// panel or slab whose rims are a few narrow faces) slides freely in its plane until the part
+/// is a sliver; UV seams along such rims used to hide this, a seamless atlas exposes it.
+const CREASE_WEIGHT: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Validity {
@@ -837,7 +845,9 @@ impl<'a> State<'a> {
         // 1 + silhouette_weight × (mean of that fraction over its edges).
         let sil_beta = opts.silhouette_weight as f64;
         let adj = Adjacency::new(&pairs, &counts);
-        let sil: Vec<f64> = if sil_beta > 0.0 {
+        // The same pass weighs each edge's crease, (1 − cos dihedral) / 2: 0 where the surface
+        // is flat, 1 where it folds back on itself (see CREASE_WEIGHT).
+        let edge_terms: Vec<(f64, [f64; 3])> = {
             let fnorm: Vec<DVec3> = tpos
                 .par_iter()
                 .with_min_len(1024)
@@ -852,12 +862,13 @@ impl<'a> State<'a> {
                 .into_par_iter()
                 .with_min_len(1024)
                 .map(|t| {
+                    let mut crease = [0.0; 3];
                     if !tri_alive[t] {
-                        return 1.0;
+                        return (1.0, crease);
                     }
                     let p = tpos[t];
                     let mut acc = 0.0;
-                    for i in 0..3 {
+                    for (i, k) in crease.iter_mut().enumerate() {
                         let (a, b) = (p[i], p[(i + 1) % 3]);
                         let (mut n, mut other) = (0usize, 0u32);
                         for &g in adj.get(a) {
@@ -869,17 +880,16 @@ impl<'a> State<'a> {
                             }
                         }
                         acc += if n == 2 {
-                            fnorm[t].dot(fnorm[other as usize]).clamp(-1.0, 1.0).acos()
-                                / std::f64::consts::PI
+                            let c = fnorm[t].dot(fnorm[other as usize]).clamp(-1.0, 1.0);
+                            *k = (1.0 - c) * 0.5;
+                            c.acos() / std::f64::consts::PI
                         } else {
                             1.0
                         };
                     }
-                    1.0 + sil_beta * acc / 3.0
+                    (1.0 + sil_beta * acc / 3.0, crease)
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
         struct Face {
             p: [u32; 3],
@@ -905,11 +915,17 @@ impl<'a> State<'a> {
                 return None;
             }
             let nn = n / (2.0 * area);
-            let plane = Quadric::plane(nn, -nn.dot(a), area * sil.get(t).copied().unwrap_or(1.0));
+            let (sil, crease) = edge_terms[t];
+            let plane = Quadric::plane(nn, -nn.dot(a), area * sil);
             let mut border = [None; 3];
             for (i, slot) in border.iter_mut().enumerate() {
                 let (e0, e1v) = (p[i], p[(i + 1) % 3]);
-                if bnbr[e0 as usize].contains(&e1v) {
+                let w = if bnbr[e0 as usize].contains(&e1v) {
+                    opts.border_weight as f64
+                } else {
+                    CREASE_WEIGHT * crease[i]
+                };
+                if w > 0.0 {
                     let (x0, x1) = (pos[e0 as usize], pos[e1v as usize]);
                     let dir = x1 - x0;
                     let bn = dir.cross(nn).normalize_or_zero();
@@ -917,7 +933,7 @@ impl<'a> State<'a> {
                         *slot = Some(Quadric::constraint(
                             bn,
                             -bn.dot(x0),
-                            dir.length_squared() * opts.border_weight as f64,
+                            dir.length_squared() * w,
                         ));
                     }
                 }
@@ -1444,11 +1460,17 @@ impl<'a> State<'a> {
         let qd = &self.quadric[p as usize];
         let raw = qd.eval_m(&m);
         // Error normalization: area^alpha. alpha = 1 is the classic mean distance, which dilutes
-        // as a vertex absorbs surface; alpha = 0 keeps the area-weighted sum.
+        // as a vertex absorbs surface; alpha = 0 keeps the area-weighted sum (plus the mean).
         let alpha = self.alpha;
         let norm = |w: f64| {
-            if w <= 0.0 || alpha == 0.0 {
+            if w <= 0.0 {
                 self.avg_area
+            } else if alpha == 0.0 {
+                // error/avg + error/w: the area-weighted sum plus the mean over the vertex's own
+                // area, so a vertex with little surface (the rim of a thin part) can't drift
+                // much further than its mean distance just because its error is weighted by
+                // its small area.
+                self.avg_area * w / (w + self.avg_area)
             } else if alpha == 1.0 {
                 w
             } else {
@@ -2117,8 +2139,9 @@ impl<'a> State<'a> {
     /// only needs the new or changed candidate x→q scored, unless its cached target died or was q.
     /// Validity is re-checked lazily when an entry reaches the top of the heap.
     fn refresh(&mut self, p: u32, q: u32, heap: &mut IndexedHeap) {
-        // q's collapse costs only grow when it absorbs p (sums of PSD quadrics), so its old key
-        // stays a valid lower bound: defer the re-rank until q reaches the top of the heap.
+        // q's quadric errors only grow when it absorbs p (sums of PSD quadrics), and its mean
+        // term (error / own area) shrinks at most by the factor its area grew: the old key
+        // scaled by that stays a lower bound, so defer the re-rank until q reaches the top.
         let (_, qt) = self.best[q as usize];
         if self.alpha == 0.0
             && qt != u32::MAX
@@ -2126,6 +2149,10 @@ impl<'a> State<'a> {
             && self.pos_alive[qt as usize]
             && heap.slot[q as usize] != u32::MAX
         {
+            let (wq, wp) = (self.quadric[q as usize].w, self.quadric[p as usize].w);
+            if wq > 0.0 && wp > 0.0 {
+                heap.set(q, heap.key[q as usize] * ((wq - wp).max(0.0) / wq).sqrt());
+            }
             self.dirty[q as usize] = true;
         } else {
             self.requeue(q, heap);
@@ -4224,5 +4251,77 @@ mod part_tests {
         assert_eq!(crate::reduce::parts::parts_of(&r.mesh).1, 1);
         let d = crate::metrics::surface_distance(&copy, &r.mesh, 5000);
         assert!(d.relative_hausdorff < 0.05, "{d:?}");
+    }
+
+    /// A thin closed disc (a panel): two dense faces joined by a one-strip rim.
+    fn slab(seg: u32, rings: u32, thickness: f32) -> Mesh {
+        let mut pos = Vec::new();
+        let mut idx = Vec::new();
+        for side in [1.0f32, -1.0] {
+            let base = pos.len() as u32;
+            let z = side * thickness * 0.5;
+            pos.push(Vec3::new(0.0, 0.0, z));
+            for r in 1..=rings {
+                let rad = r as f32 / rings as f32;
+                for s in 0..seg {
+                    let a = s as f32 / seg as f32 * std::f32::consts::TAU;
+                    pos.push(Vec3::new(rad * a.cos(), rad * a.sin(), z));
+                }
+            }
+            let at = |r: u32, s: u32| base + 1 + (r - 1) * seg + s % seg;
+            let mut tri = |a: u32, b: u32, c: u32| {
+                if side > 0.0 {
+                    idx.extend_from_slice(&[a, b, c]);
+                } else {
+                    idx.extend_from_slice(&[a, c, b]);
+                }
+            };
+            for s in 0..seg {
+                tri(base, at(1, s), at(1, s + 1));
+                for r in 1..rings {
+                    tri(at(r, s), at(r + 1, s), at(r + 1, s + 1));
+                    tri(at(r, s), at(r + 1, s + 1), at(r, s + 1));
+                }
+            }
+        }
+        let top = |s: u32| 1 + (rings - 1) * seg + s % seg;
+        let bot = |s: u32| top(s) + 1 + rings * seg;
+        for s in 0..seg {
+            idx.extend_from_slice(&[top(s), bot(s), bot(s + 1), top(s), bot(s + 1), top(s + 1)]);
+        }
+        Mesh::new(pos, idx)
+    }
+
+    #[test]
+    fn thin_closed_part_keeps_its_outline() {
+        // A small panel beside a sphere, reduced as an LOD chain. The panel's rim is a strip of
+        // narrow faces: without crease planes its vertices slide in the panel's plane for the
+        // price of that tiny area, and by the last level the panel is a sliver (23% error).
+        for (seg, rings, size, at) in [(64, 8, 0.3, 1.6), (96, 4, 0.5, 1.7)] {
+            let mut m = tests::uv_sphere(48, 24);
+            m.normals = None;
+            m.uvs.clear();
+            m.append(
+                &moved(slab(seg, rings, 0.02), Vec3::new(at, 0.0, 0.0), size),
+                1,
+            );
+            let mut cur = m.clone();
+            for level in 1..=4 {
+                let target = cur.triangle_count() / 2;
+                let r = simplify(
+                    &cur,
+                    &SimplifyOptions {
+                        target_triangles: Some(target),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                r.mesh.validate().unwrap();
+                assert!(r.mesh.triangle_count() <= target);
+                let d = crate::metrics::surface_distance(&m, &r.mesh, 10000);
+                assert!(d.relative_hausdorff < 0.025, "{seg} L{level}: {d:?}");
+                cur = r.mesh;
+            }
+        }
     }
 }
