@@ -20,6 +20,8 @@
 //! * [`uv`] — chart-based UV parameterization and atlas packing.
 //! * [`bake`] — material casting from a source to a target surface through the host.
 //! * [`aggregate`] — many meshes and materials into one mesh with one atlas.
+//! * [`cluster`] — Nanite-style cluster DAGs for per-cluster LOD selection at run time.
+//! * [`hlod`] — many objects into one distant proxy: hidden-surface removal, merge, reduce, bake.
 //! * [`voxel`] — voxel remeshing (watertight proxies) and conservative occluders.
 //! * [`visibility`] — camera-sampled visibility culling and texel budgets.
 //! * [`impostor`] — octahedral, flipbook, single-view and billboard-cloud impostors.
@@ -50,6 +52,8 @@ pub mod scene;
 pub mod aggregate;
 pub mod bake;
 pub mod bones;
+pub mod cluster;
+pub mod hlod;
 pub mod impostor;
 #[cfg(feature = "io")]
 pub mod io;

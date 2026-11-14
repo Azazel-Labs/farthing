@@ -16,6 +16,7 @@ cargo run --release -- remesh <assets...>    # voxel proxies vs baby_shark
 RD_RATIOS=0.01,0.003,0.001 cargo run --release -- reduce <assets...>   # aggressive targets
 LF_OPTS='{"error_normalization":1.0}' cargo run --release -- reduce ... # option overrides
 cargo run --release -- pack                  # rectangle packers
+cargo run --release -- clusters <assets...>  # cluster LOD DAGs vs a clusterlod.h-style build
 (cd ../engine-poc && cargo run --release -- layered)      # one- vs two-layer impostors
 (cd ../engine-poc && cargo run --release -- surfel_lod)   # progressive surfels
 cargo run --release -- export <asset> <ratio> <dir>   # LODs for image-space scoring, then:
@@ -1092,3 +1093,95 @@ numbering and the take-in-order loop are still serial.
 Without the per-pass cost cap, rings blocked by a neighbour let dearer ones through, and error
 at 21,600 quads rose 55% (mean 0.082%); with it, quality matches or beats the one-at-a-time
 order except on the smallest mesh.
+
+## Cluster LOD DAGs (v16)
+
+`clusters` builds a Nanite-style DAG with `farthing::cluster::build_cluster_dag` and compares
+it with the same scheme assembled from meshoptimizer 0.7's own primitives, as its
+`demo/clusterlod.h` does: `build_meshlets(255, 128)`, then `partition_clusters_with_positions`
+(groups of about 8), then each group simplified to half with its border locked
+(`Sparse | ErrorAbsolute`, plus `Permissive` and normal/UV attributes for "meshopt attr", as in
+clusterlod.h). A group that keeps more than 85% of its triangles passes through to the next level,
+for every method. Both use 128-triangle, 255-vertex clusters.
+
+**How quality is scored.** The camera sits 4 bounding radii out (1080p, 60° vertical FOV). The
+screen-error threshold is swept from 0.02 to 200 px in steps of ×1.5. Each cut is
+`dag.select` → `to_mesh`, and its mean surface distance to the source is *measured* (40k
+samples, in pixels at the bounds' nearest point). Each cell is the fewest triangles any cut needs
+to stay under that measured error. A method that under-reports its own error gains nothing.
+Raw data, including every cut's (triangles, mean px, max px) curve:
+[`benchmarks/results-clusters.jsonl`](benchmarks/results-clusters.jsonl). Machine: 22 threads,
+Windows 11, mimalloc. Lower is better.
+
+| Asset (triangles) | Method | Build | Levels / roots | ≤ 0.25 px | ≤ 0.5 px | ≤ 1 px | ≤ 2 px |
+|---|---|---|---|---|---|---|---|
+| DamagedHelmet (15k) | farthing | 67 ms | 8 / 1 | **5,927** | 5,927 | 3,888 | 1,943 |
+| | farthing fast | 31 ms | 8 / 1 | 7,270 | **4,400** | **1,943** | 1,943 |
+| | meshopt | 36 ms | 4 / 26 | 7,720 | 7,049 | 5,416 | 5,416 |
+| | meshopt attr | 57 ms | 8 / 1 | 7,721 | 7,721 | 3,858 | **1,926** |
+| pirate (5k) | farthing | 26 ms | 7 / 1 | 2,785 | 1,630 | 1,630 | 621 |
+| | farthing fast | 12 ms | 7 / 1 | 3,272 | **1,123** | **625** | **311** |
+| | meshopt | 11 ms | 6 / 2 | **2,503** | 1,250 | 1,250 | 625 |
+| | meshopt attr | 13 ms | 7 / 1 | 2,504 | 2,504 | 1,251 | 625 |
+| Lantern (5k) | farthing | 27 ms | 7 / 1 | 674 | 674 | 336 | 168 |
+| | farthing fast | 18 ms | 7 / 1 | 674 | 674 | 336 | 336 |
+| | meshopt | 10 ms | 4 / 6 | 1,347 | 1,347 | 1,347 | 672 |
+| | meshopt attr | 20 ms | 7 / 1 | **661** | **330** | **330** | **82** |
+| DragonAttenuation (135k) | farthing | 208 ms | 12 / 1 | 16,685 | 8,741 | 7,781 | 3,323 |
+| | farthing fast | 112 ms | 12 / 1 | **12,531** | **8,187** | **2,791** | **799** |
+| | meshopt | 397 ms | 7 / 363 | 47,457 | 38,607 | 38,607 | 38,607 |
+| | meshopt attr | 508 ms | 12 / 1 | 24,592 | 24,592 | 13,196 | 13,196 |
+| Avocado (682) | all four | 1–5 ms | 4 / 1 | 682 | 341–682 | 341–682 | 169–170 |
+
+Build time on ABeautifulGame (1.5M triangles, 22 threads): farthing 1.85 s, fast 1.04 s,
+meshopt 3.3 s (973 roots), meshopt attr 3.9 s (160 roots).
+
+What the numbers say:
+
+- **Reaching one root.** farthing's DAG always closes to a single root (two on the chess set,
+  whose pieces are disconnected). Geometry-only meshopt stalls when groups can't reach 85%
+  under locked borders: 363 roots on the dragon, 973 on the chess set. So its coarsest cut is
+  still 38,607 triangles, however far away the dragon is. Permissive attributes help (one
+  root on the dragon) but still leave 160 on the chess set. Both methods pass a stalled group on
+  to be regrouped. farthing's reducer keeps finding collapses under locked borders where
+  meshoptimizer's runs out.
+- **Triangles at matched error.** On the dragon, farthing needs 1.7–4× fewer triangles than
+  meshopt attr at every error level, and fast mode needs up to 16× fewer at 2 px. On the helmet
+  and the pirate it is level or better at most targets. **meshoptimizer wins on the Lantern**
+  (330 vs 674 triangles at 0.5 px). Its permissive attribute path keeps the lantern's thin frame
+  at half the triangles.
+- **Fast mode** (`ClusterOptions::fast()`, `Quality::Fast` group reductions) builds about 2×
+  faster, with geometric error as low or lower. It keeps normals and UVs less faithfully, which
+  this table, measuring positions only, doesn't show.
+- **Speed.** The meshopt baseline here is serial. clusterlod.h itself runs groups in parallel,
+  and zeux reports about 10.6M triangles/s on 16 threads, which is faster than farthing's
+  roughly 0.8M (default) and 1.4M (fast) triangles/s here. Per core (dragon, one thread):
+  farthing 1.2 s, fast 0.56 s, meshopt 0.39 s. farthing's levels are parallel: groups are reduced
+  concurrently, and clustering uses a parallel spatial bisection and parallel adjacency. With
+  the Windows system allocator, parallel scaling stalls; the bench links mimalloc, and engines should too.
+
+### HLOD (v16)
+
+`farthing::hlod::build_hlod` (CLI: `farthing hlod`) makes one distant proxy out of a whole
+scene. It runs camera-sampled visibility, then `cull_invisible`, then merges and reduces (or
+voxel-remeshes), unwraps, and bakes from the culled source. The Lantern on its own, with 64
+cameras, reduced to 500 triangles: 122 of its 5,394 triangles are never seen, and the result has a
+mean distance of 0.026% of the bounds. In the test scene (a crate with a box hidden inside it,
+standing on a ground slab, with pebbles), every triangle of the hidden box goes, the faces pressed
+against the ground go, and the 200-triangle budget holds.
+
+Small parts are kept or dropped whole before culling (`small_part_pixels`, 8 px of the visibility
+render by default). Without that, partly seen pebbles leave shards the reducer can't collapse,
+and a hard triangle budget then removes the large parts instead. Visibility is camera ID renders
+only. Unlike EA's US 9,978,176, nothing is decided by casting rays along normals.
+
+### Gaussian splats from surfels (v16)
+
+`farthing::impostor::splats` (CLI: `farthing splats`) writes a progressive surfel cloud as a
+standard 3D Gaussian Splatting `.ply`: one flat Gaussian per surfel, with tangent σ at half the
+disc radius and normal σ at 5% of that, SH degree 0 colour from a host channel, and logit
+opacity. The progressive order carries over: the first k splats, grown by `SurfelCloud::lod`'s
+radius scale, are a coarser even covering. These are placed, not optimized. There is no
+photometric training, so the colour is whatever the host evaluates at each surfel (albedo, or
+baked lighting), and the result is view-independent.
+

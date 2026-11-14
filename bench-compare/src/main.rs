@@ -13,6 +13,11 @@ use farthing::reduce::{simplify, SimplifyOptions};
 use serde_json::json;
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+mod cluster_bench;
+
 fn load(path: &str) -> Mesh {
     let scene = farthing::io::load(path).expect("load");
     let (mut m, _) = scene.flatten();
@@ -648,6 +653,7 @@ fn main() {
         Some("remesh") => remesh_mode(&args[1..]),
         Some("rmdiag") => rmdiag_mode(&args[1..]),
         Some("pack") => pack_bench::pack_mode(&args[1..]),
+        Some("clusters") => cluster_bench::cluster_mode(&args[1..]),
         Some("nrm") => {
             for path in &args[1..] {
                 let m = load(path);

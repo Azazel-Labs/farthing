@@ -89,8 +89,10 @@ and marches depth for parallax.
 | **Proxies** | Rebuilds a messy kitbash or scene as one closed, manifold mesh | Voxelization with sub-voxel signed boundaries, leak-aware gap sealing, surface nets, then reduction |
 | **UV atlases** | Fresh atlases for proxies and far LODs | LSCM + ARAP charts with exact overlap tests, split and merge under stretch limits, packed by `snugly` |
 | **Baking** | Moves colour, normal, roughness/metal and any custom channel onto the new mesh | farthing finds where each texel comes from on the source surface, and your engine shades it. Supersampled, dilated, MikkTSpace normals. Has a two-phase API for async GPUs |
+| **Cluster LOD** | Nanite-style cluster DAGs for per-cluster LOD on the GPU, crack-free for any camera | Meshlets (128 triangles, 255 vertices) grouped by shared border, each group reduced to half with its border locked, levels down to one root. Errors and bounds grow monotonically, so the select test runs per cluster with no traversal. Parallel, deterministic |
+| **HLOD** | Turns a whole area (buildings, props, terrain pieces) into one distant proxy with one atlas | Camera-sampled hidden-surface removal, small parts kept whole, merge, then reduction or voxel remesh, unwrap, and a bake from the visible source only |
 | **Aggregation** | Merges many objects into one draw call | Material classes, island repacking by texel density, texel copy |
-| **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds. Reference WGSL included |
+| **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds, which also export as 3D Gaussian splats (`.ply`). Reference WGSL included |
 | **Visibility & occluders** | Removes what can't be seen and builds occlusion geometry | Camera-sampled ID renders (alpha-aware through your engine), plus conservative self-tuning occluder meshes and boxes |
 | **Bones** | Fewer joints and influences for far LODs | Leaf-first removal by skinned error, influence limiting |
 | **I/O** | glTF/GLB (skins, morphs, embedded textures) and OBJ | Optional `io` feature |
@@ -123,6 +125,9 @@ farthing uv far.glb -o far_uv.glb
 farthing occluder scene.glb -o occ.glb --triangles 300 --boxes 8
 farthing bones character.glb -o char_lod.glb --ratio 0.5 --influences 2
 farthing quad-reduce character.obj -o character_lod.obj --ratio 0.25
+farthing clusters model.glb -o dag.json                     # Nanite-style cluster DAG
+farthing hlod block.glb -o far.glb --triangles 2000 --hemisphere   # distant proxy of an area
+farthing splats tree.glb -o tree.ply --count 20000         # foliage as Gaussian splats
 ```
 
 **As a library:**
@@ -411,6 +416,9 @@ Other kinds of impostor:
 - `ImpostorKind::SingleView`, one view from a fixed direction.
 - `build_layered_impostor`, which captures a second depth layer for concave props.
 - `billboard_cloud` and `progressive_surfel_cloud`, for shapes one card can't hold.
+- `impostor::splats`, which turns a surfel cloud into flat 3D Gaussians and writes the standard
+  3D Gaussian Splatting `.ply`, for foliage in any splat renderer. Colours come from your
+  engine, evaluated at each surfel's source point.
 
 The reference shader is
 [`shaders/octahedral_impostor.wgsl`](crates/farthing/shaders/octahedral_impostor.wgsl).
@@ -427,6 +435,52 @@ let infos: Vec<_> = scene.materials.iter().map(|m| engine.material_info(m.id)).c
 let merged = aggregate(&scene, &infos, &AggregateOptions { atlas_size: 2048, ..Default::default() })?;
 let color = copy_texels(&merged, &flattened, channels::BASE_COLOR)?; // flattened: FlattenedTextures
 ```
+
+### Cluster LOD
+
+`build_cluster_dag` builds the cluster hierarchy that Nanite-style renderers select from per
+cluster: meshlets at the bottom, coarser clusters above, one root at the top. Every cluster
+indexes the source mesh's vertex buffer, so all levels share it.
+
+```rust
+use farthing::cluster::{build_cluster_dag, ClusterOptions, LodView};
+
+let dag = build_cluster_dag(&mesh, &ClusterOptions::default())?; // or ClusterOptions::fast()
+// Per cluster: indices, bounds, normal cone, lod_error/lod_bounds, parent_error/parent_bounds.
+// On the GPU: draw a cluster when its own error projects under the threshold and its parent's
+// doesn't. Errors and bounds only grow towards the roots, so any camera gets a crack-free cut.
+let visible = dag.select(&LodView { eye, pixels_per_radian, threshold: 1.0 });
+let (vertices, local_indices) = dag.clusters[0].meshlet(); // u8 meshlet layout
+```
+
+Compared with a DAG built the way meshoptimizer's `clusterlod.h` builds one, at equal *measured*
+on-screen error: on the 135k-triangle dragon it needs 1.7–4× fewer triangles (up to 16× in
+fast mode), and it always reaches a single root. On small assets the results are mixed, and
+meshoptimizer wins on the Lantern. See [BENCHMARKS](docs/BENCHMARKS.md#cluster-lod-dags-v16).
+
+### Distant LOD for a whole area (HLOD)
+
+`build_hlod` turns everything in a scene into one stand-in for the far distance. Before
+merging, it renders the scene from a ring of cameras and removes what none of them see: the
+insides of crates, the floors under walls, faces pressed together. Pebbles and bolts too small to
+matter at that distance are kept or dropped whole, never as shards. The rest is merged, reduced
+(or voxel-remeshed into one shell), unwrapped, and baked from the visible source, so hidden
+geometry never bleeds into the atlas.
+
+```rust
+use farthing::hlod::{build_hlod, HlodGeometry, HlodOptions};
+
+let hlod = build_hlod(&mut engine, &scene, &HlodOptions {
+    target_triangles: Some(2000),
+    geometry: HlodGeometry::Reduce,       // or HlodGeometry::Remesh(RemeshOptions { .. })
+    ..Default::default()                  // 64 cameras, 1024² atlas, colour + normal + ORM
+})?;
+// hlod.mesh: world-space proxy. hlod.bake: its textures. hlod.hidden_triangles: what was culled.
+```
+
+Set `bake: None` to get the unwrapped mesh and bake in your engine, and `visibility: None` to
+keep everything. Use `CameraSet::Hemisphere` for things standing on the ground, so their
+undersides go too.
 
 ### Visibility
 
@@ -486,6 +540,10 @@ Work runs on rayon's thread pool, and the output is the same on any thread count
 
 - **Speed.** The default reducer is 5–9× slower than meshoptimizer on small assets and 2–3×
   on large ones. About 88% of the work runs in parallel. Fast mode closes most of the gap.
+- **Cluster DAG build speed.** Faster than a serial meshoptimizer `clusterlod.h`-style build
+  from about 4 threads up, but 1.4× (fast) to 3× (default) slower per core. On Windows, link
+  [mimalloc](https://crates.io/crates/mimalloc) as the global allocator: the system heap
+  limits parallel scaling.
 - **Worst-case distance against positions-only reducers.** Ranking by area-weighted error
   trades a little worst-case distance for much better mean, UV and normal fidelity. Set
   `error_normalization = 1.0` for classic QEM when only the outline matters.

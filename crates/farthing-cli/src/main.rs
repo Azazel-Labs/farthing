@@ -140,6 +140,47 @@ enum Cmd {
         #[arg(long, default_value_t = 1)]
         rings: usize,
     },
+    /// Nanite-style cluster DAG (meshlets + LOD groups) for run-time per-cluster LOD.
+    Clusters {
+        input: PathBuf,
+        /// Write the DAG as JSON.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value_t = 128)]
+        max_triangles: usize,
+        #[arg(long, default_value_t = 255)]
+        max_vertices: usize,
+        /// Fast group reductions (about 2x faster build, attributes kept less faithfully).
+        #[arg(long)]
+        fast: bool,
+    },
+    /// Distant-LOD proxy of a whole scene: hidden-surface removal, merge, reduce, unwrap.
+    Hlod {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 2000)]
+        triangles: usize,
+        /// Max deviation in world units (with --triangles, whichever comes first).
+        #[arg(long)]
+        max_error: Option<f32>,
+        /// Voxel-remesh at this resolution first (fuses interpenetrating objects).
+        #[arg(long)]
+        remesh: Option<usize>,
+        /// Keep hidden surfaces (skip the visibility pass).
+        #[arg(long)]
+        no_cull: bool,
+        /// Visibility cameras on the upper hemisphere only (things that stand on the ground).
+        #[arg(long)]
+        hemisphere: bool,
+        #[arg(long, default_value_t = 64)]
+        cameras: usize,
+        #[arg(long, default_value_t = 256)]
+        resolution: u32,
+        /// UV atlas size for the proxy (0: no UVs).
+        #[arg(long, default_value_t = 1024)]
+        atlas: u32,
+    },
     /// New UV atlas for every mesh.
     Uv {
         input: PathBuf,
@@ -189,6 +230,15 @@ enum Cmd {
         frames: u32,
         #[arg(long, default_value_t = 128)]
         frame_size: u32,
+    },
+    /// Foliage / distant proxy as Gaussian splats: blue-noise surfels written as a 3DGS .ply
+    /// (progressive order: any prefix is a coarser covering). Coloured from vertex colours.
+    Splats {
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 20000)]
+        count: usize,
     },
     /// Fit billboard-cloud planes (geometry only) and write card quads.
     Billboard {
@@ -493,6 +543,88 @@ fn main() -> Result<()> {
             out["seconds"] = json!(t0.elapsed().as_secs_f32());
             print(out);
         }
+        Cmd::Clusters {
+            input,
+            output,
+            max_triangles,
+            max_vertices,
+            fast,
+        } => {
+            let mesh = single_mesh(&load(&input)?);
+            let opts = farthing::cluster::ClusterOptions {
+                max_triangles,
+                max_vertices,
+                ..if fast {
+                    farthing::cluster::ClusterOptions::fast()
+                } else {
+                    Default::default()
+                }
+            };
+            let t1 = Instant::now();
+            let dag = farthing::cluster::build_cluster_dag(&mesh, &opts)?;
+            let build = t1.elapsed().as_secs_f32();
+            if let Some(o) = &output {
+                std::fs::write(o, serde_json::to_string(&dag)?)?;
+            }
+            print(
+                json!({"input_triangles": mesh.triangle_count(), "clusters": dag.clusters.len(), "groups": dag.groups.len(), "levels": dag.levels(), "level_triangles": dag.level_triangles(), "roots": dag.roots().count(), "build_seconds": build, "seconds": t0.elapsed().as_secs_f32()}),
+            );
+        }
+        Cmd::Hlod {
+            input,
+            output,
+            triangles,
+            max_error,
+            remesh,
+            no_cull,
+            hemisphere,
+            cameras,
+            resolution,
+            atlas,
+        } => {
+            use farthing::hlod::{build_hlod, HlodGeometry, HlodOptions};
+            use farthing::visibility::{CameraSet, VisibilityOptions};
+            let s = load(&input)?;
+            let d = HlodOptions::default();
+            let opts = HlodOptions {
+                visibility: (!no_cull).then_some(VisibilityOptions {
+                    cameras: if hemisphere {
+                        CameraSet::Hemisphere {
+                            count: cameras,
+                            distance_factor: 2.5,
+                        }
+                    } else {
+                        CameraSet::Sphere {
+                            count: cameras,
+                            distance_factor: 2.5,
+                        }
+                    },
+                    resolution,
+                }),
+                geometry: match remesh {
+                    Some(r) => HlodGeometry::Remesh(farthing::voxel::RemeshOptions {
+                        resolution: r,
+                        ..Default::default()
+                    }),
+                    None => HlodGeometry::Reduce,
+                },
+                target_triangles: Some(triangles),
+                max_error,
+                uv: (atlas > 0).then(|| farthing::uv::ParamOptions {
+                    atlas_size: atlas,
+                    ..d.uv.clone().unwrap()
+                }),
+                // Materials live in the engine: bake there (or through a RenderHost).
+                bake: None,
+                ..d
+            };
+            let r = build_hlod(&mut GeometryOnlyHost, &s, &opts)?;
+            let dist = surface_distance(&single_mesh(&s), &r.mesh, 20000);
+            save(&Scene::from_mesh(r.mesh.clone()), &output)?;
+            print(
+                json!({"input_triangles": r.input_triangles, "hidden_triangles": r.hidden_triangles, "output_triangles": r.mesh.triangle_count(), "error": r.error, "relative_mean_distance": dist.relative_mean, "seconds": t0.elapsed().as_secs_f32()}),
+            );
+        }
         Cmd::Uv {
             input,
             output,
@@ -628,6 +760,47 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&json!({"plan": p, "views": views}))?,
             )?;
             print(json!({"frames": p.directions.len(), "atlas": p.atlas_size(), "output": output}));
+        }
+        Cmd::Splats {
+            input,
+            output,
+            count,
+        } => {
+            use farthing::impostor::splats::{surfels_to_splats, write_splat_ply, SplatOptions};
+            use farthing::impostor::surfels::{
+                progressive_surfel_cloud, SurfelChannel, SurfelOptions,
+            };
+            let mesh = single_mesh(&load(&input)?);
+            let cloud = progressive_surfel_cloud(
+                &mesh,
+                &SurfelOptions {
+                    count,
+                    ..Default::default()
+                },
+            )?;
+            let color = mesh.colors.as_ref().map(|c| SurfelChannel {
+                name: "color".into(),
+                components: 4,
+                data: cloud
+                    .surfels
+                    .iter()
+                    .flat_map(|s| {
+                        let t = mesh.triangle(s.triangle as usize);
+                        let b = s.barycentrics;
+                        let v = c[t[0] as usize] * b.x
+                            + c[t[1] as usize] * b.y
+                            + c[t[2] as usize] * b.z;
+                        v.to_array()
+                            .map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u8)
+                    })
+                    .collect(),
+            });
+            let splats =
+                surfels_to_splats(&cloud.surfels, color.as_ref(), &SplatOptions::default())?;
+            std::fs::write(&output, write_splat_ply(&splats))?;
+            print(
+                json!({"input_triangles": mesh.triangle_count(), "splats": splats.len(), "colored": color.is_some(), "seconds": t0.elapsed().as_secs_f32()}),
+            );
         }
         Cmd::Billboard {
             input,

@@ -19,6 +19,7 @@ mod fast;
 mod kernels;
 pub mod optimize;
 mod parts;
+pub(crate) use parts::parts_of;
 pub mod quad;
 mod quadric;
 pub mod repair;
