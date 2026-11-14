@@ -90,7 +90,7 @@ and marches depth for parallax.
 | **UV atlases** | Fresh atlases for proxies and far LODs | LSCM + ARAP charts with exact overlap tests, split and merge under stretch limits, packed by `snugly` |
 | **Baking** | Moves colour, normal, roughness/metal and any custom channel onto the new mesh | farthing finds where each texel comes from on the source surface, and your engine shades it. Supersampled, dilated, MikkTSpace normals. Has a two-phase API for async GPUs |
 | **Cluster LOD** | Nanite-style cluster DAGs for per-cluster LOD on the GPU, crack-free for any camera | Meshlets (128 triangles, 255 vertices) grouped by shared border, each group reduced to half with its border locked, levels down to one root. Errors and bounds grow monotonically, so the select test runs per cluster with no traversal. Parallel, deterministic |
-| **HLOD** | Turns a whole area (buildings, props, terrain pieces) into one distant proxy with one atlas | Camera-sampled hidden-surface removal, small parts kept whole, merge, then reduction or voxel remesh, unwrap, and a bake from the visible source only |
+| **HLOD** | Turns a whole area (buildings, props, terrain pieces) into one distant proxy with one atlas, or a whole level into a tree of nested cells | Camera-sampled hidden-surface removal, small parts kept whole, merge, then reduction or voxel remesh, unwrap, and a bake from the visible source only. Loose-octree cells, each parent built from its children, switch distances per node and a selection that covers every instance exactly once |
 | **Aggregation** | Merges many objects into one draw call | Material classes, island repacking by texel density, texel copy |
 | **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds, which also export as 3D Gaussian splats (`.ply`). Reference WGSL included |
 | **Visibility & occluders** | Removes what can't be seen and builds occlusion geometry | Camera-sampled ID renders (alpha-aware through your engine), plus conservative self-tuning occluder meshes and boxes |
@@ -127,6 +127,7 @@ farthing bones character.glb -o char_lod.glb --ratio 0.5 --influences 2
 farthing quad-reduce character.obj -o character_lod.obj --ratio 0.25
 farthing clusters model.glb -o dag.json                     # Nanite-style cluster DAG
 farthing hlod block.glb -o far.glb --triangles 2000 --hemisphere   # distant proxy of an area
+farthing hlod level.glb -o hlod/ --cells 64 --hemisphere     # nested HLOD cells + hlod.json
 farthing splats tree.glb -o tree.ply --count 20000         # foliage as Gaussian splats
 ```
 
@@ -481,6 +482,37 @@ let hlod = build_hlod(&mut engine, &scene, &HlodOptions {
 Set `bake: None` to get the unwrapped mesh and bake in your engine, and `visibility: None` to
 keep everything. Use `CameraSet::Hemisphere` for things standing on the ground, so their
 undersides go too.
+
+**Nested cells.** `build_hlod_tree` partitions a whole level and builds a tree of proxies, as
+world-partition HLOD layers do. Every instance goes to one cell of a loose octree (or a
+quadtree over XZ) by the centre of its bounds. Instances too large for a cell go up to the first
+level whose cells fit them. Each leaf cell gets a proxy of its instances, and each parent gets
+a proxy of its children's proxies (or of the source, with `ParentSource::Source`). Cells double
+in size per level, and so does the error budget. Every node gets the same triangle budget, at
+most half its input, so each level is coarser than the one below. Hidden-surface removal for a
+node sees everything it replaces at once.
+
+```rust
+use farthing::cluster::LodView;
+use farthing::hlod::{build_hlod_tree, HlodOptions, HlodTreeOptions};
+
+let tree = build_hlod_tree(&mut engine, &scene, &HlodTreeOptions {
+    cell_size: 64.0,                      // leaf cells; level l is 64 × 2^l
+    proxy: HlodOptions { target_triangles: Some(2000), ..Default::default() },
+    ..Default::default()
+})?;
+// Per node: bounds, the instances it replaces, its proxy (mesh + bake + engine material),
+// and an error in world units: draw it beyond node.switch_distance(pixels_per_radian, 1.0).
+let cut = tree.select(&LodView { eye, pixels_per_radian, threshold: 1.0 });
+// cut.nodes: proxies to draw. cut.instances: originals to draw. Each instance exactly once.
+```
+
+A node's error uses the same convention as cluster LOD, and counts one atlas texel as error
+too, so a proxy never shows while its texels are bigger than the pixel threshold. Built from
+children, errors add up level by level. `build_hlod_tree_with` hands each node to a callback as
+soon as the builder no longer needs it, so an exporter can write proxies out and free them as it
+goes. The CLI's `--cells` writes one glTF per node and an `hlod.json` manifest with each node's
+bounds, instances, error and switch distance.
 
 ### Visibility
 

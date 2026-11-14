@@ -21,7 +21,8 @@
 //! * [`bake`] — material casting from a source to a target surface through the host.
 //! * [`aggregate`] — many meshes and materials into one mesh with one atlas.
 //! * [`cluster`] — Nanite-style cluster DAGs for per-cluster LOD selection at run time.
-//! * [`hlod`] — many objects into one distant proxy: hidden-surface removal, merge, reduce, bake.
+//! * [`hlod`] — many objects into one distant proxy: hidden-surface removal, merge, reduce, bake;
+//!   or a whole level into a tree of nested cells with per-node switch distances.
 //! * [`voxel`] — voxel remeshing (watertight proxies) and conservative occluders.
 //! * [`visibility`] — camera-sampled visibility culling and texel budgets.
 //! * [`impostor`] — octahedral, flipbook, single-view and billboard-cloud impostors.
