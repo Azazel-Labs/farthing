@@ -92,7 +92,7 @@ and marches depth for parallax.
 | **Cluster LOD** | Nanite-style cluster DAGs for per-cluster LOD on the GPU, crack-free for any camera | Meshlets (128 triangles, 255 vertices) grouped by shared border, each group reduced to half with its border locked, levels down to one root. Errors and bounds grow monotonically, so the select test runs per cluster with no traversal. Parallel, deterministic |
 | **HLOD** | Turns a whole area (buildings, props, terrain pieces) into one distant proxy with one atlas, or a whole level into a tree of nested cells | Camera-sampled hidden-surface removal, small parts kept whole, merge, then reduction or voxel remesh, unwrap, and a bake from the visible source only. Loose-octree cells, each parent built from its children, switch distances per node and a selection that covers every instance exactly once |
 | **Aggregation** | Merges many objects into one draw call | Material classes, island repacking by texel density, texel copy |
-| **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds, which also export as 3D Gaussian splats (`.ply`). Reference WGSL included |
+| **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds, which also export as 3D Gaussian splats (`.ply`) shaped to the surface each one stands for. Reference WGSL included |
 | **Visibility & occluders** | Removes what can't be seen and builds occlusion geometry | Camera-sampled ID renders (alpha-aware through your engine), plus conservative self-tuning occluder meshes and boxes |
 | **Bones** | Fewer joints and influences for far LODs | Leaf-first removal by skinned error, influence limiting |
 | **I/O** | glTF/GLB (skins, morphs, embedded textures) and OBJ | Optional `io` feature |
@@ -128,7 +128,7 @@ farthing quad-reduce character.obj -o character_lod.obj --ratio 0.25
 farthing clusters model.glb -o dag.json                     # Nanite-style cluster DAG
 farthing hlod block.glb -o far.glb --triangles 2000 --hemisphere   # distant proxy of an area
 farthing hlod level.glb -o hlod/ --cells 64 --hemisphere     # nested HLOD cells + hlod.json
-farthing splats tree.glb -o tree.ply --count 20000         # foliage as Gaussian splats
+farthing splats tree.glb -o tree.ply --count 20000         # foliage as Gaussian splats (--round: old fixed discs)
 ```
 
 **As a library:**
@@ -417,9 +417,13 @@ Other kinds of impostor:
 - `ImpostorKind::SingleView`, one view from a fixed direction.
 - `build_layered_impostor`, which captures a second depth layer for concave props.
 - `billboard_cloud` and `progressive_surfel_cloud`, for shapes one card can't hold.
-- `impostor::splats`, which turns a surfel cloud into flat 3D Gaussians and writes the standard
-  3D Gaussian Splatting `.ply`, for foliage in any splat renderer. Colours come from your
-  engine, evaluated at each surfel's source point.
+- `impostor::splats`, which turns a surfel cloud into 3D Gaussians and writes the standard
+  3D Gaussian Splatting `.ply`, for foliage in any splat renderer. With footprints from
+  `impostor::footprint`, each splat takes the shape of the patch of surface its surfel stands
+  for: stretched along leaf strips, as opaque as the patch is covered (so coarse levels of
+  sparse foliage stay see-through), and thicker and rougher where the normals spread.
+  Colours come from your engine, evaluated at each surfel's source point or averaged over its
+  patch (`average_surfel_channel`).
 
 The reference shader is
 [`shaders/octahedral_impostor.wgsl`](crates/farthing/shaders/octahedral_impostor.wgsl).

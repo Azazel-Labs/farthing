@@ -16,12 +16,18 @@
 //! in for continuous LOD with no popping. [`SurfelCloud::encode`] writes a compact stream in
 //! that order (quantized positions and normals, optional host attributes), so any prefix of the
 //! bytes decodes to a coarser cloud: stream from the start and refine as data arrives.
+//!
+//! A surfel's point attributes describe one spot; for coarse levels (and splats) the patch of
+//! surface it stands for matters more. [`SurfelCloud::footprints`] measures each patch's
+//! anisotropic shape, coverage and normal spread (see [`footprint`](super::footprint)), and
+//! [`SurfelCloud::encode_with_footprints`] streams them in 6 more bytes per surfel.
 
 use glam::{Vec2, Vec3};
 
 /// Reference WGSL for drawing a [`SurfelCloud`] as oriented splats with the dithered fade of
 /// [`SurfelCloud::lod`], writing a G-buffer (albedo, normal). Engines adapt it.
 pub const SURFEL_SHADER: &str = include_str!("../../shaders/surfel_splat.wgsl");
+use super::footprint::{surfel_footprints, tangent_basis, FootprintOptions, SurfelFootprint};
 use crate::{Error, Mesh, Result};
 use serde::{Deserialize, Serialize};
 
@@ -368,6 +374,25 @@ impl SurfelCloud {
             if frac > 0.0 { frac } else { 1.0 },
         )
     }
+
+    /// Footprints of the first `k` surfels (see [`surfel_footprints`]): each patch is measured
+    /// against the prefix only, so a coarser prefix gets larger, possibly sparser footprints,
+    /// with the prefix's radius scale √(count ⁄ k) bounding the sample distance.
+    pub fn footprints(
+        &self,
+        mesh: &Mesh,
+        k: usize,
+        opts: &FootprintOptions,
+    ) -> Result<Vec<SurfelFootprint>> {
+        let n = self.surfels.len();
+        let k = k.clamp(1, n.max(1)).min(n);
+        surfel_footprints(
+            mesh,
+            &self.surfels[..k],
+            (n.max(1) as f32 / k.max(1) as f32).sqrt(),
+            opts,
+        )
+    }
 }
 
 /// A per-surfel attribute the host evaluated at each surfel's source point (albedo,
@@ -386,17 +411,40 @@ pub struct DecodedSurfels {
     /// The surfels received so far (a prefix of the encoded cloud, so an even covering).
     pub cloud: SurfelCloud,
     pub channels: Vec<SurfelChannel>,
+    /// Footprints, when the stream carries them
+    /// ([`encode_with_footprints`](SurfelCloud::encode_with_footprints)). Each one's centre
+    /// and normal are its surfel's decoded position and normal.
+    pub footprints: Option<Vec<SurfelFootprint>>,
     /// Surfel count of the whole stream.
     pub total: usize,
 }
 
 const MAGIC: &[u8; 4] = b"LFSF";
-const VERSION: u16 = 1;
+/// Version 2 added [`FLAG_FOOTPRINT`]. Version 1 streams still decode.
+const VERSION: u16 = 2;
 /// Flag: records carry source triangle and barycentrics.
 const FLAG_SOURCE: u16 = 1;
 /// Flag: records carry a per-surfel radius scale (u8, log2 steps of 1/16 relative to the
 /// cloud's base radius, covering ×1/16 to ×16).
 const FLAG_RADII: u16 = 2;
+/// Flag (version 2): records carry a footprint, [`FOOTPRINT_BYTES`] bytes: the major axis's
+/// angle from [`tangent_basis`]'s `t` (u8, π ⁄ 256 steps), σx and σy (u8 each, log2 steps of
+/// 1/16 relative to the base radius, ×1/256 to ×256), thickness ⁄ σx (u8, square-root coded),
+/// coverage and normal spread (unorm8). The record's position and normal are then the
+/// footprint's centre and mean normal.
+const FLAG_FOOTPRINT: u16 = 4;
+/// Bytes a footprint adds to each record.
+pub const FOOTPRINT_BYTES: usize = 6;
+
+fn encode_sigma(s: f32) -> u8 {
+    ((s.max(1e-30).log2() + 8.0) * 16.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+fn decode_sigma(q: u8) -> f32 {
+    (q as f32 / 16.0 - 8.0).exp2()
+}
 
 fn encode_scale(s: f32) -> u8 {
     ((s.max(1e-6).log2() + 4.0) * 16.0)
@@ -435,6 +483,38 @@ impl SurfelCloud {
     /// the area and count ([`radius_for`](Self::radius_for)). 10 bytes per surfel without
     /// source references, radii or channels.
     pub fn encode(&self, channels: &[SurfelChannel], with_source: bool) -> Result<Vec<u8>> {
+        self.encode_impl(channels, with_source, None)
+    }
+
+    /// [`encode`](Self::encode) with a footprint per surfel (from [`surfel_footprints`] or
+    /// [`footprints`](Self::footprints)), [`FOOTPRINT_BYTES`] more per record. The record
+    /// stores the footprint's centre and mean normal in place of the surfel's point and point
+    /// normal (the source triangle and barycentrics, if kept, still name the surfel's point).
+    /// Footprints measured for the whole cloud describe the whole cloud: a decoded prefix can
+    /// grow their sigmas by its radius scale, as it does the radii, or the host can measure
+    /// the prefix itself with [`footprints`](Self::footprints).
+    pub fn encode_with_footprints(
+        &self,
+        channels: &[SurfelChannel],
+        with_source: bool,
+        footprints: &[SurfelFootprint],
+    ) -> Result<Vec<u8>> {
+        if footprints.len() != self.surfels.len() {
+            return Err(Error::InvalidInput(format!(
+                "{} footprints for {} surfels",
+                footprints.len(),
+                self.surfels.len()
+            )));
+        }
+        self.encode_impl(channels, with_source, Some(footprints))
+    }
+
+    fn encode_impl(
+        &self,
+        channels: &[SurfelChannel],
+        with_source: bool,
+        footprints: Option<&[SurfelFootprint]>,
+    ) -> Result<Vec<u8>> {
         let n = self.surfels.len();
         for c in channels {
             if c.data.len() != n * c.components as usize || c.name.len() > 255 {
@@ -444,9 +524,10 @@ impl SurfelCloud {
                 )));
             }
         }
-        let (lo, hi) = self.surfels.iter().fold(
+        let pos = |i: usize| footprints.map_or(self.surfels[i].position, |f| f[i].center);
+        let (lo, hi) = (0..n).fold(
             (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
-            |(lo, hi), s| (lo.min(s.position), hi.max(s.position)),
+            |(lo, hi), i| (lo.min(pos(i)), hi.max(pos(i))),
         );
         let (lo, hi) = if n == 0 {
             (Vec3::ZERO, Vec3::ZERO)
@@ -455,10 +536,22 @@ impl SurfelCloud {
         };
         let radii = self.has_varying_radii();
         let base = self.radius_for(n as f32);
-        let mut out = Vec::with_capacity(64 + n * (Self::record_size(channels, with_source) + 1));
+        let extra = 1 + if footprints.is_some() {
+            FOOTPRINT_BYTES
+        } else {
+            0
+        };
+        let mut out =
+            Vec::with_capacity(64 + n * (Self::record_size(channels, with_source) + extra));
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
-        let flags = if with_source { FLAG_SOURCE } else { 0 } | if radii { FLAG_RADII } else { 0 };
+        let flags = if with_source { FLAG_SOURCE } else { 0 }
+            | if radii { FLAG_RADII } else { 0 }
+            | if footprints.is_some() {
+                FLAG_FOOTPRINT
+            } else {
+                0
+            };
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&(n as u32).to_le_bytes());
         for f in [self.area, self.coverage, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z] {
@@ -473,13 +566,15 @@ impl SurfelCloud {
         let ext = (hi - lo).max(Vec3::splat(1e-30));
         let q16 = |x: f32| (x.clamp(0.0, 1.0) * 65535.0).round() as u16;
         for (i, s) in self.surfels.iter().enumerate() {
-            let p = (s.position - lo) / ext;
+            let fp = footprints.map(|f| &f[i]);
+            let p = (pos(i) - lo) / ext;
             for v in [p.x, p.y, p.z] {
                 out.extend_from_slice(&q16(v).to_le_bytes());
             }
-            let o = crate::impostor::oct_encode(s.normal);
-            out.extend_from_slice(&q16(o.x).to_le_bytes());
-            out.extend_from_slice(&q16(o.y).to_le_bytes());
+            let o = crate::impostor::oct_encode(fp.map_or(s.normal, |f| f.normal));
+            let (ox, oy) = (q16(o.x), q16(o.y));
+            out.extend_from_slice(&ox.to_le_bytes());
+            out.extend_from_slice(&oy.to_le_bytes());
             if with_source {
                 out.extend_from_slice(&s.triangle.to_le_bytes());
                 out.extend_from_slice(&q16(s.barycentrics.y).to_le_bytes());
@@ -487,6 +582,23 @@ impl SurfelCloud {
             }
             if radii {
                 out.push(encode_scale(s.radius / base));
+            }
+            if let Some(f) = fp {
+                // Angle from the basis the decoder rebuilds from the quantized normal.
+                let nq = crate::impostor::oct_decode(Vec2::new(
+                    ox as f32 / 65535.0,
+                    oy as f32 / 65535.0,
+                ));
+                let (t0, b0) = tangent_basis(nq);
+                let a = f.tangent.dot(b0).atan2(f.tangent.dot(t0));
+                let a = a.rem_euclid(std::f32::consts::PI) / std::f32::consts::PI;
+                out.push(((a * 256.0).round() as u32 % 256) as u8);
+                out.push(encode_sigma(f.sigma.x / base));
+                out.push(encode_sigma(f.sigma.y / base));
+                let t = (f.thickness / f.sigma.x.max(1e-30)).clamp(0.0, 1.0);
+                out.push((t.sqrt() * 255.0).round() as u8);
+                out.push((f.coverage.clamp(0.0, 1.0) * 255.0).round() as u8);
+                out.push((f.normal_spread.clamp(0.0, 1.0) * 255.0).round() as u8);
             }
             for c in channels {
                 let k = c.components as usize;
@@ -515,12 +627,13 @@ impl SurfelCloud {
         }
         let u16le = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
         let version = u16le(take(2)?);
-        if version != VERSION {
+        if !(1..=VERSION).contains(&version) {
             return Err(bad(&format!("unsupported version {version}")));
         }
         let flags = u16le(take(2)?);
         let with_source = flags & FLAG_SOURCE != 0;
         let radii = flags & FLAG_RADII != 0;
+        let with_fp = version >= 2 && flags & FLAG_FOOTPRINT != 0;
         let total = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
         let mut f = [0f32; 8];
         for v in &mut f {
@@ -540,12 +653,16 @@ impl SurfelCloud {
                 data: Vec::new(),
             });
         }
-        let rec = Self::record_size(&channels, with_source) + radii as usize;
+        let rec = Self::record_size(&channels, with_source)
+            + radii as usize
+            + if with_fp { FOOTPRINT_BYTES } else { 0 };
         let n = ((bytes.len() - at) / rec).min(total);
         let ext = hi - lo;
         let d16 = |b: &[u8]| u16le(b) as f32 / 65535.0;
         let mut surfels = Vec::with_capacity(n);
-        let radius = (area / (total.max(1) as f32 * std::f32::consts::PI)).sqrt() * coverage;
+        let mut footprints = Vec::with_capacity(if with_fp { n } else { 0 });
+        let base = (area / (total.max(1) as f32 * std::f32::consts::PI)).sqrt() * coverage;
+        let radius = base;
         for i in 0..n {
             let r = &bytes[at + i * rec..at + (i + 1) * rec];
             let position = lo + Vec3::new(d16(&r[0..2]), d16(&r[2..4]), d16(&r[4..6])) * ext;
@@ -565,6 +682,26 @@ impl SurfelCloud {
             } else {
                 radius
             };
+            if with_fp {
+                let b = &r[o..o + FOOTPRINT_BYTES];
+                o += FOOTPRINT_BYTES;
+                let (t0, b0) = tangent_basis(normal);
+                let a = b[0] as f32 / 256.0 * std::f32::consts::PI;
+                let sigma = Vec2::new(decode_sigma(b[1]), decode_sigma(b[2])) * base;
+                let t = b[3] as f32 / 255.0;
+                let (coverage, spread) = (b[4] as f32 / 255.0, b[5] as f32 / 255.0);
+                footprints.push(SurfelFootprint {
+                    center: position,
+                    normal,
+                    tangent: (t0 * a.cos() + b0 * a.sin()).normalize(),
+                    sigma,
+                    thickness: sigma.x * t * t,
+                    normal_spread: spread,
+                    coverage,
+                    area: coverage * 4.0 * std::f32::consts::PI * sigma.x * sigma.y
+                        / (1.0 - spread).max(1e-3),
+                });
+            }
             for c in &mut channels {
                 let k = c.components as usize;
                 c.data.extend_from_slice(&r[o..o + k]);
@@ -585,6 +722,7 @@ impl SurfelCloud {
                 coverage,
             },
             channels,
+            footprints: with_fp.then_some(footprints),
             total,
         })
     }
@@ -897,6 +1035,68 @@ mod tests {
         assert_eq!(part.channels[0].data, albedo.data[..37 * 3].to_vec());
         assert!(SurfelCloud::decode(&bytes[..10]).is_err());
         assert!(SurfelCloud::decode(b"nope, not surfels").is_err());
+        assert!(d.footprints.is_none());
+        // A version-1 stream (same layout without footprints) still decodes.
+        let mut v1 = bytes.clone();
+        v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(SurfelCloud::decode(&v1).unwrap(), d);
+        let mut v3 = bytes.clone();
+        v3[4..6].copy_from_slice(&3u16.to_le_bytes());
+        assert!(SurfelCloud::decode(&v3).is_err());
+    }
+
+    #[test]
+    fn footprint_stream_round_trips() {
+        let m = plane(8);
+        let cloud = progressive_surfel_cloud(
+            &m,
+            &SurfelOptions {
+                count: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut fp = cloud
+            .footprints(&m, 200, &FootprintOptions::default())
+            .unwrap();
+        // Vary the shapes beyond what a flat plane gives.
+        for (i, f) in fp.iter_mut().enumerate() {
+            let a = i as f32 * 0.37;
+            let (t, b) = tangent_basis(f.normal);
+            f.tangent = t * a.cos() + b * a.sin();
+            f.sigma.y = f.sigma.x / (1.0 + (i % 7) as f32);
+            f.thickness = f.sigma.y * 0.1 * (i % 3) as f32;
+            f.coverage = (i % 11) as f32 / 10.0;
+            f.normal_spread = (i % 5) as f32 * 0.05;
+        }
+        let bytes = cloud.encode_with_footprints(&[], false, &fp).unwrap();
+        assert_eq!(bytes.len(), 45 + 200 * (10 + FOOTPRINT_BYTES));
+        let d = SurfelCloud::decode(&bytes).unwrap();
+        let df = d.footprints.as_ref().unwrap();
+        assert_eq!(df.len(), 200);
+        for ((a, b), s) in fp.iter().zip(df).zip(&d.cloud.surfels) {
+            assert!((a.center - b.center).length() < 2e-5);
+            assert_eq!(b.center, s.position);
+            assert!(a.normal.dot(b.normal) > 0.9999);
+            // Same major axis up to sign, within the angle step.
+            assert!(a.tangent.dot(b.tangent).abs() > (std::f32::consts::PI / 256.0).cos() - 1e-4);
+            for (x, y) in [(a.sigma.x, b.sigma.x), (a.sigma.y, b.sigma.y)] {
+                assert!((y / x - 1.0).abs() < 0.023, "{x} {y}");
+            }
+            assert!((a.thickness - b.thickness).abs() < 0.02 * a.sigma.x);
+            assert!((a.coverage - b.coverage).abs() <= 0.5 / 255.0 + 1e-6);
+            assert!((a.normal_spread - b.normal_spread).abs() <= 0.5 / 255.0 + 1e-6);
+        }
+        // Prefixes decode with their footprints.
+        let part = SurfelCloud::decode(&bytes[..45 + 50 * 16 + 3]).unwrap();
+        assert_eq!(part.footprints.unwrap().len(), 50);
+        // A footprint stream claimed as version 1 ignores the flag: it is not a v1 layout,
+        // but must not panic.
+        let mut v1 = bytes.clone();
+        v1[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let old = SurfelCloud::decode(&v1).unwrap();
+        assert!(old.footprints.is_none());
+        assert!(cloud.encode_with_footprints(&[], false, &fp[..5]).is_err());
     }
 
     #[test]
