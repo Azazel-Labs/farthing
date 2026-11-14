@@ -12,8 +12,9 @@
 use crate::modes::Extra;
 use farthing::bake::{bake_with_host, compute_tangents, BakeOptions};
 use farthing::host::{
-    channels, BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, MaterialClass,
-    MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages, ViewRenderRequest,
+    channels, BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, IdImage,
+    IdRenderRequest, MaterialClass, MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages,
+    ViewRenderRequest,
 };
 use farthing::image::{linear_to_srgb, Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
@@ -93,6 +94,8 @@ pub struct LodOptions {
     pub splat_count: usize,
     /// Splats: shape each Gaussian from its surface patch (footprints) instead of a round disc.
     pub splat_footprints: bool,
+    /// HLOD: render visibility (triangle IDs) on the GPU when WebGL2 is available.
+    pub gpu_visibility: bool,
 }
 
 impl Default for LodOptions {
@@ -118,6 +121,7 @@ impl Default for LodOptions {
             hlod_bake: true,
             splat_count: 20_000,
             splat_footprints: true,
+            gpu_visibility: true,
         }
     }
 }
@@ -486,7 +490,7 @@ impl Demo {
             m
         };
         let mut geo_error = 0.0;
-        let mut host = MaterialHost::new(&self.materials);
+        let mut host = MaterialHost::new(&self.materials, false);
         for level in bake_from..=levels {
             let t0 = now();
             emit(Event::Stage(&format!("LOD{level}: reducing")));
@@ -684,6 +688,21 @@ pub(crate) fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
 pub(crate) struct MaterialHost<'a> {
     materials: &'a [GltfMaterial],
     baked: Vec<BakedMaterial>,
+    /// Try triangle-ID renders on the GPU (WebGL2) before the CPU ray caster.
+    gpu: bool,
+    /// What the visibility renders cost so far.
+    pub(crate) visibility: VisibilityStats,
+}
+
+/// Triangle-ID renders (HLOD visibility) a [`MaterialHost`] served, and where.
+#[derive(Default)]
+pub(crate) struct VisibilityStats {
+    /// Renders done on the GPU, and on the CPU.
+    pub(crate) gpu_calls: u32,
+    pub(crate) cpu_calls: u32,
+    /// Views rendered, and the wall time spent rendering them.
+    pub(crate) views: u32,
+    pub(crate) ms: f64,
 }
 
 /// A material made from a bake: base color (sRGB), tangent-space normal and glTF ORM, all in
@@ -702,10 +721,13 @@ struct Shaded {
 }
 
 impl<'a> MaterialHost<'a> {
-    pub(crate) fn new(materials: &'a [GltfMaterial]) -> MaterialHost<'a> {
+    /// `gpu`: render visibility on the GPU when one is available.
+    pub(crate) fn new(materials: &'a [GltfMaterial], gpu: bool) -> MaterialHost<'a> {
         MaterialHost {
             materials,
             baked: Vec::new(),
+            gpu,
+            visibility: VisibilityStats::default(),
         }
     }
 
@@ -833,6 +855,34 @@ impl RenderHost for MaterialHost<'_> {
 
     fn render_views(&mut self, _req: &ViewRenderRequest) -> farthing::Result<Vec<ViewImages>> {
         Err(Error::Unsupported("render_views"))
+    }
+
+    fn render_ids(&mut self, req: &IdRenderRequest) -> farthing::Result<Vec<IdImage>> {
+        let t0 = crate::gpu::now_ms();
+        let infos: Vec<MaterialInfo> = req
+            .scene
+            .materials
+            .iter()
+            .map(|m| self.material_info(m.id))
+            .collect();
+        let gpu = self
+            .gpu
+            .then(|| crate::gpu::render_ids(req, &infos))
+            .flatten();
+        let v = &mut self.visibility;
+        let images = match gpu {
+            Some(images) => {
+                v.gpu_calls += 1;
+                images
+            }
+            None => {
+                v.cpu_calls += 1;
+                farthing::raster::cpu_render_ids(req.scene, &req.views, &infos)
+            }
+        };
+        v.views += req.views.len() as u32;
+        v.ms += crate::gpu::now_ms() - t0;
+        Ok(images)
     }
 
     fn create_material(&mut self, desc: &BakedMaterialDesc) -> farthing::Result<MaterialId> {

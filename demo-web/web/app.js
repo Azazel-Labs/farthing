@@ -941,6 +941,7 @@ function buildHlod(info, proxies) {
         ["Proxy tris by level", info.level_triangles.map((n, l) => `L${l}:${fmtInt(n)}`).join(" ")],
         ["Leaf cell", `${info.cell_size.toPrecision(3)} wide, ${info.copies} ${info.copies === 1 ? "copy" : "copies"}`],
         ["Proxies", info.baked ? `baked 256², ${fmtBytes(proxyBytes)} of GLB` : `geometry only, ${fmtBytes(proxyBytes)}`],
+        ["Visibility", visibilityText(info.visibility)],
         ["Built in", `${(info.ms / 1000).toFixed(2)} s`],
       );
       return rows;
@@ -950,6 +951,13 @@ function buildHlod(info, proxies) {
       if (levels[0] && original) levels[0].object = original.object;
     },
   };
+}
+
+/** Where HLOD's visibility renders ran and what they cost. */
+function visibilityText(v) {
+  if (!v || !v.views) return "—";
+  const where = v.gpu_renders && !v.cpu_renders ? `GPU (${v.gpu})` : v.gpu_renders ? `GPU ${v.gpu_renders}, CPU ${v.cpu_renders}` : "CPU";
+  return `${where}: ${fmtInt(v.views)} views in ${(v.ms / 1000).toFixed(2)} s`;
 }
 
 /** The bake panel in HLOD mode: the root proxy's baked textures. */
@@ -1578,6 +1586,7 @@ function readOptions() {
     hlod_split: +f.hlod_split.value,
     hlod_triangles: +f.hlod_triangles.value,
     hlod_bake: f.hlod_bake.checked,
+    gpu_visibility: f.gpu_visibility.checked,
     splat_count: +f.splat_count.value,
     splat_footprints: f.splat_footprints.checked,
   };

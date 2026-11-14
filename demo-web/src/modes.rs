@@ -642,7 +642,7 @@ pub(crate) fn run_hlod(
         parallel_cells: 1,
         ..Default::default()
     };
-    let mut host = MaterialHost::new(&demo.materials);
+    let mut host = MaterialHost::new(&demo.materials, opts.gpu_visibility);
     let mut built = 0usize;
     emit(Event::Stage(&format!(
         "HLOD: building {} instances",
@@ -722,6 +722,13 @@ pub(crate) fn run_hlod(
         "joint_nodes": demo.scene.skeletons.iter().map(|s| s.joints.len()).sum::<usize>(),
         "baked": opts.hlod_bake,
         "ms": now() - t0,
+        "visibility": {
+            "gpu": crate::gpu::gpu_name().filter(|_| host.visibility.gpu_calls > 0),
+            "gpu_renders": host.visibility.gpu_calls,
+            "cpu_renders": host.visibility.cpu_calls,
+            "views": host.visibility.views,
+            "ms": host.visibility.ms,
+        },
         "reference_ppr": ppr,
     })
     .to_string();

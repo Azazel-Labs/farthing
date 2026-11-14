@@ -807,15 +807,6 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
                             .map(|k| (c.uv[&(f, k)] - c.min) * density + Vec2::splat(pad as f32))
                     })
                     .collect();
-                // A chart of zero-area triangles rasterizes to nothing, which snugly 0.1 can't
-                // place (it panics); reserve its frame as a rectangle instead.
-                let area: f32 = tris
-                    .iter()
-                    .map(|t| (t[1] - t[0]).perp_dot(t[2] - t[0]).abs())
-                    .sum();
-                if area < 1e-3 {
-                    return ChartMask::rect(w, h);
-                }
                 ChartMask::from_triangles(&tris, w, h, pad)
             })
             .collect();

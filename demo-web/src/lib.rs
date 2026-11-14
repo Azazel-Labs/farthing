@@ -2,6 +2,7 @@
 //! chain build and bake, all in WebAssembly. The pipeline itself is in [`pipeline`] and runs
 //! natively too; this file only adapts it to JavaScript.
 
+mod gpu;
 pub mod modes;
 pub mod pipeline;
 
