@@ -6,7 +6,35 @@ use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
 use farthing::{Mesh, Scene};
 use farthing_demo_web::pipeline::{Demo, Event, LodOptions};
 use glam::{Vec2, Vec3, Vec4};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+/// Counts live and peak heap bytes, so the sample test can hold the pipeline to the wasm32
+/// address space: natively a 64-bit runner with 16 GB happily ran a 7 GB peak that trapped
+/// ("unreachable") in the browser.
+struct Counting;
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            PEAK.fetch_max(LIVE.fetch_add(l.size(), Relaxed) + l.size(), Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
+        LIVE.fetch_sub(l.size(), Relaxed);
+    }
+}
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// Peak heap a sample may reach: wasm32 linear memory stops at 4 GiB, and a growing `Vec`
+/// briefly needs its old and new buffers, so leave a quarter for that and fragmentation.
+const WASM_HEAP_BUDGET: usize = 3 << 30;
 
 fn textured_sphere() -> Vec<u8> {
     let (seg, rings) = (48u32, 24u32);
@@ -166,6 +194,7 @@ fn samples_reduce_and_bake() {
         let file = sample["file"].as_str().unwrap();
         let t0 = std::time::Instant::now();
         let bytes = std::fs::read(dir.join(file)).unwrap();
+        PEAK.store(LIVE.load(Relaxed), Relaxed);
         let mut demo =
             Demo::load(vec![(file.into(), bytes)]).unwrap_or_else(|e| panic!("{file}: {e}"));
         let info = demo.info();
@@ -188,12 +217,25 @@ fn samples_reduce_and_bake() {
         }
         let baked = &levels[opts.bake_from];
         assert!(baked.coverage.unwrap() > 0.2, "{file}: {baked:?}");
+        // What the page calls: the original for the viewer, then each level's download.
+        demo.original_glb()
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        for l in 1..=opts.levels {
+            demo.level_glb(l).unwrap_or_else(|e| panic!("{file}: {e}"));
+        }
+        let peak = PEAK.load(Relaxed);
         eprintln!(
-            "{file}: {} tris, LOD{} {} tris, {:.1}s",
+            "{file}: {} tris, LOD{} {} tris, {:.1}s, peak heap {} MB",
             info.triangles,
             opts.levels,
             levels[opts.levels].triangles,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            peak >> 20
+        );
+        assert!(
+            peak < WASM_HEAP_BUDGET,
+            "{file}: peak heap {} MB would not fit wasm32",
+            peak >> 20
         );
     }
 }

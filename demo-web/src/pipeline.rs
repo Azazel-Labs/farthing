@@ -152,10 +152,12 @@ pub enum Event<'a> {
 pub struct Demo {
     pub name: String,
     pub scene: Scene,
+    /// The decoded textures live here and only here (a 2K-textured asset is over a gigabyte
+    /// of float texels; a copy per level ran wasm out of memory). Export borrows them, see
+    /// [`with_original_textures`].
     pub materials: Vec<GltfMaterial>,
-    textures: ExportTextures,
-    /// Results of the last run, by level (0 = original).
-    levels: Vec<(Scene, ExportTextures)>,
+    /// Results of the last run, by level (0 = original). `None`: the original materials.
+    levels: Vec<(Scene, Option<ExportTextures>)>,
 }
 
 impl Demo {
@@ -215,7 +217,6 @@ impl Demo {
         if scene.triangle_count() == 0 {
             return Err(format!("{main_name} has no triangles"));
         }
-        let textures = original_textures(&materials);
         let name = main_name
             .rsplit('/')
             .next()
@@ -223,10 +224,9 @@ impl Demo {
             .to_owned();
         Ok(Demo {
             name,
-            levels: vec![(scene.clone(), textures.clone())],
+            levels: vec![(scene.clone(), None)],
             scene,
             materials,
-            textures,
         })
     }
 
@@ -252,17 +252,23 @@ impl Demo {
     /// The original as GLB with base color, metallic-roughness and normal textures and factors
     /// (what farthing reads of the materials), so every level is shown with the same material
     /// model.
-    pub fn original_glb(&self) -> Result<Vec<u8>, String> {
-        glb_bytes(&self.scene, &self.textures).map_err(|e| e.to_string())
+    pub fn original_glb(&mut self) -> Result<Vec<u8>, String> {
+        let scene = &self.scene;
+        with_original_textures(&mut self.materials, |t| glb_bytes(scene, t))
+            .map_err(|e| e.to_string())
     }
 
     /// A level of the last run as a self-contained GLB (for download).
-    pub fn level_glb(&self, level: usize) -> Result<Vec<u8>, String> {
+    pub fn level_glb(&mut self, level: usize) -> Result<Vec<u8>, String> {
         let (s, t) = self
             .levels
             .get(level)
             .ok_or_else(|| format!("no level {level}; run first"))?;
-        glb_bytes(s, t).map_err(|e| e.to_string())
+        match t {
+            Some(t) => glb_bytes(s, t),
+            None => with_original_textures(&mut self.materials, |t| glb_bytes(s, t)),
+        }
+        .map_err(|e| e.to_string())
     }
 
     /// Builds the chain, reporting each level as it finishes. `now` returns milliseconds.
@@ -362,7 +368,7 @@ impl Demo {
                 info: &info,
                 glb: &glb,
             });
-            self.levels.push((s, self.textures.clone()));
+            self.levels.push((s, None));
         }
         if bake_from > levels {
             emit(Event::Stage("done"));
@@ -471,7 +477,7 @@ impl Demo {
                 info: &info,
                 glb: &glb,
             });
-            self.levels.push((s, tex));
+            self.levels.push((s, Some(tex)));
         }
         emit(Event::Stage("done"));
         Ok(())
@@ -521,32 +527,53 @@ fn normalize(path: &str) -> String {
     parts.join("/")
 }
 
-fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
+/// Runs `f` with the materials' textures as [`ExportTextures`]. The images are moved out of
+/// `materials` and back, never copied (normal maps go to -1..1 and back in place).
+fn with_original_textures<R>(
+    materials: &mut [GltfMaterial],
+    f: impl FnOnce(&ExportTextures) -> R,
+) -> R {
+    let to_signed = |p: &mut glam::Vec4| *p = (p.truncate() * 2.0 - glam::Vec3::ONE).extend(p.w);
+    let to_unit = |p: &mut glam::Vec4| *p = ((p.truncate() + glam::Vec3::ONE) * 0.5).extend(p.w);
+    let empty = || Image::new(0, 0, glam::Vec4::ZERO);
+    let take = |img: &mut Image| std::mem::replace(img, empty());
     let mut t = ExportTextures::default();
-    for (i, m) in materials.iter().enumerate() {
+    for (i, m) in materials.iter_mut().enumerate() {
         let i = i as u32;
         t.base_color_factor.insert(i, m.base_color_factor);
-        if let Some((img, _)) = &m.base_color_texture {
-            t.base_color.insert(i, img.clone());
-        }
-        if let Some((img, _)) = &m.metallic_roughness_texture {
-            t.metallic_roughness.insert(i, img.clone());
-        }
-        if let Some((img, _, _)) = &m.normal_texture {
-            // Stored 0..1; ExportTextures wants xyz in -1..1.
-            let mut n = img.clone();
-            for p in &mut n.pixels {
-                *p = (p.truncate() * 2.0 - glam::Vec3::ONE).extend(1.0);
-            }
-            t.normal.insert(i, n);
-        }
         t.metallic_roughness_factor
             .insert(i, glam::Vec2::new(m.metallic_factor, m.roughness_factor));
         if let MaterialClass::Masked { cutoff } = m.info.class {
             t.alpha_cutoff.insert(i, cutoff);
         }
+        if let Some((img, _)) = &mut m.base_color_texture {
+            t.base_color.insert(i, take(img));
+        }
+        if let Some((img, _)) = &mut m.metallic_roughness_texture {
+            t.metallic_roughness.insert(i, take(img));
+        }
+        if let Some((img, _, _)) = &mut m.normal_texture {
+            let mut n = take(img);
+            n.pixels.iter_mut().for_each(to_signed);
+            t.normal.insert(i, n);
+        }
     }
-    t
+    let r = f(&t);
+    for (i, m) in materials.iter_mut().enumerate() {
+        let i = i as u32;
+        if let Some((img, _)) = &mut m.base_color_texture {
+            *img = t.base_color.remove(&i).unwrap_or_else(empty);
+        }
+        if let Some((img, _)) = &mut m.metallic_roughness_texture {
+            *img = t.metallic_roughness.remove(&i).unwrap_or_else(empty);
+        }
+        if let Some((img, _, _)) = &mut m.normal_texture {
+            let mut n = t.normal.remove(&i).unwrap_or_else(empty);
+            n.pixels.iter_mut().for_each(to_unit);
+            *img = n;
+        }
+    }
+    r
 }
 
 fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
