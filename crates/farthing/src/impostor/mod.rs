@@ -13,8 +13,10 @@
 //!   textured cards.
 //! * Surfel proxies ([`surfels`]): blue-noise oriented discs carrying normals, for relightable
 //!   distant LODs of foliage-like geometry. Progressive order (every prefix is an even
-//!   covering, for continuous LOD) and a compact streaming format. [`splats`] turns a cloud
-//!   into flat 3D Gaussians and writes the standard 3D Gaussian Splatting `.ply`.
+//!   covering, for continuous LOD) and a compact streaming format. [`footprint`] measures the
+//!   patch of surface each surfel stands for (anisotropic shape, coverage, mean normal and
+//!   its spread) and averages host attributes over it. [`splats`] turns a cloud into 3D
+//!   Gaussians shaped by those footprints and writes the standard 3D Gaussian Splatting `.ply`.
 //! * Layered impostors ([`build_layered_impostor`]): a second, depth-peeled layer per frame for
 //!   concave props.
 
@@ -26,6 +28,7 @@
 )]
 
 mod billboard;
+pub mod footprint;
 pub mod splats;
 pub mod surfels;
 

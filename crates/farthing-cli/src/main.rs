@@ -232,13 +232,28 @@ enum Cmd {
         frame_size: u32,
     },
     /// Foliage / distant proxy as Gaussian splats: blue-noise surfels written as a 3DGS .ply
-    /// (progressive order: any prefix is a coarser covering). Coloured from vertex colours.
+    /// (progressive order: any prefix is a coarser covering). Each splat takes the shape,
+    /// normal and coverage (opacity) of the patch of surface it stands for, coloured with the
+    /// vertex colours averaged over that patch.
     Splats {
         input: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long, default_value_t = 20000)]
         count: usize,
+        /// Write only the first N splats of the cloud (a coarser level), shaped for that level.
+        #[arg(long)]
+        prefix: Option<usize>,
+        /// Old fixed-size mode: round splats at half the surfel radius, fixed opacity, colour
+        /// from one point per surfel.
+        #[arg(long)]
+        round: bool,
+        /// Largest aspect ratio of a footprint splat.
+        #[arg(long, default_value_t = 8.0)]
+        max_aspect: f32,
+        /// Surface samples per surfel used to measure footprints.
+        #[arg(long, default_value_t = 64)]
+        samples_per_surfel: u32,
     },
     /// Fit billboard-cloud planes (geometry only) and write card quads.
     Billboard {
@@ -765,7 +780,14 @@ fn main() -> Result<()> {
             input,
             output,
             count,
+            prefix,
+            round,
+            max_aspect,
+            samples_per_surfel,
         } => {
+            use farthing::impostor::footprint::{
+                average_surfel_channel, surfel_footprints, ChannelSpec, FootprintOptions,
+            };
             use farthing::impostor::splats::{surfels_to_splats, write_splat_ply, SplatOptions};
             use farthing::impostor::surfels::{
                 progressive_surfel_cloud, SurfelChannel, SurfelOptions,
@@ -778,29 +800,84 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
             )?;
-            let color = mesh.colors.as_ref().map(|c| SurfelChannel {
-                name: "color".into(),
-                components: 4,
-                data: cloud
-                    .surfels
-                    .iter()
-                    .flat_map(|s| {
-                        let t = mesh.triangle(s.triangle as usize);
-                        let b = s.barycentrics;
-                        let v = c[t[0] as usize] * b.x
-                            + c[t[1] as usize] * b.y
-                            + c[t[2] as usize] * b.z;
-                        v.to_array()
-                            .map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u8)
-                    })
-                    .collect(),
-            });
-            let splats =
-                surfels_to_splats(&cloud.surfels, color.as_ref(), &SplatOptions::default())?;
+            let k = prefix.unwrap_or(count).clamp(1, cloud.surfels.len());
+            let surfels = &cloud.surfels[..k];
+            // Radius scale of the prefix: a coarser level covers more surface per splat.
+            let scale = (cloud.surfels.len() as f32 / k as f32).sqrt();
+            let lerp = |c: &[Vec4], tri: usize, b: glam::Vec3| {
+                let t = mesh.triangle(tri);
+                c[t[0] as usize] * b.x + c[t[1] as usize] * b.y + c[t[2] as usize] * b.z
+            };
+            let fopts = FootprintOptions {
+                samples_per_surfel,
+                max_aspect,
+                ..Default::default()
+            };
+            let (footprints, color) = if round {
+                let color = mesh.colors.as_ref().map(|c| SurfelChannel {
+                    name: "color".into(),
+                    components: 4,
+                    data: surfels
+                        .iter()
+                        .flat_map(|s| {
+                            lerp(c, s.triangle as usize, s.barycentrics)
+                                .to_array()
+                                .map(|x| (x.clamp(0.0, 1.0) * 255.0).round() as u8)
+                        })
+                        .collect(),
+                });
+                (None, color)
+            } else {
+                let fp = surfel_footprints(&mesh, surfels, scale, &fopts)?;
+                let color = match &mesh.colors {
+                    Some(c) => Some(average_surfel_channel(
+                        &mesh,
+                        surfels,
+                        scale,
+                        &fopts,
+                        &ChannelSpec {
+                            name: "color".into(),
+                            components: 4,
+                            alpha_weighted: true,
+                        },
+                        |samples, out| {
+                            for (s, o) in samples.iter().zip(out.chunks_exact_mut(4)) {
+                                o.copy_from_slice(
+                                    &lerp(c, s.triangle as usize, s.barycentrics).to_array(),
+                                );
+                            }
+                        },
+                    )?),
+                    None => None,
+                };
+                (Some(fp), color)
+            };
+            let opts = SplatOptions {
+                // Footprints are measured for the prefix; round splats grow by its scale.
+                radius_scale: if round { scale } else { 1.0 },
+                ..Default::default()
+            };
+            let splats = surfels_to_splats(surfels, footprints.as_deref(), color.as_ref(), &opts)?;
             std::fs::write(&output, write_splat_ply(&splats))?;
-            print(
-                json!({"input_triangles": mesh.triangle_count(), "splats": splats.len(), "colored": color.is_some(), "seconds": t0.elapsed().as_secs_f32()}),
-            );
+            let mean = |f: &dyn Fn(&farthing::impostor::splats::Splat) -> f32| {
+                splats.iter().map(f).sum::<f32>() / splats.len().max(1) as f32
+            };
+            let mut stats = json!({
+                "input_triangles": mesh.triangle_count(),
+                "splats": splats.len(),
+                "mode": if round { "round" } else { "footprint" },
+                "colored": color.is_some(),
+                "mean_opacity": mean(&|s| s.opacity),
+                "mean_aspect": mean(&|s| s.sigma.x / s.sigma.y.max(1e-30)),
+            });
+            if let Some(fp) = &footprints {
+                let n = fp.len().max(1) as f32;
+                stats["mean_coverage"] = json!(fp.iter().map(|f| f.coverage).sum::<f32>() / n);
+                stats["mean_normal_spread"] =
+                    json!(fp.iter().map(|f| f.normal_spread).sum::<f32>() / n);
+            }
+            stats["seconds"] = json!(t0.elapsed().as_secs_f32());
+            print(stats);
         }
         Cmd::Billboard {
             input,
