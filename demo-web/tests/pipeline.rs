@@ -120,6 +120,7 @@ fn zipped_gltf_reduces_and_bakes() {
         levels: 3,
         bake_from: 3,
         atlas: 64,
+        textures: TextureMode::Original,
         ..Default::default()
     };
     let (mut levels, mut textures, mut stages) = (vec![], vec![], 0);
@@ -273,6 +274,52 @@ fn shared_atlas_carries_the_original_materials() {
     assert!(charts[0] < charts[1], "{charts:?}");
 }
 
+#[test]
+fn recut_keeps_every_triangle_then_reduces() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let opts = LodOptions {
+        levels: 3,
+        shared_size: 512,
+        ..Default::default()
+    };
+    assert_eq!(opts.textures, TextureMode::Recut);
+    let (mut levels, mut textures) = (vec![], vec![]);
+    demo.run(&opts, &|| 0.0, &mut |e| match e {
+        Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+        Event::Texture { level, .. } => textures.push(level),
+        _ => {}
+    })
+    .unwrap();
+
+    // Original, LOD0 and three reductions, all drawn with LOD0's atlas: nothing else baked.
+    let names: Vec<String> = levels[1..]
+        .iter()
+        .map(|l| l.0.label.clone().unwrap())
+        .collect();
+    assert_eq!(names, ["LOD0", "LOD1", "LOD2", "LOD3"]);
+    assert!(levels[1..]
+        .iter()
+        .all(|l| matches!(l.0.kind, LevelKind::Shared) && l.0.shared_textures == Some(1)));
+    assert!(textures.iter().all(|&l| l == 1), "{textures:?}");
+    let lod0 = &levels[1].0;
+    assert_eq!(lod0.triangles, demo.info().triangles);
+    assert!(lod0.relative_error < 1e-5, "{lod0:?}");
+    for w in levels[1..].windows(2) {
+        let ratio = w[1].0.triangles as f32 / w[0].0.triangles as f32;
+        assert!(ratio > 0.4 && ratio < 0.6, "{:?}", w[1].0);
+    }
+    let reduced: Vec<_> = levels[..1].iter().chain(&levels[2..]).cloned().collect();
+    check_measured(&reduced, demo.info().diagonal);
+
+    // The checker survives resampling at the same density, but its hard edges blur: about
+    // 8 levels in 255 on average, and up to 100 on the edges themselves.
+    let (mean, p99) = (lod0.texture_error.unwrap(), lod0.texture_error_p99.unwrap());
+    assert!(mean > 0.0 && mean < 12.0 && p99 < 160.0, "{lod0:?}");
+    assert!(levels[2..].iter().all(|l| l.0.texture_error.is_none()));
+    assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
+    assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
+}
+
 /// Runs the chain and returns each level's info and the size of each texture it emitted.
 fn chain_levels(demo: &mut Demo, opts: &LodOptions) -> (Vec<LevelInfo>, Vec<(usize, u32, u32)>) {
     let (mut levels, mut textures) = (vec![], vec![]);
@@ -297,6 +344,7 @@ fn viewing_budget_drops_what_the_view_cannot_show() {
         levels: 3,
         bake_from: 3,
         atlas: 256,
+        textures: TextureMode::Original,
         ..Default::default()
     };
     // The unit sphere seen from 200 units at 1080p, 60°: a pixel is 0.21 units, and the
@@ -402,6 +450,7 @@ fn samples_reduce_and_bake() {
         let opts = LodOptions {
             bake_from: 3,
             atlas: 256,
+            textures: TextureMode::Original,
             ..Default::default()
         };
         let mut levels = vec![];
@@ -478,6 +527,46 @@ fn samples_reduce_and_bake() {
             assert!(info.density_scale.unwrap() > 0.0, "{file}: {info:?}");
         }
         for w in levels.windows(2) {
+            assert!(w[1].triangles < w[0].triangles, "{file}: {:?}", w[1]);
+        }
+
+        // The recut chain (the page's default), held to the same budget.
+        let t0 = std::time::Instant::now();
+        PEAK.store(LIVE.load(Relaxed), Relaxed);
+        let recut = LodOptions::default();
+        let mut levels = vec![];
+        demo.run(&recut, &|| 0.0, &mut |e| {
+            if let Event::Level { info, .. } = e {
+                levels.push(info.clone());
+            }
+        })
+        .unwrap_or_else(|e| panic!("{file}: {e}"));
+        let peak = PEAK.load(Relaxed);
+        let lod0 = &levels[1];
+        let last = levels.last().unwrap();
+        eprintln!(
+            "{file}: recut {}×{} at {:.0}% of the artist's density, {} charts, texture error mean {:.1} p99 {:.0}, {} {} tris ({:.1}%) at {:.4} relative error, {:.1}s, peak heap {} MB",
+            lod0.atlas_width.unwrap(),
+            lod0.atlas_height.unwrap(),
+            lod0.density_scale.unwrap() * 100.0,
+            lod0.charts.unwrap(),
+            lod0.texture_error.unwrap_or(0.0),
+            lod0.texture_error_p99.unwrap_or(0.0),
+            last.label.as_deref().unwrap(),
+            last.triangles,
+            100.0 * last.triangles as f32 / info.triangles as f32,
+            last.relative_error,
+            t0.elapsed().as_secs_f64(),
+            peak >> 20
+        );
+        assert!(
+            peak < WASM_HEAP_BUDGET,
+            "{file}: recut peak heap {} MB would not fit wasm32",
+            peak >> 20
+        );
+        assert_eq!(levels.len(), recut.levels + 2, "{file}");
+        assert_eq!(lod0.triangles, info.triangles, "{file}");
+        for w in levels[1..].windows(2) {
             assert!(w[1].triangles < w[0].triangles, "{file}: {:?}", w[1]);
         }
 

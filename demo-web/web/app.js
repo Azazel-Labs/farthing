@@ -15,6 +15,8 @@ const statusEl = $("#status");
 const rowsEl = $("#level-rows");
 
 const STORE_KEY = "farthing-demo-options";
+/** Saved options from before version 2 kept Original materials only as the old default: they get the recut. */
+const STORE_VERSION = 2;
 
 // ---------------------------------------------------------------- state
 
@@ -265,7 +267,7 @@ function drawTicks() {
     .slice(1)
     .map((l) => {
       const t = Math.min(distToSlider(l.distance) / 1000, 1);
-      return `<i style="--t:${t}" title="LOD${l.object.userData.level} from ${l.distance.toPrecision(3)}"></i>`;
+      return `<i style="--t:${t}" title="${esc(lodName(l.object.userData.level))} from ${l.distance.toPrecision(3)}"></i>`;
     })
     .join("");
 }
@@ -326,13 +328,16 @@ function hud(left, right = "") {
   $("#hud").innerHTML = (left ? `<span>${left}</span>` : "<i></i>") + (right ? `<span>${right}</span>` : "");
 }
 
+/** A level's name: its label (a recut's levels count from LOD0, the recut), else LODn. */
+const lodName = (level) => levels[level]?.info?.label ?? `LOD${level}`;
+
 function label(level) {
   const l = levels[level];
   if (!l?.info) return `LOD${level}`;
   const i = l.info;
   const stale = l.stale ? " (updating)" : "";
   if (i.kind === "splats") return `LOD${level} · ${fmtInt(i.vertices)} Gaussian splats${stale}`;
-  const name = i.label ? esc(i.label) : `LOD${level}`;
+  const name = esc(lodName(level));
   const more = i.hud ? ` · ${esc(i.hud)}` : "";
   return `${name} · ${KIND_TEXT[i.kind] ?? i.kind} · ${fmtInt(i.triangles)} tris${more}${stale}`;
 }
@@ -383,7 +388,7 @@ function render() {
       const next = lod.levels[i + 1];
       const dist = camera.position.distanceTo(original.center);
       if (document.activeElement !== distEl) distEl.value = String(distToSlider(dist));
-      const ahead = next ? ` · LOD${next.object.userData.level} at ${next.distance.toPrecision(3)}` : "";
+      const ahead = next ? ` · ${lodName(next.object.userData.level)} at ${next.distance.toPrecision(3)}` : "";
       hud(`Auto: ${label(cur)}`, `distance ${dist.toPrecision(3)}${ahead}`);
     } else {
       show(displayed(selected));
@@ -1334,7 +1339,7 @@ async function onWorker(m) {
       );
       const a = Object.assign(document.createElement("a"), {
         href: url,
-        download: `${(assetInfo?.name ?? "model").replace(/\.(glb|gltf|zip)$/i, "")}_LOD${m.level}.${ply ? "ply" : "glb"}`,
+        download: `${(assetInfo?.name ?? "model").replace(/\.(glb|gltf|zip)$/i, "")}_${lodName(m.level)}.${ply ? "ply" : "glb"}`,
       });
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
@@ -1461,9 +1466,11 @@ function showInfo(i) {
 function renderRows() {
   const m = shownMode || form.elements.mode.value;
   const chain = m === "chain";
-  const n = chain ? +form.elements.levels.value : MODE_LEVELS[m];
-  const bakeFrom = +form.elements.bake_from.value || Infinity;
-  const near = form.elements.textures.value === "shared" ? "shared" : "reduced";
+  // A recut chain is the original, LOD0 (the recut) and the levels reduced from it.
+  const recut = chain && form.elements.textures.value === "recut";
+  const n = chain ? +form.elements.levels.value + (recut ? 1 : 0) : MODE_LEVELS[m];
+  const bakeFrom = recut ? Infinity : +form.elements.bake_from.value || Infinity;
+  const near = form.elements.textures.value === "original" ? "reduced" : "shared";
   const total = assetInfo?.triangles ?? 0;
   const out = [];
   for (let i = 0; i <= Math.max(n, levels.length - 1); i++) {
@@ -1481,6 +1488,7 @@ function renderRows() {
           : `${info?.error?.toPrecision(3)}`,
         info?.mean_error != null ? `mean ${info.mean_error.toPrecision(3)}, RMS ${info.rms_error.toPrecision(3)}` : "",
         info?.normal_error != null ? `normals off by ${info.normal_error.toFixed(1)}° on average` : "",
+        info?.texture_error != null ? texErrorText(info) : "",
       ]
         .filter(Boolean)
         .join("\n");
@@ -1500,7 +1508,11 @@ function renderRows() {
           info.texture_bytes != null ? texCell(info) : "—",
         ]
       : ["…", "", "", "", "", "", ""];
-    const name = splats && info ? `${fmtInt(info.vertices)} splats` : (info?.label ?? (i === 0 && !chain ? "Original" : `LOD${i}`));
+    const name =
+      splats && info
+        ? `${fmtInt(info.vertices)} splats`
+        : (info?.label ?? (i === 0 && (!chain || recut) ? "Original" : `LOD${i - (recut ? 1 : 0)}`));
+    const kindText = recut && kind === "shared" ? "recut" : kind;
     const ext = kind === "splats" ? "ply" : "glb";
     const dl =
       pending || live || (i === 0 && m === "hlod")
@@ -1508,7 +1520,7 @@ function renderRows() {
         : `<button type="button" data-dl="${i}" data-fmt="${ext}" title="Download ${esc(name)} as .${ext}">.${ext}</button>`;
     out.push(
       `<tr data-level="${i}" class="${i === selected ? "selected" : ""} ${pending ? "pending" : ""}">` +
-        `<td class="label" title="${esc(info?.note ?? "")}">${esc(name)}</td><td><span class="kind ${kind}">${kind}</span></td>` +
+        `<td class="label" title="${esc(info?.note ?? "")}">${esc(name)}</td><td><span class="kind ${kind}">${kindText}</span></td>` +
         cells.map((c) => `<td class="n">${c}</td>`).join("") +
         `<td>${dl}</td></tr>`,
     );
@@ -1521,8 +1533,13 @@ function renderRows() {
 function texCell(info) {
   const bytes = fmtBytes(info.texture_bytes);
   if (info.kind !== "shared" || info.shared_textures === info.level) return bytes;
-  return `<span title="The atlas LOD${info.shared_textures} carries, not a second copy">${bytes}</span>`;
+  return `<span title="The atlas ${esc(lodName(info.shared_textures))} carries, not a second copy">${bytes}</span>`;
 }
+
+/** How far a recut's base color is from the original materials. */
+const texErrorText = (i) =>
+  `base color ${i.texture_error.toFixed(1)} levels in 255 from the original on average after resampling ` +
+  `(99th percentile ${i.texture_error_p99.toFixed(0)})`;
 
 const updateRow = () => renderRows();
 
@@ -1546,7 +1563,9 @@ function drawTextures(level) {
   if (!l) {
     $("#bake-title").textContent = "Baked textures";
     $("#bake-stats").textContent =
-      +form.elements.bake_from.value === 0 ? "No proxy levels (Bake proxy from: Never)." : "";
+      form.elements.textures.value !== "recut" && +form.elements.bake_from.value === 0
+        ? "No proxy levels (Bake proxy from: Never)."
+        : "";
     return;
   }
   for (const [ch, img] of Object.entries(l.tex)) {
@@ -1558,8 +1577,9 @@ function drawTextures(level) {
   }
   const i = l.info;
   const shared = i?.kind === "shared";
-  const what = shared ? "Shared atlas" : "Baked textures";
-  $("#bake-title").textContent = `${what} · LOD${level}${l.stale ? " (updating)" : ""}`;
+  // A recut's levels carry labels; a shared chain's do not.
+  const what = shared ? (i.label ? "Recut atlas" : "Shared atlas") : "Baked textures";
+  $("#bake-title").textContent = `${what} · ${lodName(level)}${l.stale ? " (updating)" : ""}`;
   const parts = [];
   if (shared)
     parts.push(
@@ -1571,6 +1591,7 @@ function drawTextures(level) {
       `capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit for the closest view` +
         (i.view_texels != null ? ` (${(i.view_texels * 100).toPrecision(2)}% of the artist's texels)` : ""),
     );
+  if (i?.texture_error != null) parts.push(texErrorText(i));
   if (i?.coverage != null)
     parts.push(
       `coverage ${(i.coverage * 100).toFixed(1)}%`,
@@ -1585,7 +1606,7 @@ rowsEl.addEventListener("click", (e) => {
   if (dl) {
     const level = +dl.dataset.dl;
     pendingDownload = level;
-    if (busy) setStatus(`LOD${level} download starts when the run finishes…`, "busy");
+    if (busy) setStatus(`${lodName(level)} download starts when the run finishes…`, "busy");
     worker.postMessage({ type: "download", level, format: dl.dataset.fmt });
     return;
   }
@@ -1667,8 +1688,11 @@ function readOptions() {
 function syncModeUi() {
   const m = form.elements.mode.value;
   for (const fs of form.querySelectorAll("fieldset[data-modes]")) fs.hidden = !fs.dataset.modes.split(" ").includes(m);
-  $("#shared-size").hidden = form.elements.textures.value !== "shared";
-  $("#shared-layout").hidden = form.elements.textures.value !== "shared";
+  const tex = form.elements.textures.value;
+  $("#shared-size").hidden = tex === "original";
+  $("#shared-layout").hidden = tex !== "shared";
+  // A recut bakes nothing per level.
+  for (const el of form.querySelectorAll(".baked-only")) el.hidden = tex === "recut";
   $("#mode-hint").textContent = MODE_HINTS[m] ?? "";
   syncViewHint();
 }
@@ -1721,10 +1745,11 @@ function restoreOptions() {
     saved = JSON.parse(localStorage.getItem(STORE_KEY));
   } catch {}
   if (saved) {
+    if (saved.version !== STORE_VERSION) delete saved.textures;
     const f = form.elements;
     for (const [k, v] of Object.entries(saved)) {
       const el = f[k];
-      if (!el || k === "bake_from") continue;
+      if (!el || k === "bake_from" || k === "version") continue;
       if (el.type === "checkbox") el.checked = !!v;
       else el.value = String(v);
     }
@@ -1738,7 +1763,7 @@ let debounce = 0;
 form.addEventListener("input", () => {
   syncOutputs();
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(readOptions()));
+    localStorage.setItem(STORE_KEY, JSON.stringify({ ...readOptions(), version: STORE_VERSION }));
   } catch {}
   renderRows();
   clearTimeout(debounce);

@@ -130,18 +130,19 @@
           Step <output name="step_out"></output>
           <input type="range" name="step" min="0.2" max="0.8" step="0.05" value="0.5">
         </label>
-        <label class="select" title="From this level on, the scene is merged into one mesh, unwrapped and its materials baked into an atlas">
-          Bake proxy from <select name="bake_from"></select>
-        </label>
-        <label class="select" title="Levels before the proxy: each mesh reduced with its own UVs and materials, or the whole scene laid out once and its materials baked into one shared atlas at the artist's texel density">
-          Near textures
+        <label class="select" title="Recut skin: the whole scene's skin is cut afresh and every texel resampled into one atlas at the artist's texel density. LOD0 keeps every triangle, and each further level is reduced from it and drawn with the same atlas and normal map (no bake, so far levels shade flatter). Original materials: each mesh reduced with its own UVs and materials until the baked proxy. Shared atlas: the artist's UV islands repacked into one atlas for the levels before the baked proxy.">
+          Textures
           <select name="textures">
-            <option value="original" selected>Original materials</option>
+            <option value="recut" selected>Recut skin</option>
+            <option value="original">Original materials</option>
             <option value="shared">Shared atlas</option>
           </select>
         </label>
-        <label class="select" id="shared-size" title="Largest side of the shared atlas. It keeps the artist's texel density when that fits, and shrinks every chart by the same factor when it does not.">
-          Shared atlas up to
+        <label class="select baked-only" title="From this level on, the scene is merged into one mesh, unwrapped and its materials baked into an atlas">
+          Bake proxy from <select name="bake_from"></select>
+        </label>
+        <label class="select" id="shared-size" title="Largest side of the atlas. It keeps the artist's texel density when that fits, and shrinks every chart by the same factor when it does not.">
+          Atlas up to
           <select name="shared_size">
             <option value="512">512</option>
             <option value="1024">1024</option>
@@ -186,8 +187,8 @@
       </fieldset>
 
       <fieldset data-modes="chain">
-        <legend>Bake</legend>
-        <label class="select">Atlas
+        <legend>Unwrap and bake</legend>
+        <label class="select baked-only">Proxy atlas
           <select name="atlas">
             <option value="256">256 × 256</option>
             <option value="512" selected>512 × 512</option>
@@ -195,10 +196,10 @@
             <option value="2048">2048 × 2048</option>
           </select>
         </label>
-        <label class="range" title="Samples per texel along each axis">Supersample <output name="supersample_out"></output>
+        <label class="range baked-only" title="Samples per texel along each axis">Supersample <output name="supersample_out"></output>
           <input type="range" name="supersample" min="1" max="4" value="2">
         </label>
-        <label class="check" title="Planar chart projection instead of LSCM"><input type="checkbox" name="planar_uv"> Planar UVs</label>
+        <label class="check" title="Planar chart projection instead of LSCM, for every unwrap (recut, shared atlas and proxies)"><input type="checkbox" name="planar_uv"> Planar UVs</label>
       </fieldset>
     </form>
   </aside>

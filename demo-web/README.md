@@ -6,16 +6,29 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 - **Input:** a `.glb`, a `.gltf` together with its `.bin` and texture files, a folder, or a
   `.zip` of any of these. External files are resolved by relative path, with a fallback to a
   unique file name.
-- **Near levels** (LOD1 up to *Bake proxy from*) are reduced mesh by mesh. Each level is built
-  from the previous one and keeps the original's UVs and materials.
-- **Near textures: Shared atlas** lays the whole scene out in one atlas instead. With *Keep
+- **Textures: Recut skin** (the default) treats the whole scene's skin as one surface to cut
+  again: farthing merges the scene, unwraps it from scratch into mip-safe charts, and resamples
+  every texel of the original materials (base color, normal map, roughness/metalness) into one
+  atlas at the artist's texel density. That is **LOD0**: every triangle of the *Original*, in
+  one material, with the waste of the artist's layout gone. LOD1 onward are reduced from it
+  step by step and drawn with the same atlas, so nothing is baked per level. The normal map is
+  tangent-space and made for LOD0, so far levels shade flatter than a bake for them would
+  (bevels and rivets fade as the triangles that carried them go). The panel shows how far the
+  resampled base color is from the original, in levels of 255: hard edges blur a little,
+  since a fresh layout puts texels at new places. A fresh layout also can't share texels
+  between mirrored or repeated parts the way the artist's could, and every chart border is a
+  seam the reduction keeps, so many charts put a floor under how coarse the levels go.
+- **Textures: Original materials** reduces the near levels (LOD1 up to *Bake proxy from*) mesh
+  by mesh. Each level is built from the previous one and keeps the original's UVs and
+  materials.
+- **Textures: Shared atlas** lays the whole scene out in one atlas instead. With *Keep
   the artist's UV layout* (the default), the artist's UV islands are repacked whole, so the
   bake copies the original texels one to one, and islands that reuse the same texels (mirrored
   halves, repeated parts) share them. Unticked, farthing re-unwraps the scene and chooses the
   chart cuts. The original materials are baked into that one atlas by exact transfer, at the
   artist's texel density (the densest texture on each surface), and every near level is
   reduced from that mesh. Charts sit in whole 2ᵏ-texel cells, so mipmaps never
-  mix two charts. *Shared atlas up to* caps the side (2048 at most: a larger bake doesn't fit
+  mix two charts. *Atlas up to* caps the side (for the recut too) (2048 at most: a larger bake doesn't fit
   in a browser's WebAssembly memory). When the artist's density doesn't fit the cap, every
   chart shrinks by the same factor, which the panel shows. Every shared level's download
   carries the atlas, but the page sends it once, with LOD1, and draws the later shared levels
@@ -29,12 +42,13 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
   (in the model's units: metres for glTF), the camera's field of view and the screen height,
   and the chain keeps nothing that view can't show. LOD1 is reduced until it deviates about a
   pixel at that distance (or by one step, if that goes further), and the later levels step
-  from it. The shared atlas is capped at a texel per pixel there (re-unwrapped, when that cap
-  is below the artist's resolution), and each baked atlas is
+  from it. The recut and shared atlases are capped at a texel per pixel there (the shared
+  one re-unwrapped, when that cap is below the artist's resolution); a recut's LOD0 is reduced
+  to about a pixel there too, and each baked atlas is
   sized for the distance its level first appears at. The panel shows how big the model is,
   what a pixel is at that distance, and how much of the artist's texture detail the view can
   ever see.
-- **Error** is the measured deviation from LOD0: a sampled two-way Hausdorff distance,
+- **Error** is the measured deviation from the original (*Original* in a recut chain): a sampled two-way Hausdorff distance,
   relative to the scene's bounding-box diagonal. *Switch at* is the camera distance where that
   error drops below one pixel, for the viewing budget's field of view and screen (1080p,
   60° unless you change them). **Auto LOD** mode switches levels using those
@@ -113,7 +127,7 @@ natively on a zipped `.gltf`.
   source normal maps) and roughness/metalness (texture × factor). Occlusion, emissive and
   other extensions are not baked.
 - Base color textures that use a second UV set are exported on the first set.
-- Baked proxies and shared-atlas levels are static: skins and morph targets are dropped.
+- Baked proxies, recut and shared-atlas levels are static: skins and morph targets are dropped.
   Reduced levels keep them.
 - The wasm build is single-threaded (rayon falls back to the calling thread). A large model
   with a 2048² atlas takes a while.

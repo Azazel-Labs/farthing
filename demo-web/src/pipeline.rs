@@ -2,10 +2,13 @@
 //!
 //! * [`Demo::load`]: glTF / GLB from dropped files or a zip (external buffers and textures
 //!   resolved by relative path).
-//! * [`Demo::run`]: a LOD chain. Near levels are reduced per mesh and keep the original
-//!   materials, or ([`TextureMode::Shared`]) are reduced from one copy of the
-//!   whole scene whose atlas holds the original materials at the artist's resolution; far levels (from `bake_from`) are geometry-only proxies of the whole scene with
-//!   fresh UVs and base color, normal and roughness/metalness maps baked from the original. Every finished level and
+//! * [`Demo::run`]: a LOD chain. By default ([`TextureMode::Recut`]) the whole scene's skin
+//!   is cut afresh and resampled into one atlas at the artist's resolution, and every level
+//!   is a reduction of that LOD0 drawn with the same atlas. Otherwise near levels are reduced
+//!   per mesh and keep the original materials, or ([`TextureMode::Shared`]) are reduced from
+//!   one copy of the whole scene whose atlas holds the original materials; far levels (from
+//!   `bake_from`) are geometry-only proxies of the whole scene with fresh UVs and base color,
+//!   normal and roughness/metalness maps baked from the original. Every finished level and
 //!   baked texture is reported through an [`Event`] as soon as it exists.
 //! * The other example modes ([`DemoMode`]: option examples, cluster DAG, HLOD tree, splats)
 //!   live in [`crate::modes`]; [`Demo::run`] dispatches on [`LodOptions::mode`].
@@ -17,7 +20,7 @@ use farthing::host::{
     IdRenderRequest, MaterialClass, MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages,
     ViewRenderRequest,
 };
-use farthing::image::{Image, Texture};
+use farthing::image::{linear_to_srgb, Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
 use farthing::metrics::{surface_distance, SurfaceDistance};
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
@@ -78,13 +81,20 @@ pub const MAX_SHARED_SIZE: u32 = 2048;
 #[serde(rename_all = "snake_case")]
 pub enum TextureMode {
     /// Each mesh reduced on its own, keeping the original UVs and materials.
-    #[default]
     Original,
     /// The whole scene laid out once in one atlas (the artist's UV islands repacked, or with
     /// [`LodOptions::shared_keep_layout`] off, charts cut afresh; mip-safe 8 × 8 blocks), the
     /// original materials baked into it at the artist's texel density, and every near level
     /// reduced from that mesh.
     Shared,
+    /// The whole scene's skin cut afresh (fresh charts, mip-safe blocks) and every texel of the
+    /// original materials resampled into one atlas at the artist's texel density. LOD0 keeps
+    /// every triangle; each further level is reduced from the one before and draws with the
+    /// same atlas, its tangent-space normal map included, so far levels shade flatter than a
+    /// bake for them would. Nothing is baked per level: `bake_from` and `shared_keep_layout`
+    /// do not apply, and the chain has `levels` levels after LOD0.
+    #[default]
+    Recut,
 }
 
 /// Options the page exposes. Unknown or missing fields take the defaults.
@@ -99,7 +109,7 @@ pub struct LodOptions {
     pub strict_seams: bool,
     pub symmetry: bool,
     pub lock_border: bool,
-    /// First level (1-based) that becomes a baked proxy; 0 = none.
+    /// First level (1-based) that becomes a baked proxy; 0 = none. Not with [`TextureMode::Recut`].
     pub bake_from: usize,
     /// Baked texture size (square).
     pub atlas: u32,
@@ -108,7 +118,7 @@ pub struct LodOptions {
     /// Planar charts instead of LSCM for baked levels and the shared atlas.
     pub planar_uv: bool,
     pub textures: TextureMode,
-    /// Shared atlas: largest side (at most [`MAX_SHARED_SIZE`]). The atlas keeps the artist's
+    /// Shared or recut atlas: largest side (at most [`MAX_SHARED_SIZE`]). The atlas keeps the artist's
     /// texel density when that fits, and shrinks every chart by the same factor when it does not.
     pub shared_size: u32,
     /// Closest distance the scene is ever seen from, in its own units (glTF: metres); 0 = no
@@ -162,7 +172,7 @@ impl Default for LodOptions {
             atlas: 512,
             supersample: 2,
             planar_uv: false,
-            textures: TextureMode::Original,
+            textures: TextureMode::Recut,
             shared_size: 2048,
             view_distance: 0.0,
             view_fov: 60.0,
@@ -239,7 +249,7 @@ pub struct SceneInfo {
 pub enum LevelKind {
     Original,
     Reduced,
-    /// Reduced from the re-unwrapped scene; textures in the shared atlas.
+    /// Reduced from the re-unwrapped scene (shared or recut); textures in its atlas.
     Shared,
     Baked,
     Splats,
@@ -291,6 +301,10 @@ pub struct LevelInfo {
     pub density_scale: Option<f32>,
     /// Shared levels: the level whose GLB carries the atlas (the others reuse its material).
     pub shared_textures: Option<usize>,
+    /// Recut LOD0: how far its base color is from the original materials at matching points of
+    /// the same triangles, in 8-bit sRGB levels (largest channel): mean and 99th percentile.
+    pub texture_error: Option<f32>,
+    pub texture_error_p99: Option<f32>,
     /// With a viewing budget: the most texels per world unit the closest view can show (the
     /// shared atlas is capped there), and the fraction of the artist's texels under that cap.
     pub view_texel_density: Option<f32>,
@@ -324,6 +338,8 @@ impl LevelInfo {
             atlas_height: None,
             density_scale: None,
             shared_textures: None,
+            texture_error: None,
+            texture_error_p99: None,
             view_texel_density: None,
             view_texels: None,
         }
@@ -557,6 +573,10 @@ impl Demo {
         let original_bytes = texture_bytes(&original_textures(&self.materials));
         let mut info = level_info(0, LevelKind::Original, &self.scene, None, 0.0, 0.0);
         info.texture_bytes = Some(original_bytes);
+        // A recut's levels are named from LOD0, the recut itself.
+        if opts.textures == TextureMode::Recut {
+            info.label = Some("Original".into());
+        }
         if let Some(v) = visible {
             let dens = self.artist_density(&source);
             info.view_texel_density = Some(1.0 / v);
@@ -566,6 +586,11 @@ impl Demo {
             info: &info,
             glb: &[],
         });
+        if opts.textures == TextureMode::Recut {
+            self.shared_levels(opts, true, levels + 2, now, emit)?;
+            emit(Event::Stage("done"));
+            return Ok(());
+        }
 
         // Near levels: each mesh simplified from its previous level (as `lod_chain` does),
         // keeping UVs and material slots.
@@ -578,7 +603,7 @@ impl Demo {
         let mut from_level = 0;
         let shared = opts.textures == TextureMode::Shared;
         if shared && bake_from > 1 {
-            self.shared_levels(opts, bake_from, now, emit)?;
+            self.shared_levels(opts, false, bake_from, now, emit)?;
         }
         let first_reduced = if shared { bake_from } else { 1 };
         for level in first_reduced..bake_from {
@@ -735,20 +760,24 @@ impl Demo {
         Ok(())
     }
 
-    /// Shared-atlas near levels (1 until `bake_from`): the whole scene as one mesh, its UV
-    /// islands repacked (or re-unwrapped) at the artist's texel density (up to
-    /// `opts.shared_size` per side) and baked by exact transfer, then reduced level by level.
-    /// Level 1's GLB carries the atlas.
+    /// Shared-atlas levels (1 until `end`): the whole scene as one mesh, its UV islands
+    /// repacked (or re-unwrapped) at the artist's texel density (up to `opts.shared_size` per
+    /// side) and baked by exact transfer, then reduced level by level. Level 1's GLB carries the
+    /// atlas. A `recut` always unwraps afresh, and its level 1 is LOD0: every triangle (unless a
+    /// viewing budget drops some), with the texture error of the resampling.
     fn shared_levels(
         &mut self,
         opts: &LodOptions,
-        bake_from: usize,
+        recut: bool,
+        end: usize,
         now: &dyn Fn() -> f64,
         emit: &mut dyn FnMut(Event),
     ) -> Result<(), String> {
         let err = |e: Error| e.to_string();
         let mut t0 = now();
-        emit(Event::Stage("Shared atlas: merging the scene"));
+        let what = if recut { "Recut" } else { "Shared atlas" };
+        let name = |level: usize| format!("LOD{}", level - usize::from(recut));
+        emit(Event::Stage(&format!("{what}: merging the scene")));
         let (flat, refs) = self.scene.flatten();
         let mut dens = self.artist_density(&flat);
         // A viewing budget caps it at a texel per pixel of the closest view.
@@ -773,7 +802,7 @@ impl Demo {
         });
         // Kept islands hold the artist's texels one to one, so a cap that binds unwraps afresh.
         let capped = view_texels.is_some_and(|t| t < 0.999);
-        let keep = (opts.shared_keep_layout && textured && !capped)
+        let keep = (!recut && opts.shared_keep_layout && textured && !capped)
             .then(|| source_texels(&flat, &self.largest_textures(), one_set));
         let source = flat.clone();
         let mut mesh = flat;
@@ -789,7 +818,7 @@ impl Demo {
         // Copies of a vertex on the original's UV seams become one (triangles keep their order).
         repair::weld(&mut mesh, 0.0);
 
-        emit(Event::Stage("Shared atlas: unwrapping UVs"));
+        emit(Event::Stage(&format!("{what}: unwrapping UVs")));
         let size = opts.shared_size.clamp(64, MAX_SHARED_SIZE);
         let size = if textured { size } else { size.min(512) };
         // Charts sit in their own block × block cells, `block` texels apart, so mips stay inside
@@ -827,7 +856,7 @@ impl Demo {
             }
         };
         let (w, h) = (p.width, p.height);
-        emit(Event::Stage(&format!("Shared atlas: baking {w}×{h}")));
+        emit(Event::Stage(&format!("{what}: baking {w}×{h}")));
         let mut mesh = p.mesh;
         compute_tangents(&mut mesh, 0).map_err(err)?;
         let (mut tex, coverage) = bake_textures(
@@ -863,6 +892,9 @@ impl Demo {
             tex.alpha_cutoff.insert(0, c);
         }
         let tex_bytes = texture_bytes(&tex);
+        let texture_error = recut
+            .then(|| self.texture_error(&source, &mesh, tex.base_color.get(&0)?))
+            .flatten();
 
         let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
         let input_tris = self.scene.triangle_count();
@@ -871,16 +903,20 @@ impl Demo {
         let ppr = opts.ppr();
         let visible = opts.visible_error();
         let mut error_bound = 0.0;
-        // Steps compound from the original, or with a budget from the first level.
-        let mut from = (input_tris, 0);
-        for level in 1..bake_from {
-            emit(Event::Stage(&format!("LOD{level}: reducing")));
+        // Steps compound from the original (a recut's LOD0 is a step of none), or with a
+        // budget from the first level.
+        let mut from = (input_tris, usize::from(recut));
+        for level in 1..end {
+            emit(Event::Stage(&format!("{}: reducing", name(level))));
             let ratio = step.powi((level - from.1) as i32);
             let target = ((from.0 as f32 * ratio) as usize).max(4);
             let limit = visible.filter(|_| level == 1);
             let ((m, e, s, d), error) = fit_visible(limit, |k| {
-                let (m, e, x) =
-                    reduce_to(&mesh, &base, target, limit.map(|v| k * v)).map_err(err)?;
+                let (m, e, x) = if limit.is_none() && target >= mesh.triangle_count() {
+                    (mesh.clone(), 0.0, false)
+                } else {
+                    reduce_to(&mesh, &base, target, limit.map(|v| k * v)).map_err(err)?
+                };
                 let mut t = m.clone();
                 compute_tangents(&mut t, 0).map_err(err)?;
                 let mut s = Scene::from_mesh(t);
@@ -918,8 +954,12 @@ impl Demo {
                 atlas_height: Some(h),
                 density_scale: Some(p.density_scale),
                 shared_textures: Some(1),
+                label: recut.then(|| name(level)),
                 ..LevelInfo::new(level, LevelKind::Shared)
             };
+            if level == 1 {
+                (info.texture_error, info.texture_error_p99) = texture_error.unzip();
+            }
             info.set_distance(&d, diag);
             emit(Event::Level {
                 info: &info,
@@ -929,6 +969,72 @@ impl Demo {
             t0 = now();
         }
         Ok(())
+    }
+
+    /// Base color deviation of `mesh` drawn with `atlas` from `source` (the flattened scene)
+    /// drawn with the original materials, at matching points of the same triangles: the mean
+    /// and 99th percentile of the largest channel's difference, in 8-bit sRGB levels. Points
+    /// are spread by area.
+    fn texture_error(&self, source: &Mesh, mesh: &Mesh, atlas: &Texture) -> Option<(f32, f32)> {
+        let n = source.triangle_count().min(mesh.triangle_count());
+        let area = |t: usize| {
+            let [a, b, c] = source.triangle(t).map(|v| source.positions[v as usize]);
+            (b - a).cross(c - a).length()
+        };
+        let total: f32 = (0..n).map(area).sum();
+        if total <= 0.0 || mesh.uvs.is_empty() {
+            return None;
+        }
+        let to_srgb = |c: Vec4| {
+            glam::Vec3::new(
+                linear_to_srgb(c.x.clamp(0.0, 1.0)),
+                linear_to_srgb(c.y.clamp(0.0, 1.0)),
+                linear_to_srgb(c.z.clamp(0.0, 1.0)),
+            )
+        };
+        let mut diffs = Vec::with_capacity(MEASURE_SAMPLES + n);
+        let (mut acc, mut i) = (0.0f64, 0usize);
+        for t in 0..n {
+            acc += f64::from(area(t) / total) * MEASURE_SAMPLES as f64;
+            let m = self
+                .materials
+                .get(self.scene.material_id(source.material_ids[t]).0 as usize);
+            let (sv, mv) = (source.triangle(t), mesh.triangle(t));
+            while (i as f64) < acc {
+                // R2 points folded into the triangle.
+                let (mut u, mut w) = (
+                    (0.5 + i as f32 * 0.754_877_7).fract(),
+                    (0.5 + i as f32 * 0.569_840_3).fract(),
+                );
+                if u + w > 1.0 {
+                    (u, w) = (1.0 - u, 1.0 - w);
+                }
+                i += 1;
+                let k = [1.0 - u - w, u, w];
+                let uv_of = |m: &Mesh, v: [u32; 3], set: usize| {
+                    m.uvs.get(set).map_or(Vec2::ZERO, |uv| {
+                        (0..3).map(|j| uv[v[j] as usize] * k[j]).sum()
+                    })
+                };
+                let mut want = source.colors.as_ref().map_or(Vec4::ONE, |c| {
+                    (0..3).map(|j| c[sv[j] as usize] * k[j]).sum()
+                });
+                if let Some(m) = m {
+                    want *= m.base_color_factor;
+                    if let Some((tex, set)) = &m.base_color_texture {
+                        want *= tex.sample_bilinear(uv_of(source, sv, *set as usize), true);
+                    }
+                }
+                let got = atlas.sample_bilinear(uv_of(mesh, mv, 0), false);
+                diffs.push((to_srgb(want) - to_srgb(got)).abs().max_element() * 255.0);
+            }
+        }
+        if diffs.is_empty() {
+            return None;
+        }
+        let mean = diffs.iter().sum::<f32>() / diffs.len() as f32;
+        diffs.sort_by(f32::total_cmp);
+        Some((mean, diffs[(diffs.len() - 1) * 99 / 100]))
     }
 
     /// The artist's texel density per triangle of the flattened scene, from the largest
