@@ -46,7 +46,7 @@ pub(crate) struct Parts {
 }
 
 impl Parts {
-    /// None for single-part meshes.
+    /// None for single-part meshes and when every part has a locked vertex.
     pub fn analyze(input: &Mesh, locked: Option<&[bool]>, transparent: &[u32]) -> Option<Parts> {
         let (tri_part, np) = parts_of(input);
         if np < 2 {
@@ -75,6 +75,11 @@ impl Parts {
             part_tris[k].push(tri);
             normals[k].push(n);
             ids[k].push(t as u32);
+        }
+        // Parts with a locked vertex are never removed; with none left, there is nothing to
+        // analyze (an empty queue behaves exactly like no parts at all).
+        if pinned.iter().all(|&p| p) {
+            return None;
         }
         // Samples per part: vertices and triangle centroids, at most about 256.
         for s in &mut samples {
@@ -120,9 +125,10 @@ impl Parts {
         let coarse: Vec<f32> = {
             use rayon::prelude::*;
             let p = &parts;
+            // Pinned parts never enter the queue: their errors are not needed.
             (0..np)
                 .into_par_iter()
-                .map(|k| p.error_of(k, true))
+                .map(|k| if pinned[k] { 0.0 } else { p.error_of(k, true) })
                 .collect()
         };
         parts.heap = (0..np)

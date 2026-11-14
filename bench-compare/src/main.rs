@@ -14,7 +14,51 @@ use serde_json::json;
 use std::time::Instant;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: PeakAlloc = PeakAlloc;
+
+/// mimalloc with a live-bytes counter, so modes can report peak heap use.
+pub struct PeakAlloc;
+static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for PeakAlloc {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { mimalloc::MiMalloc.alloc(l) };
+        if !p.is_null() {
+            let now = LIVE.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed) + l.size();
+            PEAK.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(p, l) };
+        LIVE.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let q = unsafe { mimalloc::MiMalloc.realloc(p, l, new) };
+        if !q.is_null() {
+            if new >= l.size() {
+                let now = LIVE.fetch_add(new - l.size(), std::sync::atomic::Ordering::Relaxed) + new - l.size();
+                PEAK.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                LIVE.fetch_sub(l.size() - new, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        q
+    }
+}
+
+/// Resets the peak to the current live bytes and returns them.
+pub fn reset_peak() -> usize {
+    let now = LIVE.load(std::sync::atomic::Ordering::Relaxed);
+    PEAK.store(now, std::sync::atomic::Ordering::Relaxed);
+    now
+}
+
+/// Peak live heap bytes since the last [`reset_peak`].
+pub fn peak() -> usize {
+    PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 mod cluster_bench;
 

@@ -590,12 +590,14 @@ impl<'a> State<'a> {
             let p = mesh.positions[i];
             [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
         };
-        let mut order: Vec<u32> = (0..mesh.vertex_count() as u32).collect();
-        order.par_sort_unstable_by_key(|&i| (key(i as usize), i));
+        let mut order: Vec<([u32; 3], u32)> = (0..mesh.vertex_count())
+            .map(|i| (key(i), i as u32))
+            .collect();
+        order.par_sort_unstable();
         let mut group_of = vec![0u32; mesh.vertex_count()];
         let mut first: Vec<u32> = Vec::new();
-        for (k, &i) in order.iter().enumerate() {
-            if k == 0 || key(order[k - 1] as usize) != key(i as usize) {
+        for (k, &(ki, i)) in order.iter().enumerate() {
+            if k == 0 || order[k - 1].0 != ki {
                 first.push(i); // smallest index of the group (sorted by (key, i))
             }
             group_of[i as usize] = first.len() as u32 - 1;
@@ -784,10 +786,12 @@ impl<'a> State<'a> {
             p: [u32; 3],
             plane: Quadric,
             border: [Option<Quadric>; 3],
-            attr: Option<([f64; 12], [f64; 12], Vec<(DVec3, f64)>)>,
+            /// Normal- and other-group attribute quadrics; the gradients go to the chunk's
+            /// gradient buffer (`dim` per face).
+            attr: Option<([f64; 12], [f64; 12])>,
             area: f64,
         }
-        let face = |t: usize| -> Option<Face> {
+        let face = |t: usize, grads: &mut [(DVec3, f64)]| -> Option<Face> {
             if !tri_alive[t] {
                 return None;
             }
@@ -828,15 +832,14 @@ impl<'a> State<'a> {
                     let inv = m.inverse();
                     let w = tri.map(|v| attrs.get(v));
                     let (mut sqn, mut sqo) = (Quadric::default(), Quadric::default());
-                    let mut grads = Vec::with_capacity(dim);
                     for j in 0..dim {
                         let (s0, s1, s2) = (w[0][j] as f64, w[1][j] as f64, w[2][j] as f64);
                         let g = inv * DVec3::new(s1 - s0, s2 - s0, 0.0);
                         let d = s0 - g.dot(a);
                         if j < nd { &mut sqn } else { &mut sqo }.add(&Quadric::plane(g, d, area));
-                        grads.push((g, d));
+                        grads[j] = (g, d);
                     }
-                    attr = Some((sqn.coeffs(), sqo.coeffs(), grads));
+                    attr = Some((sqn.coeffs(), sqo.coeffs()));
                 }
             }
             Some(Face {
@@ -880,6 +883,8 @@ impl<'a> State<'a> {
         // taken in the same order as a serial scatter, so results match for any thread count.
         const FACE_CHUNK: usize = 65_536;
         let mut faces: Vec<Option<Face>> = Vec::with_capacity(FACE_CHUNK.min(tris.len()));
+        let gd = dim.max(1);
+        let mut fgrads = vec![(DVec3::ZERO, 0.0); FACE_CHUNK.min(tris.len()) * gd];
         let mut pcur = vec![0u32; np];
         let mut wcur: Vec<u32> = if dim > 0 {
             wstart[..wstart.len() - 1].to_vec()
@@ -888,12 +893,16 @@ impl<'a> State<'a> {
         };
         for c0 in (0..tris.len()).step_by(FACE_CHUNK) {
             let c1 = (c0 + FACE_CHUNK).min(tris.len());
-            (c0..c1)
-                .into_par_iter()
+            faces.clear();
+            faces.resize_with(c1 - c0, || None);
+            faces
+                .par_iter_mut()
+                .zip(fgrads[..(c1 - c0) * gd].par_chunks_mut(gd))
+                .enumerate()
                 .with_min_len(256)
-                .map(&face)
-                .collect_into_vec(&mut faces);
+                .for_each(|(i, (f, g))| *f = face(c0 + i, g));
             let faces = &faces;
+            let fgrads = &fgrads;
             let adj = &adj;
             quadric
                 .par_iter_mut()
@@ -935,9 +944,10 @@ impl<'a> State<'a> {
                             }
                             *cur += 1;
                             let Some(f) = &faces[t - c0] else { continue };
-                            let Some((cn, co, grads)) = &f.attr else {
+                            let Some((cn, co)) = &f.attr else {
                                 continue;
                             };
+                            let grads = &fgrads[(t - c0) * dim..(t - c0 + 1) * dim];
                             let area = f.area;
                             for k in 0..12 {
                                 row[k] += cn[k];

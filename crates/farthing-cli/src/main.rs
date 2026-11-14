@@ -153,6 +153,16 @@ enum Cmd {
         /// Fast group reductions (about 2x faster build, attributes kept less faithfully).
         #[arg(long)]
         fast: bool,
+        /// Write the packed GPU form (quantized vertices in streaming pages; see
+        /// `farthing::cluster::gpu`).
+        #[arg(long)]
+        gpu: Option<PathBuf>,
+        /// Streaming page size of the GPU form, in bytes.
+        #[arg(long, default_value_t = 131072)]
+        page_size: usize,
+        /// Position grid resolution of the GPU form (1-21 bits over the largest extent).
+        #[arg(long, default_value_t = 16)]
+        position_bits: u32,
     },
     /// Distant-LOD proxy of a whole scene: hidden-surface removal, merge, reduce, unwrap.
     Hlod {
@@ -549,6 +559,9 @@ fn main() -> Result<()> {
             max_triangles,
             max_vertices,
             fast,
+            gpu,
+            page_size,
+            position_bits,
         } => {
             let mesh = single_mesh(&load(&input)?);
             let opts = farthing::cluster::ClusterOptions {
@@ -566,8 +579,19 @@ fn main() -> Result<()> {
             if let Some(o) = &output {
                 std::fs::write(o, serde_json::to_string(&dag)?)?;
             }
+            let mut gpu_stats = serde_json::Value::Null;
+            if let Some(path) = &gpu {
+                let opts = farthing::cluster::GpuOptions {
+                    page_size,
+                    position_bits,
+                };
+                let packed = farthing::cluster::GpuClusterDag::from_dag(&dag, &mesh, &opts)?;
+                let bytes = packed.to_bytes();
+                std::fs::write(path, &bytes)?;
+                gpu_stats = json!({"bytes": bytes.len(), "pages": packed.pages.len(), "position_step": packed.step});
+            }
             print(
-                json!({"input_triangles": mesh.triangle_count(), "clusters": dag.clusters.len(), "groups": dag.groups.len(), "levels": dag.levels(), "level_triangles": dag.level_triangles(), "roots": dag.roots().count(), "build_seconds": build, "seconds": t0.elapsed().as_secs_f32()}),
+                json!({"input_triangles": mesh.triangle_count(), "clusters": dag.clusters.len(), "groups": dag.groups.len(), "levels": dag.levels(), "level_triangles": dag.level_triangles(), "roots": dag.roots().count(), "build_seconds": build, "gpu": gpu_stats, "seconds": t0.elapsed().as_secs_f32()}),
             );
         }
         Cmd::Hlod {
