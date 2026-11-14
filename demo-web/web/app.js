@@ -370,9 +370,59 @@ function spawn() {
   worker.onmessage = ({ data }) => onWorker(data);
   worker.onerror = (e) => {
     busy = false;
+    hideLoading();
     setStatus(`Worker failed to start: ${e.message ?? "see the console"}`, "error");
   };
 }
+
+// The viewport overlay while a model downloads and while the worker decodes it: big enough
+// that clicking a sample visibly does something, with a way out.
+const loadingEl = $("#loading");
+let loadingT0 = 0;
+let loadingTimer = 0;
+function showLoading(title, thumb) {
+  loadingEl.querySelector(".title").textContent = title;
+  const img = loadingEl.querySelector("img");
+  img.hidden = !thumb;
+  if (thumb) img.src = thumb;
+  loadingEl.hidden = false;
+  $("#empty").hidden = true;
+}
+function loadingProgress(phase, got, total) {
+  clearInterval(loadingTimer);
+  loadingEl.classList.toggle("indeterminate", !total);
+  loadingEl.querySelector(".phase").textContent = phase;
+  loadingEl.querySelector(".meter").style.setProperty("--p", total ? got / total : 0);
+  loadingEl.querySelector(".nums").textContent = total
+    ? `${mb(got)} of ${mb(total)} · ${Math.floor((100 * got) / total)}%`
+    : "";
+}
+/** Indeterminate phase with an elapsed-time counter (decoding a textured model takes seconds). */
+function loadingBusy(phase) {
+  loadingProgress(phase, 0, 0);
+  loadingT0 = performance.now();
+  const nums = loadingEl.querySelector(".nums");
+  const tick = () => (nums.textContent = `${((performance.now() - loadingT0) / 1000).toFixed(1)} s`);
+  tick();
+  loadingTimer = setInterval(tick, 100);
+}
+function hideLoading() {
+  clearInterval(loadingTimer);
+  loadingEl.hidden = true;
+  if (!original) $("#empty").hidden = false;
+}
+loadingEl.querySelector(".cancel").addEventListener("click", () => {
+  fetching?.abort();
+  if (busy && !original) {
+    // Decoding: wasm can't be interrupted, so drop the worker.
+    spawn();
+    busy = false;
+    files = null;
+  }
+  for (const b of cards.values()) b.removeAttribute("aria-current");
+  hideLoading();
+  setStatus("Cancelled");
+});
 
 function setStatus(text, cls = "") {
   statusEl.textContent = text;
@@ -390,8 +440,10 @@ async function onWorker(m) {
       try {
         await showOriginal(m.glb);
       } catch (e) {
+        hideLoading();
         return setStatus(`Could not display the model: ${e.message ?? e}`, "error");
       }
+      hideLoading();
       $("#empty").hidden = true;
       startRun();
       break;
@@ -437,8 +489,25 @@ async function onWorker(m) {
     }
     case "error":
       busy = false;
+      hideLoading();
       setStatus(m.message, "error");
       break;
+    case "crash": {
+      // The worker's wasm is dead after a trap: replace it, and reload the files quietly so
+      // the model on screen can be run again with other options.
+      busy = false;
+      hideLoading();
+      console.error("farthing wasm trap:", m.message);
+      spawn();
+      if (files && original) worker.postMessage({ type: "load", files, quiet: true });
+      else files = null;
+      setStatus(
+        `farthing crashed in the browser (wasm: ${m.message}), most likely out of memory. ` +
+          "The worker was restarted; try fewer levels, a smaller atlas or a smaller model.",
+        "error",
+      );
+      break;
+    }
   }
 }
 
@@ -485,8 +554,10 @@ function startRun() {
   worker.postMessage({ type: "run", runId: id, options: runOpts });
 }
 
-async function load(list) {
+async function load(list, title) {
   if (!list.length) return;
+  if (loadingEl.hidden) showLoading(title ?? (list.length === 1 ? list[0].name : `${list.length} files`));
+  loadingBusy("Decoding geometry and textures…");
   resetViewer();
   rowsEl.replaceChildren();
   drawTextures(-1);
@@ -793,19 +864,26 @@ async function download(url, signal, progress, expected = 0) {
 
 // Only one download at a time: picking another model cancels the one in flight.
 let fetching = null;
-async function loadUrl(url, name, expected, onProgress = () => {}) {
+async function loadUrl(url, name, expected, onProgress = () => {}, thumb = null) {
   fetching?.abort();
   const ctl = (fetching = new AbortController());
   setStatus(`Downloading ${name}…`, "busy");
+  showLoading(name, thumb);
+  loadingProgress("Downloading…", 0, expected);
   try {
     const bytes = await download(url, ctl.signal, (got, total) => {
       setStatus(`Downloading ${name}… ${mb(got)} of ${mb(total)}`, "busy");
+      loadingProgress("Downloading…", got, total);
       onProgress(got / total);
     }, expected);
     if (ctl.signal.aborted) return;
-    await load([{ name: decodeURIComponent(new URL(url, location.href).pathname.split("/").pop()), bytes }]);
+    const file = decodeURIComponent(new URL(url, location.href).pathname.split("/").pop());
+    await load([{ name: file, bytes }], name);
   } catch (err) {
-    if (!ctl.signal.aborted) setStatus(`Could not download ${name}: ${err.message ?? err}`, "error");
+    if (!ctl.signal.aborted) {
+      hideLoading();
+      setStatus(`Could not download ${name}: ${err.message ?? err}`, "error");
+    }
   } finally {
     if (fetching === ctl) fetching = null;
     onProgress(null);
@@ -831,10 +909,16 @@ function card(s) {
 function loadSample(s) {
   for (const [file, b] of cards) b.setAttribute("aria-current", String(file === s.file));
   const b = cards.get(s.file);
-  loadUrl(`samples/${s.file}`, s.name, s.bytes, (p) => {
-    b.classList.toggle("loading", p !== null);
-    b.style.setProperty("--p", p ?? 0);
-  });
+  loadUrl(
+    `samples/${s.file}`,
+    s.name,
+    s.bytes,
+    (p) => {
+      b.classList.toggle("loading", p !== null);
+      b.style.setProperty("--p", p ?? 0);
+    },
+    s.thumb ? `samples/${s.thumb}` : null,
+  );
 }
 
 fetch("samples/index.json")

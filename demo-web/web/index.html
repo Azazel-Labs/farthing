@@ -89,6 +89,17 @@
     <section id="view">
       <canvas id="gl"></canvas>
       <div id="empty">Drop a .glb, .gltf or .zip anywhere, or pick a sample</div>
+      <div id="loading" hidden role="status" aria-live="polite">
+        <div class="box">
+          <img alt="" hidden>
+          <div class="body">
+            <div class="title"></div>
+            <div class="phase"></div>
+            <div class="meter"><span></span></div>
+            <div class="row"><span class="nums"></span><button type="button" class="cancel">Cancel</button></div>
+          </div>
+        </div>
+      </div>
       <div id="hud"></div>
       <figure id="mag" hidden>
         <canvas></canvas>

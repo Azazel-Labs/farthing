@@ -35,6 +35,10 @@ self.onmessage = async ({ data }) => {
       post({ type: "download", level: data.level, glb: glb.buffer }, [glb.buffer]);
     }
   } catch (e) {
-    post({ type: "error", runId: data.runId, message: String(e?.message ?? e) });
+    // A wasm trap (`unreachable`, out of bounds...) poisons the module: nothing in this worker
+    // can run again, so the page respawns it. Out-of-memory is the usual cause: allocation
+    // failure aborts without reaching the panic hook.
+    const trap = e instanceof WebAssembly.RuntimeError;
+    post({ type: trap ? "crash" : "error", runId: data.runId, message: String(e?.message ?? e) });
   }
 };
