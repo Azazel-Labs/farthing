@@ -55,3 +55,7 @@ required-features = ["io"]
 [[example]]
 name = "bench_remesh"
 required-features = ["io"]
+
+[[example]]
+name = "bench_hlod_tree"
+required-features = ["io"]

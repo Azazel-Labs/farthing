@@ -15,6 +15,11 @@
 //!    interpenetrating objects into one watertight shell.
 //! 4. **Unwrap and bake.** New UVs, tangents, and base color / normal / ORM (or any channels)
 //!    cast from the culled source through the host into one atlas.
+//!
+//! [`build_hlod`] makes one proxy for everything it is given. [`build_hlod_tree`] partitions a
+//! whole level into a loose octree (or quadtree) of cells and builds a proxy per cell, each
+//! parent from its children's proxies, with budgets and switch distances that grow with cell
+//! size; [`HlodTree::select`] then picks what to draw for a camera (see [`tree`]).
 
 use crate::bake::{bake_with_host, compute_tangents, BakeOptions, BakeOutput};
 use crate::host::RenderHost;
@@ -25,6 +30,12 @@ use crate::voxel::{remesh, RemeshOptions};
 use crate::{Error, Mesh, Result, Scene};
 use glam::Mat4;
 use serde::{Deserialize, Serialize};
+
+pub mod tree;
+pub use tree::{
+    build_hlod_tree, build_hlod_tree_with, CellGrid, HlodCut, HlodNode, HlodTree, HlodTreeOptions,
+    ParentSource, PROXY_MATERIAL,
+};
 
 /// How the merged surface is brought down to its budget.
 #[allow(clippy::large_enum_variant)] // options, built once
@@ -115,29 +126,72 @@ pub struct HlodResult {
 }
 
 /// Builds one proxy for everything in `scene`.
+///
+/// For a whole level partitioned into a tree of cells, see [`build_hlod_tree`].
 pub fn build_hlod(
     host: &mut dyn RenderHost,
     scene: &Scene,
     opts: &HlodOptions,
 ) -> Result<HlodResult> {
-    let input_triangles = scene.triangle_count();
-    if input_triangles == 0 {
+    if scene.triangle_count() == 0 {
         return Err(Error::InvalidInput("HLOD of an empty scene".into()));
     }
-    // 1. Hidden-surface removal.
+    let culled = cull_stage(host, scene, opts)?;
+    if culled.visible.triangle_count() == 0 {
+        return Err(Error::InvalidInput("no camera saw any triangle".into()));
+    }
+    let shaped = shape_stage(&culled.visible, opts)?;
+    let bake = bake_stage(host, &shaped.mesh, &culled.visible, opts)?;
+    Ok(HlodResult {
+        mesh: shaped.mesh,
+        bake,
+        input_triangles: culled.input_triangles,
+        hidden_triangles: culled.hidden_triangles,
+        error: shaped.error,
+    })
+}
+
+/// What survives hidden-surface removal.
+pub(crate) struct Culled {
+    pub visible: Scene,
+    pub input_triangles: usize,
+    pub hidden_triangles: usize,
+}
+
+/// The reduced (and unwrapped) proxy before its bake.
+pub(crate) struct Shaped {
+    pub mesh: Mesh,
+    pub error: f32,
+    /// Atlas texels per world unit, when unwrapped.
+    pub texels_per_unit: Option<f32>,
+}
+
+/// Step 1, through the host: hidden-surface removal (an empty scene stays empty).
+pub(crate) fn cull_stage(
+    host: &mut dyn RenderHost,
+    scene: &Scene,
+    opts: &HlodOptions,
+) -> Result<Culled> {
+    let input_triangles = scene.triangle_count();
     let (visible, hidden_triangles) = match &opts.visibility {
-        Some(v) => {
+        Some(v) if input_triangles > 0 => {
             let mut vis = compute_visibility(host, scene, v)?;
             // Views frame the bounding sphere: about 2.5 radii across `resolution` pixels.
             let pixel = 2.5 * scene.bounds().radius() / v.resolution.max(1) as f32;
             keep_small_parts_whole(scene, &mut vis, opts.small_part_pixels * pixel);
             cull_invisible(scene, &vis, opts.grow_rings)
         }
-        None => (scene.clone(), 0),
+        _ => (scene.clone(), 0),
     };
-    if visible.triangle_count() == 0 {
-        return Err(Error::InvalidInput("no camera saw any triangle".into()));
-    }
+    Ok(Culled {
+        visible,
+        input_triangles,
+        hidden_triangles,
+    })
+}
+
+/// Steps 2 and 3 and the unwrap of step 4: pure geometry, no host (safe to run in parallel).
+pub(crate) fn shape_stage(visible: &Scene, opts: &HlodOptions) -> Result<Shaped> {
     // 2. One world-space mesh without attributes.
     let mut geo = repair::geometry_only(&visible.flatten().0);
     geo.skin = None;
@@ -182,47 +236,55 @@ pub fn build_hlod(
     mesh.tangents = None;
     mesh.compute_normals(opts.hard_angle_deg);
 
-    // 4. Unwrap and bake from the culled source (hidden surfaces can't bleed into the atlas).
+    // 4a. Unwrap.
+    let mut texels_per_unit = None;
     if let Some(uv) = &opts.uv {
         let atlas = opts
             .bake
             .as_ref()
             .map_or(uv.atlas_size, |b| b.width.max(b.height));
-        mesh = parameterize(
+        let p = parameterize(
             &mesh,
             &ParamOptions {
                 atlas_size: atlas,
                 ..uv.clone()
             },
-        )?
-        .mesh;
+        )?;
+        texels_per_unit = Some(p.texels_per_unit);
+        mesh = p.mesh;
         compute_tangents(&mut mesh, 0)?;
     }
-    let bake = match &opts.bake {
-        Some(_) if opts.uv.is_none() => {
-            return Err(Error::InvalidInput(
-                "an HLOD bake needs `uv` options".into(),
-            ))
-        }
-        Some(b) => Some(bake_with_host(
+    Ok(Shaped {
+        mesh,
+        error,
+        texels_per_unit,
+    })
+}
+
+/// Step 4b, through the host: bake from the culled source (hidden surfaces can't bleed into
+/// the atlas).
+pub(crate) fn bake_stage(
+    host: &mut dyn RenderHost,
+    mesh: &Mesh,
+    visible: &Scene,
+    opts: &HlodOptions,
+) -> Result<Option<BakeOutput>> {
+    match &opts.bake {
+        Some(_) if opts.uv.is_none() => Err(Error::InvalidInput(
+            "an HLOD bake needs `uv` options".into(),
+        )),
+        Some(b) => Ok(Some(bake_with_host(
             host,
-            &mesh,
+            mesh,
             Mat4::IDENTITY,
-            &visible,
+            visible,
             &BakeOptions {
                 uv_set: 0,
                 ..b.clone()
             },
-        )?),
-        None => None,
-    };
-    Ok(HlodResult {
-        mesh,
-        bake,
-        input_triangles,
-        hidden_triangles,
-        error,
-    })
+        )?)),
+        None => Ok(None),
+    }
 }
 
 /// Marks every triangle of a connected part (by welded position) whose world-space diagonal is
@@ -262,7 +324,7 @@ mod tests {
     use glam::Vec3;
 
     /// Axis-aligned box, 2 triangles per face, outward winding, `n` subdivisions per edge.
-    fn cube(n: usize) -> Mesh {
+    pub(super) fn cube(n: usize) -> Mesh {
         let mut pos = Vec::new();
         let mut idx = Vec::new();
         let faces = [
@@ -406,7 +468,7 @@ mod tests {
     }
 
     /// A host whose "material" colors by world position.
-    struct PositionHost;
+    pub(super) struct PositionHost;
     impl RenderHost for PositionHost {
         fn material_info(&self, _m: MaterialId) -> crate::host::MaterialInfo {
             Default::default()

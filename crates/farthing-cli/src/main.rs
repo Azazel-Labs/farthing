@@ -180,6 +180,30 @@ enum Cmd {
         /// UV atlas size for the proxy (0: no UVs).
         #[arg(long, default_value_t = 1024)]
         atlas: u32,
+        /// Nested HLOD cells: partition the scene into a tree of leaf cells this size (world
+        /// units) and coarser parents. `--output` is then a directory: one glTF per node plus
+        /// `hlod.json` (nodes, bounds, errors, switch distances). `--triangles` and
+        /// `--max-error` are the leaf budgets.
+        #[arg(long)]
+        cells: Option<f32>,
+        /// Most tree levels, leaves included (default: up to a single root).
+        #[arg(long)]
+        levels: Option<u32>,
+        /// Build every parent from the source instances instead of its children's proxies.
+        #[arg(long)]
+        from_source: bool,
+        /// Quadtree columns over XZ instead of an octree.
+        #[arg(long)]
+        quadtree: bool,
+        /// Screen height (pixels) for the manifest's switch distances.
+        #[arg(long, default_value_t = 1080.0)]
+        screen_height: f32,
+        /// Vertical field of view (degrees) for the manifest's switch distances.
+        #[arg(long, default_value_t = 60.0)]
+        fov: f32,
+        /// Largest acceptable on-screen error (pixels) for the manifest's switch distances.
+        #[arg(long, default_value_t = 1.0)]
+        pixel_error: f32,
     },
     /// New UV atlas for every mesh.
     Uv {
@@ -298,6 +322,101 @@ fn print(v: serde_json::Value) {
 
 fn single_mesh(s: &Scene) -> Mesh {
     s.flatten().0
+}
+
+/// `farthing hlod --cells`: the tree, one glTF per node and a JSON manifest in `dir`.
+fn hlod_tree(
+    s: &Scene,
+    opts: &farthing::hlod::HlodTreeOptions,
+    dir: &Path,
+    pixels_per_radian: f32,
+    pixel_error: f32,
+    t0: Instant,
+) -> Result<()> {
+    use farthing::hlod::{build_hlod_tree_with, CellGrid, HlodNode};
+    std::fs::create_dir_all(dir)?;
+    let file_name =
+        |n: &HlodNode| format!("l{}_{}_{}_{}.glb", n.level, n.cell[0], n.cell[1], n.cell[2]);
+    // Each proxy is written and dropped as soon as the builder is done with it.
+    let mut hidden = vec![0usize; 0];
+    let mut write_err = None;
+    let tree = build_hlod_tree_with(&mut GeometryOnlyHost, s, opts, |i, node| {
+        let proxy = node.proxy.take().expect("proxy");
+        if hidden.len() <= i as usize {
+            hidden.resize(i as usize + 1, 0);
+        }
+        hidden[i as usize] = proxy.hidden_triangles;
+        if proxy.mesh.triangle_count() > 0 && write_err.is_none() {
+            if let Err(e) = save(&Scene::from_mesh(proxy.mesh), &dir.join(file_name(node))) {
+                write_err = Some(e);
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+    let nodes: Vec<serde_json::Value> = tree
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            json!({
+                "id": i,
+                "level": n.level,
+                "cell": n.cell,
+                "file": (n.triangles > 0).then(|| file_name(n)),
+                "parent": n.parent,
+                "children": n.children,
+                "bounds": {"min": n.bounds.min.to_array(), "max": n.bounds.max.to_array()},
+                "sphere": {"center": n.sphere.center.to_array(), "radius": n.sphere.radius},
+                "error": n.error,
+                "geometric_error": n.geometric_error,
+                "texel_size": n.texel_size,
+                "switch_distance": n.switch_distance(pixels_per_radian, pixel_error),
+                "triangles": n.triangles,
+                "source_triangles": n.source_triangles,
+                "hidden_triangles": hidden.get(i).copied().unwrap_or(0),
+                "own_instances": n.own_instances,
+                "instances": n.instances,
+            })
+        })
+        .collect();
+    let instances: Vec<serde_json::Value> = s
+        .instances
+        .iter()
+        .enumerate()
+        .map(|(i, inst)| json!({"id": i, "name": inst.name, "node": tree.instance_node[i]}))
+        .collect();
+    let manifest = json!({
+        "cell_size": tree.cell_size,
+        "grid": match tree.grid { CellGrid::Octree => "octree", CellGrid::Quadtree => "quadtree" },
+        "origin": tree.origin.to_array(),
+        "levels": tree.levels,
+        "parents": format!("{:?}", opts.parents).to_lowercase(),
+        "pixels_per_radian": pixels_per_radian,
+        "pixel_error": pixel_error,
+        "switch_rule": "draw a node when distance(eye, sphere.center) >= switch_distance and its parent's test fails; otherwise draw its own_instances and recurse",
+        "roots": tree.roots,
+        "nodes": nodes,
+        "instances": instances,
+    });
+    std::fs::write(
+        dir.join("hlod.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+    let per_level: Vec<usize> = (0..tree.levels).map(|l| tree.level(l).count()).collect();
+    print(json!({
+        "input_triangles": s.triangle_count(),
+        "instances": s.instances.len(),
+        "nodes": tree.nodes.len(),
+        "levels": tree.levels,
+        "nodes_per_level": per_level,
+        "triangles_per_level": tree.level_triangles(),
+        "roots": tree.roots.len(),
+        "seconds": t0.elapsed().as_secs_f32(),
+    }));
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -581,6 +700,13 @@ fn main() -> Result<()> {
             cameras,
             resolution,
             atlas,
+            cells,
+            levels,
+            from_source,
+            quadtree,
+            screen_height,
+            fov,
+            pixel_error,
         } => {
             use farthing::hlod::{build_hlod, HlodGeometry, HlodOptions};
             use farthing::visibility::{CameraSet, VisibilityOptions};
@@ -618,6 +744,26 @@ fn main() -> Result<()> {
                 bake: None,
                 ..d
             };
+            if let Some(cell_size) = cells {
+                let tree_opts = farthing::hlod::HlodTreeOptions {
+                    cell_size,
+                    grid: if quadtree {
+                        farthing::hlod::CellGrid::Quadtree
+                    } else {
+                        farthing::hlod::CellGrid::Octree
+                    },
+                    max_levels: levels,
+                    parents: if from_source {
+                        farthing::hlod::ParentSource::Source
+                    } else {
+                        farthing::hlod::ParentSource::Children
+                    },
+                    proxy: opts,
+                    ..Default::default()
+                };
+                let ppr = screen_height / (2.0 * (fov.to_radians() * 0.5).tan());
+                return hlod_tree(&s, &tree_opts, &output, ppr, pixel_error, t0);
+            }
             let r = build_hlod(&mut GeometryOnlyHost, &s, &opts)?;
             let dist = surface_distance(&single_mesh(&s), &r.mesh, 20000);
             save(&Scene::from_mesh(r.mesh.clone()), &output)?;
