@@ -226,6 +226,11 @@ pub fn screen_size_to_max_error(diagonal: f32, screen_size_px: f32, pixel_tolera
 /// Positions with more wedges than this are never collapse sources in permissive mode.
 const MAX_SOURCE_WEDGES: usize = 8;
 
+/// Least UV jump (texture units) a seam tear is priced at (see `State::tear_error`).
+const TEAR_UV: f64 = 1.0;
+/// Wedges whose UVs are closer than this have the same UV (a normal-only seam).
+const TEAR_SAME_UV: f64 = 1e-4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Validity {
     Ok,
@@ -469,6 +474,10 @@ struct AttrLayout {
     dim: usize,
     /// The first `nd` dims are the normal (scaled by region size in the cost).
     nd: usize,
+    /// Dims `nd..nd + nuv` are the UV sets.
+    nuv: usize,
+    /// The UV weight (values hold UVs · √weight).
+    uv_weight: f64,
     /// Per wedge, `dim` weighted attribute values.
     values: Vec<f32>,
 }
@@ -486,6 +495,7 @@ impl AttrLayout {
         if uw > 0.0 {
             dim += 2 * mesh.uvs.len();
         }
+        let nuv = dim - nd;
         if mesh.colors.is_some() && cw > 0.0 {
             dim += 4;
         }
@@ -504,7 +514,13 @@ impl AttrLayout {
                 values.extend((cs[v] * cw).to_array());
             }
         }
-        AttrLayout { dim, nd, values }
+        AttrLayout {
+            dim,
+            nd,
+            nuv,
+            uv_weight: (uw * uw) as f64,
+            values,
+        }
     }
     #[inline]
     fn get(&self, w: u32) -> &[f32] {
@@ -543,6 +559,11 @@ struct State<'a> {
     best: Vec<(f64, u32)>,
     vremap: Vec<u32>,
     premap: Vec<u32>,
+    /// An input vertex at each position (for the output position of slid wedges).
+    pos_src: Vec<u32>,
+    /// Wedges that slid onto another position, keeping their attributes (see
+    /// [`State::map_from_corners`]); their output position is that of their final position.
+    slid: Vec<u32>,
     inv_scale: f64,
     mirror: Option<Vec<u32>>,
     avg_area: f64,
@@ -611,6 +632,7 @@ impl<'a> State<'a> {
             .map(|&g| (mesh.positions[first[g as usize] as usize].as_dvec3() - min) / diag)
             .collect();
         let vpos: Vec<u32> = group_of.iter().map(|&g| gid[g as usize]).collect();
+        let pos_src: Vec<u32> = rank.iter().map(|&g| first[g as usize]).collect();
         let np = pos.len();
         let tris: Vec<[u32; 3]> = (0..mesh.triangle_count())
             .map(|t| mesh.triangle(t))
@@ -993,6 +1015,8 @@ impl<'a> State<'a> {
             importance,
             best: vec![(0.0, u32::MAX); np],
             vremap: (0..mesh.vertex_count() as u32).collect(),
+            pos_src,
+            slid: Vec::new(),
             premap: (0..np as u32).collect(),
             inv_scale: diag,
             mirror,
@@ -1117,8 +1141,15 @@ impl<'a> State<'a> {
         }
     }
 
-    /// Wedge mapping from precomputed corners (see [`Self::map_wedges`]).
-    fn map_from_corners(&self, corners: &[Corner], q: u32, out: &mut Vec<(u32, u32)>) -> bool {
+    /// Wedge mapping from precomputed corners (see [`Self::map_wedges`]). `None` if the
+    /// collapse is not possible; otherwise the extra attribute error of the seams it tears
+    /// (see [`Self::tear_error`]), to add in [`Self::cost`].
+    fn map_from_corners(
+        &self,
+        corners: &[Corner],
+        q: u32,
+        out: &mut Vec<(u32, u32)>,
+    ) -> Option<f64> {
         out.clear();
         // Fast path: p has a single wedge (no seam through it) and seams may move. The general
         // rule then maps it to q's wedge in the first triangle the two share.
@@ -1134,9 +1165,9 @@ impl<'a> State<'a> {
                             continue;
                         };
                         out.push((first.pw, qw));
-                        return true;
+                        return Some(0.0);
                     }
-                    return false;
+                    return None;
                 }
             }
         }
@@ -1154,7 +1185,7 @@ impl<'a> State<'a> {
             match out.iter().find(|(x, _)| *x == pw) {
                 Some(&(_, existing)) if existing != qw => {
                     if self.strict {
-                        return false;
+                        return None;
                     }
                 }
                 Some(_) => {}
@@ -1162,43 +1193,91 @@ impl<'a> State<'a> {
             }
         }
         if shared == 0 {
-            return false;
+            return None;
         }
+        let mut tear = 0.0;
         let mut mh = None;
+        // Candidates for p's unpartnered wedges: every wedge of q, not only those in the
+        // triangles p and q share. When both lie on a seam and the edge is a chord through one
+        // island, p's wedge on the other island belongs with q's wedge there; restricting it
+        // to the shared triangles' wedges dragged it across the atlas.
+        let mut q_wedges: Vec<u32> = Vec::new();
         for c in corners {
             let pw = c.pw;
             if out.iter().any(|(x, _)| *x == pw) {
                 continue;
             }
             if self.strict {
-                return false;
+                return None;
             }
             let (m, h) = *mh.get_or_insert_with(|| {
                 let qp = self.pos[q as usize];
                 (kernels::monomials(qp), kernels::homogeneous(qp))
             });
-            let mut best: Option<(f64, u32)> = None;
-            for &(_, qw) in out.iter() {
-                let (en, eo, _) = self.attr_eval_m(pw, &m, &h, qw);
-                let e = en + eo;
+            if q_wedges.is_empty() {
+                for &t in self.adj.get(q) {
+                    let tp = self.tpos[t as usize];
+                    if let Some(k) = tp.iter().position(|&x| x == q) {
+                        let w = self.tris[t as usize][k];
+                        if !q_wedges.contains(&w) {
+                            q_wedges.push(w);
+                        }
+                    }
+                }
+            }
+            // Or the wedge slides onto q keeping its own attributes: its triangles stay on
+            // their UV island and only stretch, where any wedge of q would move them to
+            // another island (q has no wedge of pw's island, or it would be partnered).
+            let (en, eo, _) = self.attr_eval_m(pw, &m, &h, pw);
+            let mut best: Option<(f64, u32, f64)> = Some((en + eo, pw, 0.0));
+            for &qw in &q_wedges {
+                let (en, eo, w) = self.attr_eval_m(pw, &m, &h, qw);
+                let t = self.tear_error(pw, qw, eo, w);
+                let e = en + eo + t;
                 if best.is_none_or(|b| e < b.0) {
-                    best = Some((e, qw));
+                    best = Some((e, qw, t));
                 }
             }
             match best {
-                Some((_, qw)) => out.push((pw, qw)),
-                None => return false,
+                Some((_, qw, t)) => {
+                    out.push((pw, qw));
+                    tear += t;
+                }
+                None => return None,
             }
         }
-        true
+        Some(tear)
     }
 
-    /// Wedge mapping for collapsing p onto q into `out`. False if the collapse would tear a seam
-    /// (strict mode) or p and q share no triangle.
+    /// Extra error for remapping wedge `pw` onto `qw`, a wedge of a vertex it shares no
+    /// triangle with, beyond `eo` (its plain attribute error; `w` its area). If their UVs
+    /// differ the remap moves `pw`'s triangles off their UV island, and what they show is then
+    /// wrong however short the jump (islands are often thin strips, and a jump of a few
+    /// hundredths lands in the gutter). So the UV part of the error is at least that of a
+    /// [`TEAR_UV`] jump. Wedges split only by normals (same UVs) cost nothing extra.
+    #[inline]
+    fn tear_error(&self, pw: u32, qw: u32, eo: f64, w: f64) -> f64 {
+        let a = &self.attrs;
+        if a.nuv == 0 {
+            return 0.0;
+        }
+        let (va, vb) = (a.get(pw), a.get(qw));
+        let d2: f64 = (a.nd..a.nd + a.nuv)
+            .map(|i| ((va[i] - vb[i]) as f64).powi(2))
+            .sum();
+        if d2 <= a.uv_weight * TEAR_SAME_UV * TEAR_SAME_UV {
+            return 0.0;
+        }
+        (w * a.uv_weight * TEAR_UV * TEAR_UV - eo).max(0.0)
+    }
+
+    /// Wedge mapping for collapsing p onto q into `out`: pairs (p's wedge, q's wedge it merges
+    /// into), or (w, w) for a wedge that slides onto q as it is. False if the collapse would
+    /// tear a seam (strict mode) or p and q share no triangle.
     fn map_wedges(&self, p: u32, q: u32, out: &mut Vec<(u32, u32)>) -> bool {
         let mut corners = std::mem::take(&mut self.scratch().borrow_mut().corners2);
         self.p_corners(p, &mut corners);
-        let ok = self.map_from_corners(&corners, q, out);
+        let ok = self.map_from_corners(&corners, q, out).is_some();
         self.scratch().borrow_mut().corners2 = corners;
         ok
     }
@@ -1229,11 +1308,11 @@ impl<'a> State<'a> {
                     v
                 }
             });
-            let pts = nt.map(|v| {
-                if self.vpos[v as usize] == q {
+            let pts = tp.map(|x| {
+                if x == p {
                     qp
                 } else {
-                    self.pos[self.vpos[v as usize] as usize].as_vec3()
+                    self.pos[x as usize].as_vec3()
                 }
             });
             let (_, w) = crate::bvh::closest_on_triangle(pp, pts[0], pts[1], pts[2]);
@@ -1271,7 +1350,7 @@ impl<'a> State<'a> {
     }
 
     /// Cost of collapsing p onto q with wedge map `map`: (cost, geometric error²).
-    fn cost(&self, p: u32, q: u32, map: &[(u32, u32)]) -> (f64, f64) {
+    fn cost(&self, p: u32, q: u32, map: &[(u32, u32)], tear: f64) -> (f64, f64) {
         let qp = self.pos[q as usize];
         let (m, h) = (kernels::monomials(qp), kernels::homogeneous(qp));
         let qd = &self.quadric[p as usize];
@@ -1298,8 +1377,11 @@ impl<'a> State<'a> {
             eo += o;
             w += wi;
         }
-        let attr2 =
-            if w > 0.0 { (en + eo) / norm(w) } else { 0.0 } + self.skin_morph_cost(p, q, map);
+        let attr2 = if w > 0.0 {
+            (en + eo + tear) / norm(w)
+        } else {
+            0.0
+        } + self.skin_morph_cost(p, q, map);
         let imp =
             ((self.importance[p as usize] + self.importance[q as usize]) * 0.5).max(1e-3) as f64;
         // Second value: mean squared distance, for max_error and reporting.
@@ -1424,11 +1506,13 @@ impl<'a> State<'a> {
     /// Full evaluation (cost + validity).
     fn evaluate(&self, p: u32, q: u32) -> Option<(f64, f64)> {
         let mut map = std::mem::take(&mut self.scratch().borrow_mut().map);
-        let ok = self.map_wedges(p, q, &mut map);
-        let r = if ok && self.valid(p, q) {
-            Some(self.cost(p, q, &map))
-        } else {
-            None
+        let mut corners = std::mem::take(&mut self.scratch().borrow_mut().corners2);
+        self.p_corners(p, &mut corners);
+        let tear = self.map_from_corners(&corners, q, &mut map);
+        self.scratch().borrow_mut().corners2 = corners;
+        let r = match tear {
+            Some(t) if self.valid(p, q) => Some(self.cost(p, q, &map, t)),
+            _ => None,
         };
         self.scratch().borrow_mut().map = map;
         r
@@ -1529,8 +1613,8 @@ impl<'a> State<'a> {
             if self.border[p as usize] && !self.bnbr[p as usize].contains(&q) {
                 continue;
             }
-            if self.map_from_corners(&corners, q, &mut map) {
-                let (c, g) = self.cost(p, q, &map);
+            if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
+                let (c, g) = self.cost(p, q, &map, tear);
                 cands.push((c, g, q));
             }
         }
@@ -1578,6 +1662,11 @@ impl<'a> State<'a> {
         let ok = self.map_wedges(p, q, &mut map);
         debug_assert!(ok);
         for &(a, b) in &map {
+            if a == b {
+                self.vpos[a as usize] = q;
+                self.slid.push(a);
+                continue;
+            }
             self.vremap[a as usize] = b;
             if self.attrs.dim > 0 {
                 let (sa, sb) = (a as usize * self.aq_stride, b as usize * self.aq_stride);
@@ -1664,6 +1753,9 @@ impl<'a> State<'a> {
         let mut rows: Vec<f64> = Vec::new();
         if self.attrs.dim > 0 {
             for &(a, b) in &map {
+                if a == b {
+                    continue;
+                }
                 let sa = a as usize * stride;
                 let k = match row_ids.iter().position(|&r| r == b) {
                     Some(k) => k,
@@ -1720,7 +1812,12 @@ impl<'a> State<'a> {
     fn apply_collapse(&mut self, plan: &CollapsePlan) -> usize {
         let (p, q) = (plan.p, plan.q);
         for &(a, b) in &plan.map {
-            self.vremap[a as usize] = b;
+            if a == b {
+                self.vpos[a as usize] = q;
+                self.slid.push(a);
+            } else {
+                self.vremap[a as usize] = b;
+            }
         }
         let stride = self.aq_stride;
         for (k, &b) in plan.row_ids.iter().enumerate() {
@@ -1819,8 +1916,8 @@ impl<'a> State<'a> {
             {
                 continue;
             }
-            if self.map_from_corners(&corners, q, &mut map) {
-                let (c, g) = self.cost(x, q, &map);
+            if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
+                let (c, g) = self.cost(x, q, &map, tear);
                 let old = heap.key[x as usize];
                 if c < old || target == q && c <= old * 1.0001 + 1e-12 {
                     self.best[x as usize] = (g, q);
@@ -2433,8 +2530,8 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                         {
                             return (x, None);
                         }
-                        if shared.map_from_corners(corners, q, map) {
-                            (x, Some(shared.cost(x, q, map)))
+                        if let Some(tear) = shared.map_from_corners(corners, q, map) {
+                            (x, Some(shared.cost(x, q, map, tear)))
                         } else {
                             (x, None)
                         }
@@ -2823,6 +2920,13 @@ fn simplify_frame(
     out.indices = out_indices;
     out.material_ids = out_mats;
     let remap = out.compact();
+    for &v in &st.slid {
+        let new = remap[v as usize];
+        if new != u32::MAX {
+            let src = st.pos_src[st.vpos[v as usize] as usize];
+            out.positions[new as usize] = mesh.positions[src as usize];
+        }
+    }
     let resolve_pos = |mut p: u32| {
         let mut guard = 0;
         while st.premap[p as usize] != p && guard < 1_000_000 {
@@ -3153,6 +3257,68 @@ pub(crate) mod tests {
             strict.mesh.triangle_count()
         );
         auto.mesh.validate().unwrap();
+    }
+
+    /// `m` cut into UV islands 10 apart in UV: `island` picks a triangle's island from its
+    /// centroid, and each island maps positions to UVs within a unit square.
+    fn with_islands(m: &Mesh, island: impl Fn(Vec3) -> u32, local: impl Fn(Vec3) -> Vec2) -> Mesh {
+        let mut pos = Vec::new();
+        let mut uv = Vec::new();
+        let mut idx = Vec::new();
+        for t in 0..m.triangle_count() {
+            let tri = m.triangle_positions(t);
+            let k = island((tri[0] + tri[1] + tri[2]) / 3.0);
+            let off = Vec2::new(10.0 * (k % 4) as f32, 10.0 * (k / 4) as f32);
+            for p in tri {
+                idx.push(pos.len() as u32);
+                pos.push(p);
+                uv.push(off + local(p));
+            }
+        }
+        let mut out = Mesh::new(pos, idx);
+        out.uvs = vec![uv];
+        crate::reduce::repair::weld(&mut out, 0.0);
+        out
+    }
+
+    #[test]
+    fn permissive_seams_keep_triangles_on_one_uv_island() {
+        // UV islands meeting at T-junctions, so many seam wedges have no wedge of their island
+        // at the position they collapse onto. Such a wedge must slide (keeping its UVs), never
+        // take another island's wedge: a triangle spanning two islands samples whatever lies
+        // between them in the texture (the Lantern's brace showed the atlas gutter).
+        let grid = with_islands(
+            &grid(12),
+            |c| u32::from(c.x >= 5.0) + u32::from(c.x >= 5.0 && c.z >= 4.0),
+            |p| Vec2::new(p.x, p.z) / 12.0,
+        );
+        let sphere = with_islands(
+            &uv_sphere(32, 16),
+            |c| u32::from(c.x > 0.3) + 2 * u32::from(c.y > -0.2) + 4 * u32::from(c.z > 0.1),
+            |p| Vec2::new(p.x + p.z, p.y + p.z) * 0.25 + 0.5,
+        );
+        for (name, m) in [("grid", &grid), ("sphere", &sphere)] {
+            for target in [120, 60, 30, 16, 8] {
+                let r = simplify(
+                    m,
+                    &SimplifyOptions {
+                        target_triangles: Some(target),
+                        seams: SeamMode::Permissive,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                r.mesh.validate().unwrap();
+                for t in 0..r.mesh.triangle_count() {
+                    let [a, b, c] = r.mesh.triangle(t).map(|v| r.mesh.uvs[0][v as usize]);
+                    let span = a.max(b).max(c) - a.min(b).min(c);
+                    assert!(
+                        span.max_element() < 2.0,
+                        "{name} target {target}: triangle {t} spans UV islands: {a} {b} {c}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
