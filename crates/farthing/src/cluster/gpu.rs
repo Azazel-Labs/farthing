@@ -10,7 +10,7 @@
 //! # Pages
 //!
 //! Clusters are packed into pages of at most [`GpuOptions::page_size`] bytes (128 KiB by
-//! default). The unit of packing is a group's output: the clusters one [`ClusterGroup`]
+//! default). The unit of packing is a group's output: the clusters one [`ClusterGroup`](super::ClusterGroup)
 //! produced share their LOD error and bounds, so they become visible together, and they
 //! always land in one page. Source-level clusters (no producing group) are packed by the group
 //! that consumes them. Units go in coarse-to-fine order (level descending), so the root
