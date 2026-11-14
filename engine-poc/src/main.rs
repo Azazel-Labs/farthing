@@ -108,10 +108,10 @@ fn save_textured(scene: &Scene, slot_textures: &[(u32, &farthing::host::ChannelI
     let mut tex = ExportTextures::default();
     for (slot, t) in slot_textures {
         if let Some(c) = t.get(channels::BASE_COLOR) {
-            tex.base_color.insert(*slot, c.image.clone());
+            tex.base_color.insert(*slot, farthing::image::Texture::from_image(&c.image, true));
         }
         if let Some(n) = t.get(channels::NORMAL).filter(|n| n.encoding == ChannelEncoding::NormalTangent) {
-            tex.normal.insert(*slot, n.image.clone());
+            tex.normal.insert(*slot, farthing::image::Texture::from_signed_normals(&n.image));
         }
     }
     farthing::io::save_glb(scene, path, &tex)?;
@@ -121,7 +121,7 @@ fn save_textured(scene: &Scene, slot_textures: &[(u32, &farthing::host::ChannelI
 fn load_gltf_into_engine(engine: &mut Engine, path: &str) -> Result<Scene> {
     let (mut scene, mats) = farthing::io::load_gltf(path)?;
     for (slot, m) in mats.iter().enumerate() {
-        let base = m.base_color_texture.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| Image::new(1, 1, Vec4::ONE));
+        let base = m.base_color_texture.as_ref().map(|t| t.0.to_image()).unwrap_or_else(|| Image::new(1, 1, Vec4::ONE));
         let cutoff = match m.info.class {
             MaterialClass::Masked { cutoff } => cutoff,
             _ => 0.0,
@@ -145,8 +145,8 @@ fn impostor_shot_mode(args: &[String]) -> Result<()> {
     // Like `load_gltf_into_engine`, plus the asset's tangent-space normal map.
     let (mut scene, mats) = farthing::io::load_gltf(path)?;
     for (slot, m) in mats.iter().enumerate() {
-        let base = m.base_color_texture.as_ref().map(|t| t.0.clone()).unwrap_or_else(|| Image::new(1, 1, Vec4::ONE));
-        let normal = m.normal_texture.as_ref().map(|t| t.0.clone());
+        let base = m.base_color_texture.as_ref().map(|t| t.0.to_image()).unwrap_or_else(|| Image::new(1, 1, Vec4::ONE));
+        let normal = m.normal_texture.as_ref().map(|t| t.0.to_image());
         let cutoff = match m.info.class {
             MaterialClass::Masked { cutoff } => cutoff,
             _ => 0.0,

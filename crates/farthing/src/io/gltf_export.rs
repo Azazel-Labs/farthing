@@ -1,4 +1,4 @@
-use crate::image::Image;
+use crate::image::Texture;
 use crate::{Error, Result, Scene};
 use glam::Mat4;
 use serde_json::{json, Value};
@@ -8,10 +8,12 @@ use std::path::Path;
 /// Optional textures to embed per material slot, so outputs open in any glTF viewer.
 #[derive(Clone, Debug, Default)]
 pub struct ExportTextures {
-    /// slot index → (base color, linear RGB), sampled with UV set 0.
-    pub base_color: BTreeMap<u32, Image>,
-    /// slot index → tangent-space normal map (xyz in -1..1).
-    pub normal: BTreeMap<u32, Image>,
+    /// slot index → base color, sampled with UV set 0. Written as sRGB (converted if the
+    /// texture holds linear bytes); build one from a bake with [`Texture::from_image`].
+    pub base_color: BTreeMap<u32, Texture>,
+    /// slot index → tangent-space normal map stored as glTF does (xyz · 0.5 + 0.5; see
+    /// [`Texture::from_signed_normals`]).
+    pub normal: BTreeMap<u32, Texture>,
     /// slot index → alpha cutoff, for alpha-tested outputs (impostors, cards).
     pub alpha_cutoff: BTreeMap<u32, f32>,
     /// slot index → base color factor (linear RGBA; multiplies the base color texture).
@@ -19,7 +21,7 @@ pub struct ExportTextures {
     pub base_color_factor: BTreeMap<u32, glam::Vec4>,
     /// slot index → glTF metallic-roughness texture (linear data: G = roughness,
     /// B = metalness), sampled with UV set 0.
-    pub metallic_roughness: BTreeMap<u32, Image>,
+    pub metallic_roughness: BTreeMap<u32, Texture>,
     /// slot index → (metallic, roughness) factors. Default (0, 0.8) without a texture,
     /// (1, 1) with one.
     pub metallic_roughness_factor: BTreeMap<u32, glam::Vec2>,
@@ -92,27 +94,16 @@ impl Bin {
     }
 }
 
-fn png_bytes(img: &Image, srgb: bool) -> Result<Vec<u8>> {
+fn png_bytes(tex: &Texture, srgb: bool) -> Result<Vec<u8>> {
     use image::ImageEncoder;
-    let mut raw = Vec::with_capacity(img.pixels.len() * 4);
-    for p in &img.pixels {
-        let rgb = if srgb {
-            [
-                crate::image::linear_to_srgb(p.x),
-                crate::image::linear_to_srgb(p.y),
-                crate::image::linear_to_srgb(p.z),
-            ]
-        } else {
-            [p.x, p.y, p.z]
-        };
-        for c in rgb {
-            raw.push((c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-        }
-        raw.push((p.w.clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
-    }
     let mut out = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&raw, img.width, img.height, image::ExtendedColorType::Rgba8)
+        .write_image(
+            &tex.rgba8_as(srgb),
+            tex.width,
+            tex.height,
+            image::ExtendedColorType::Rgba8,
+        )
         .map_err(|e| Error::Image(e.to_string()))?;
     Ok(out)
 }
@@ -167,12 +158,7 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
                 mat["pbrMetallicRoughness"]["baseColorTexture"] = json!({ "index": gl_textures.len() - 1 });
             }
             if let Some(img) = textures.normal.get(&(slot as u32)) {
-                let enc = Image {
-                    width: img.width,
-                    height: img.height,
-                    pixels: img.pixels.iter().map(|p| (p.truncate() * 0.5 + 0.5).extend(1.0)).collect(),
-                };
-                let view = bin.view(&png_bytes(&enc, false)?, None);
+                let view = bin.view(&png_bytes(img, false)?, None);
                 images.push(json!({ "bufferView": view, "mimeType": "image/png" }));
                 gl_textures.push(json!({ "source": images.len() - 1 }));
                 mat["normalTexture"] = json!({ "index": gl_textures.len() - 1 });

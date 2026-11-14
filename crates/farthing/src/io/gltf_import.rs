@@ -1,5 +1,5 @@
 use crate::host::{MaterialClass, MaterialInfo};
-use crate::image::Image;
+use crate::image::Texture;
 use crate::{
     Error, Instance, Joint, MaterialId, MaterialSlot, Mesh, MorphTarget, Result, Scene, Skeleton,
     Skin,
@@ -15,15 +15,16 @@ pub struct GltfMaterial {
     pub name: String,
     pub info: MaterialInfo,
     pub base_color_factor: Vec4,
-    /// Decoded base color texture (linear RGB, sRGB-decoded) and its UV set.
-    pub base_color_texture: Option<(Image, u32)>,
+    /// Base color texture (sRGB; [`Texture::sample_bilinear`] returns linear RGB) and its UV
+    /// set. Textures used by several materials share their texels.
+    pub base_color_texture: Option<(Texture, u32)>,
     pub metallic_factor: f32,
     pub roughness_factor: f32,
     /// Metallic-roughness texture as stored (linear data: G = roughness, B = metalness) and
     /// its UV set.
-    pub metallic_roughness_texture: Option<(Image, u32)>,
+    pub metallic_roughness_texture: Option<(Texture, u32)>,
     /// Tangent-space normal map as stored (linear data, xyz in 0..1), its UV set and scale.
-    pub normal_texture: Option<(Image, u32, f32)>,
+    pub normal_texture: Option<(Texture, u32, f32)>,
 }
 
 /// Loads a glTF / GLB file. Each glTF mesh becomes one [`Mesh`] (primitives merged, material
@@ -32,7 +33,7 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<(Scene, Vec<GltfMaterial>)> {
     let (doc, buffers, images) =
         gltf::import(path.as_ref()).map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
     build(&doc, &buffers, &|i, srgb| {
-        images.get(i).map(|d| decode_image(d, srgb))
+        images.get(i).and_then(|d| decode_image(d, srgb))
     })
 }
 
@@ -82,27 +83,26 @@ pub fn load_gltf_with(
         }
         buffers.push(gltf::buffer::Data(data));
     }
-    // Images are decoded on demand (only the material textures farthing reads).
-    let mut encoded: Vec<Option<Vec<u8>>> = Vec::new();
+    // Images are decoded on demand (only the material textures farthing reads). Embedded
+    // ones are borrowed from their buffer, not copied.
+    let mut external: Vec<Option<Vec<u8>>> = Vec::new();
     for img in document.images() {
-        encoded.push(match img.source() {
-            gltf::image::Source::View { view, .. } => {
-                let buf = &buffers[view.buffer().index()];
-                buf.get(view.offset()..view.offset() + view.length())
-                    .map(<[u8]>::to_vec)
-            }
+        external.push(match img.source() {
+            gltf::image::Source::View { .. } => None,
             gltf::image::Source::Uri { uri, .. } => fetch(uri).ok(),
         });
     }
+    let encoded = |i: usize| -> Option<&[u8]> {
+        match document.images().nth(i)?.source() {
+            gltf::image::Source::View { view, .. } => {
+                buffers[view.buffer().index()].get(view.offset()..view.offset() + view.length())
+            }
+            gltf::image::Source::Uri { .. } => external.get(i)?.as_deref(),
+        }
+    };
     build(&document, &buffers, &|i, srgb| {
-        let bytes = encoded.get(i)?.as_ref()?;
-        let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
-        Some(Image::from_rgba8(
-            rgba.width(),
-            rgba.height(),
-            rgba.as_raw(),
-            srgb,
-        ))
+        let rgba = image::load_from_memory(encoded(i)?).ok()?.into_rgba8();
+        Texture::from_rgba8(rgba.width(), rgba.height(), rgba.as_raw(), srgb).ok()
     })
 }
 
@@ -160,9 +160,19 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 fn build(
     doc: &gltf::Document,
     buffers: &[gltf::buffer::Data],
-    // Image index, sRGB-decode → decoded image.
-    image: &dyn Fn(usize, bool) -> Option<Image>,
+    // Image index, sRGB → decoded texture.
+    decode: &dyn Fn(usize, bool) -> Option<Texture>,
 ) -> Result<(Scene, Vec<GltfMaterial>)> {
+    // Each image decodes once, however many materials use it.
+    let cache = std::cell::RefCell::new(HashMap::<(usize, bool), Option<Texture>>::new());
+    let image = |i: usize, srgb: bool| -> Option<Texture> {
+        if let Some(t) = cache.borrow().get(&(i, srgb)) {
+            return t.clone();
+        }
+        let t = decode(i, srgb);
+        cache.borrow_mut().insert((i, srgb), t.clone());
+        t
+    };
     // Material slots: one per glTF material, plus a default slot for primitives without one.
     let mut materials: Vec<MaterialSlot> = doc
         .materials()
@@ -410,7 +420,7 @@ fn build(
     ))
 }
 
-fn decode_image(img: &gltf::image::Data, srgb: bool) -> Image {
+fn decode_image(img: &gltf::image::Data, srgb: bool) -> Option<Texture> {
     use gltf::image::Format;
     let px = &img.pixels;
     let rgba: Vec<u8> = match img.format {
@@ -435,5 +445,5 @@ fn decode_image(img: &gltf::image::Data, srgb: bool) -> Image {
             .collect(),
         _ => vec![255; (img.width * img.height * 4) as usize],
     };
-    Image::from_rgba8(img.width, img.height, &rgba, srgb)
+    Texture::from_rgba8(img.width, img.height, &rgba, srgb).ok()
 }

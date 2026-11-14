@@ -32,9 +32,9 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
-/// Peak heap a sample may reach: wasm32 linear memory stops at 4 GiB, and a growing `Vec`
-/// briefly needs its old and new buffers, so leave a quarter for that and fragmentation.
-const WASM_HEAP_BUDGET: usize = 3 << 30;
+/// Peak heap a sample may reach. wasm32 linear memory stops at 4 GiB; the samples peak near
+/// 360 MB (FlightHelmet), so 1 GiB catches a regression long before a browser would trap.
+const WASM_HEAP_BUDGET: usize = 1 << 30;
 
 fn textured_sphere() -> Vec<u8> {
     let (seg, rings) = (48u32, 24u32);
@@ -71,7 +71,8 @@ fn textured_sphere() -> Vec<u8> {
         }
     }
     let mut t = ExportTextures::default();
-    t.base_color.insert(0, tex);
+    t.base_color
+        .insert(0, farthing::image::Texture::from_image(&tex, true));
     glb_bytes(&Scene::from_mesh(m), &t).unwrap()
 }
 

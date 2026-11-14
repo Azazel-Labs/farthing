@@ -42,13 +42,13 @@ mod web {
 
         /// The original as GLB, with the materials as farthing reads them.
         #[wasm_bindgen(js_name = originalGlb)]
-        pub fn original_glb(&mut self) -> Result<Vec<u8>, JsError> {
+        pub fn original_glb(&self) -> Result<Vec<u8>, JsError> {
             self.0.original_glb().map_err(|e| JsError::new(&e))
         }
 
         /// A level of the last run as a self-contained GLB.
         #[wasm_bindgen(js_name = levelGlb)]
-        pub fn level_glb(&mut self, level: usize) -> Result<Vec<u8>, JsError> {
+        pub fn level_glb(&self, level: usize) -> Result<Vec<u8>, JsError> {
             self.0.level_glb(level).map_err(|e| JsError::new(&e))
         }
 

@@ -12,7 +12,7 @@ use farthing::host::{
     channels, BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, MaterialClass,
     MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages, ViewRenderRequest,
 };
-use farthing::image::{linear_to_srgb, Image};
+use farthing::image::{linear_to_srgb, Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
 use farthing::metrics::surface_distance;
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
@@ -152,12 +152,11 @@ pub enum Event<'a> {
 pub struct Demo {
     pub name: String,
     pub scene: Scene,
-    /// The decoded textures live here and only here (a 2K-textured asset is over a gigabyte
-    /// of float texels; a copy per level ran wasm out of memory). Export borrows them, see
-    /// [`with_original_textures`].
+    /// Decoded textures are shared 8-bit [`Texture`]s: every level that uses the original
+    /// materials holds references, not copies.
     pub materials: Vec<GltfMaterial>,
-    /// Results of the last run, by level (0 = original). `None`: the original materials.
-    levels: Vec<(Scene, Option<ExportTextures>)>,
+    /// Results of the last run, by level (0 = original), with the textures to export.
+    levels: Vec<(Scene, ExportTextures)>,
 }
 
 impl Demo {
@@ -224,7 +223,7 @@ impl Demo {
             .to_owned();
         Ok(Demo {
             name,
-            levels: vec![(scene.clone(), None)],
+            levels: vec![(scene.clone(), original_textures(&materials))],
             scene,
             materials,
         })
@@ -252,23 +251,17 @@ impl Demo {
     /// The original as GLB with base color, metallic-roughness and normal textures and factors
     /// (what farthing reads of the materials), so every level is shown with the same material
     /// model.
-    pub fn original_glb(&mut self) -> Result<Vec<u8>, String> {
-        let scene = &self.scene;
-        with_original_textures(&mut self.materials, |t| glb_bytes(scene, t))
-            .map_err(|e| e.to_string())
+    pub fn original_glb(&self) -> Result<Vec<u8>, String> {
+        self.level_glb(0)
     }
 
     /// A level of the last run as a self-contained GLB (for download).
-    pub fn level_glb(&mut self, level: usize) -> Result<Vec<u8>, String> {
+    pub fn level_glb(&self, level: usize) -> Result<Vec<u8>, String> {
         let (s, t) = self
             .levels
             .get(level)
             .ok_or_else(|| format!("no level {level}; run first"))?;
-        match t {
-            Some(t) => glb_bytes(s, t),
-            None => with_original_textures(&mut self.materials, |t| glb_bytes(s, t)),
-        }
-        .map_err(|e| e.to_string())
+        glb_bytes(s, t).map_err(|e| e.to_string())
     }
 
     /// Builds the chain, reporting each level as it finishes. `now` returns milliseconds.
@@ -368,7 +361,7 @@ impl Demo {
                 info: &info,
                 glb: &glb,
             });
-            self.levels.push((s, None));
+            self.levels.push((s, original_textures(&self.materials)));
         }
         if bake_from > levels {
             emit(Event::Stage("done"));
@@ -455,13 +448,16 @@ impl Demo {
                 });
                 match name.as_str() {
                     channels::BASE_COLOR => {
-                        tex.base_color.insert(0, ch.image.clone());
+                        tex.base_color
+                            .insert(0, Texture::from_image(&ch.image, true));
                     }
                     channels::NORMAL => {
-                        tex.normal.insert(0, ch.image.clone());
+                        tex.normal
+                            .insert(0, Texture::from_signed_normals(&ch.image));
                     }
                     channels::ORM => {
-                        tex.metallic_roughness.insert(0, ch.image.clone());
+                        tex.metallic_roughness
+                            .insert(0, Texture::from_image(&ch.image, false));
                     }
                     _ => {}
                 }
@@ -477,7 +473,7 @@ impl Demo {
                 info: &info,
                 glb: &glb,
             });
-            self.levels.push((s, Some(tex)));
+            self.levels.push((s, tex));
         }
         emit(Event::Stage("done"));
         Ok(())
@@ -527,18 +523,10 @@ fn normalize(path: &str) -> String {
     parts.join("/")
 }
 
-/// Runs `f` with the materials' textures as [`ExportTextures`]. The images are moved out of
-/// `materials` and back, never copied (normal maps go to -1..1 and back in place).
-fn with_original_textures<R>(
-    materials: &mut [GltfMaterial],
-    f: impl FnOnce(&ExportTextures) -> R,
-) -> R {
-    let to_signed = |p: &mut glam::Vec4| *p = (p.truncate() * 2.0 - glam::Vec3::ONE).extend(p.w);
-    let to_unit = |p: &mut glam::Vec4| *p = ((p.truncate() + glam::Vec3::ONE) * 0.5).extend(p.w);
-    let empty = || Image::new(0, 0, glam::Vec4::ZERO);
-    let take = |img: &mut Image| std::mem::replace(img, empty());
+/// The materials' textures and factors for export (the textures are shared, not copied).
+fn original_textures(materials: &[GltfMaterial]) -> ExportTextures {
     let mut t = ExportTextures::default();
-    for (i, m) in materials.iter_mut().enumerate() {
+    for (i, m) in materials.iter().enumerate() {
         let i = i as u32;
         t.base_color_factor.insert(i, m.base_color_factor);
         t.metallic_roughness_factor
@@ -546,34 +534,17 @@ fn with_original_textures<R>(
         if let MaterialClass::Masked { cutoff } = m.info.class {
             t.alpha_cutoff.insert(i, cutoff);
         }
-        if let Some((img, _)) = &mut m.base_color_texture {
-            t.base_color.insert(i, take(img));
+        if let Some((tex, _)) = &m.base_color_texture {
+            t.base_color.insert(i, tex.clone());
         }
-        if let Some((img, _)) = &mut m.metallic_roughness_texture {
-            t.metallic_roughness.insert(i, take(img));
+        if let Some((tex, _)) = &m.metallic_roughness_texture {
+            t.metallic_roughness.insert(i, tex.clone());
         }
-        if let Some((img, _, _)) = &mut m.normal_texture {
-            let mut n = take(img);
-            n.pixels.iter_mut().for_each(to_signed);
-            t.normal.insert(i, n);
+        if let Some((tex, _, _)) = &m.normal_texture {
+            t.normal.insert(i, tex.clone());
         }
     }
-    let r = f(&t);
-    for (i, m) in materials.iter_mut().enumerate() {
-        let i = i as u32;
-        if let Some((img, _)) = &mut m.base_color_texture {
-            *img = t.base_color.remove(&i).unwrap_or_else(empty);
-        }
-        if let Some((img, _)) = &mut m.metallic_roughness_texture {
-            *img = t.metallic_roughness.remove(&i).unwrap_or_else(empty);
-        }
-        if let Some((img, _, _)) = &mut m.normal_texture {
-            let mut n = t.normal.remove(&i).unwrap_or_else(empty);
-            n.pixels.iter_mut().for_each(to_unit);
-            *img = n;
-        }
-    }
-    r
+    t
 }
 
 fn to_rgba8(img: &Image, encoding: ChannelEncoding) -> Vec<u8> {
@@ -671,17 +642,17 @@ impl RenderHost for MaterialHost<'_> {
                 },
             );
         }
-        let image = |pixels| Image {
+        let image = |pixels: &mut Vec<Vec4>| Image {
             width: req.width,
             height: req.height,
-            pixels,
+            pixels: std::mem::take(pixels),
         };
         let mut out = ChannelImages::new();
         for ch in &req.channels {
             let (img, encoding) = match ch.as_str() {
-                channels::BASE_COLOR => (image(color.clone()), ChannelEncoding::Color),
-                channels::NORMAL => (image(normal.clone()), ChannelEncoding::NormalWorld),
-                channels::ORM => (image(orm.clone()), ChannelEncoding::Data),
+                channels::BASE_COLOR => (image(&mut color), ChannelEncoding::Color),
+                channels::NORMAL => (image(&mut normal), ChannelEncoding::NormalWorld),
+                channels::ORM => (image(&mut orm), ChannelEncoding::Data),
                 _ => {
                     return Err(Error::Unsupported(
                         "channel (demo host: base_color, normal, orm)",
