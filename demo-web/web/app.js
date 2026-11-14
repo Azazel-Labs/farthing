@@ -1644,6 +1644,7 @@ function readOptions() {
     view_distance: Math.max(0, +f.view_distance.value || 0),
     view_fov: +f.view_fov.value,
     view_height: +f.view_height.value,
+    shared_keep_layout: f.shared_keep_layout.checked,
     fast: f.fast.checked,
     strict_seams: f.strict_seams.checked,
     symmetry: f.symmetry.checked,
@@ -1667,6 +1668,7 @@ function syncModeUi() {
   const m = form.elements.mode.value;
   for (const fs of form.querySelectorAll("fieldset[data-modes]")) fs.hidden = !fs.dataset.modes.split(" ").includes(m);
   $("#shared-size").hidden = form.elements.textures.value !== "shared";
+  $("#shared-layout").hidden = form.elements.textures.value !== "shared";
   $("#mode-hint").textContent = MODE_HINTS[m] ?? "";
   syncViewHint();
 }

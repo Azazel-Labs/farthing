@@ -133,7 +133,7 @@
         <label class="select" title="From this level on, the scene is merged into one mesh, unwrapped and its materials baked into an atlas">
           Bake proxy from <select name="bake_from"></select>
         </label>
-        <label class="select" title="Levels before the proxy: each mesh reduced with its own UVs and materials, or the whole scene re-unwrapped once and its materials baked into one shared atlas at the artist's texel density">
+        <label class="select" title="Levels before the proxy: each mesh reduced with its own UVs and materials, or the whole scene laid out once and its materials baked into one shared atlas at the artist's texel density">
           Near textures
           <select name="textures">
             <option value="original" selected>Original materials</option>
@@ -148,6 +148,7 @@
             <option value="2048" selected>2048</option>
           </select>
         </label>
+        <label class="check" id="shared-layout" title="Keep the artist's UV islands so the atlas copies the original texels one to one, and store texels that mirrored or repeated parts reuse only once. Off: unwrap the scene afresh."><input type="checkbox" name="shared_keep_layout" checked> Keep the artist's UV layout</label>
       </fieldset>
 
       <fieldset data-modes="chain">
