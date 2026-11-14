@@ -20,7 +20,7 @@ use crate::reduce::kernels;
 use crate::reduce::quadric::Quadric;
 use crate::reduce::symmetry::{mirror_map, Symmetry};
 use crate::{Error, Mesh, Result, Scene};
-use glam::DVec3;
+use glam::{DVec2, DVec3, Vec2};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -230,6 +230,12 @@ const MAX_SOURCE_WEDGES: usize = 8;
 const TEAR_UV: f64 = 1.0;
 /// Wedges whose UVs are closer than this have the same UV (a normal-only seam).
 const TEAR_SAME_UV: f64 = 1e-4;
+/// Furthest (texture units) a UV island's boundary may drift outward, summed over the
+/// collapses that move it (see `State::uv_drift`). Past the boundary lies the texture's gutter,
+/// which shows as white cracks; half a texel at 1024² keeps clear of any padding.
+const DRIFT_UV: f64 = 1.0 / 2048.0;
+/// Points sampled per edge when measuring how far a UV spill reaches (see `State::uv_merge_ok`).
+const SPILL_SAMPLES: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Validity {
@@ -240,6 +246,8 @@ enum Validity {
     Link,
     Degenerate,
     Flip,
+    /// A UV island would cover texture gutter or fold over.
+    Gutter,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -364,6 +372,9 @@ struct Scratch {
     corners: Vec<Corner>,
     map2: Vec<(u32, u32)>,
     corners2: Vec<Corner>,
+    map3: Vec<(u32, u32)>,
+    corners3: Vec<Corner>,
+    drift: Vec<(u32, f32)>,
 }
 
 /// Per-position triangle lists in one arena: contiguous, no per-vertex allocations. A list that
@@ -457,6 +468,8 @@ struct CollapsePlan {
     moved: Vec<(u32, [u32; 3], [u32; 3])>,
     /// q's quadric after absorbing p's.
     quadric: Quadric,
+    /// New UV boundary drift per wedge (see `State::uv_drift`).
+    drift: Vec<(u32, f32)>,
 }
 
 /// One of p's corners: p's wedge, the other two wedges, and their positions.
@@ -564,6 +577,9 @@ struct State<'a> {
     /// Wedges that slid onto another position, keeping their attributes (see
     /// [`State::map_from_corners`]); their output position is that of their final position.
     slid: Vec<u32>,
+    /// Per wedge: how far (texture units) the UV island boundary edges at it may already have
+    /// drifted outward from the source island (see `State::uv_drift`).
+    drift: Vec<f32>,
     inv_scale: f64,
     mirror: Option<Vec<u32>>,
     avg_area: f64,
@@ -585,6 +601,67 @@ fn ekey(a: u32, b: u32) -> (u32, u32) {
     } else {
         (b, a)
     }
+}
+
+/// Distance from `x` to triangle `t` (0 inside; either winding).
+fn tri_distance(x: DVec2, t: [DVec2; 3]) -> f64 {
+    let s = (t[1] - t[0]).perp_dot(t[2] - t[0]);
+    let inside = (0..3).all(|e| (t[(e + 1) % 3] - t[e]).perp_dot(x - t[e]) * s >= 0.0);
+    if inside && s != 0.0 {
+        return 0.0;
+    }
+    (0..3)
+        .map(|e| {
+            let (a, b) = (t[e], t[(e + 1) % 3]);
+            let d = b - a;
+            let l2 = d.length_squared();
+            let k = if l2 > 0.0 {
+                ((x - a).dot(d) / l2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (x - (a + d * k)).length()
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Area of triangle `t` inside triangle `o` (either winding).
+fn clip_area(t: [DVec2; 3], o: [DVec2; 3]) -> f64 {
+    let sign = (o[1] - o[0]).perp_dot(o[2] - o[0]);
+    if sign == 0.0 {
+        return 0.0;
+    }
+    let mut poly = [DVec2::ZERO; 9];
+    let mut next = [DVec2::ZERO; 9];
+    poly[..3].copy_from_slice(&t);
+    let mut n = 3;
+    for e in 0..3 {
+        let (p0, p1) = (o[e], o[(e + 1) % 3]);
+        let side = |x: DVec2| (p1 - p0).perp_dot(x - p0) * sign;
+        let mut m = 0;
+        for i in 0..n {
+            let (a, b) = (poly[i], poly[(i + 1) % n]);
+            let (sa, sb) = (side(a), side(b));
+            if sa >= 0.0 {
+                next[m] = a;
+                m += 1;
+            }
+            if (sa >= 0.0) != (sb >= 0.0) && m < 9 {
+                next[m] = a + (b - a) * (sa / (sa - sb));
+                m += 1;
+            }
+        }
+        n = m.min(9);
+        poly = next;
+        if n < 3 {
+            return 0.0;
+        }
+    }
+    let mut a = 0.0;
+    for i in 0..n {
+        a += poly[i].perp_dot(poly[(i + 1) % n]);
+    }
+    a.abs() * 0.5
 }
 
 impl<'a> State<'a> {
@@ -1027,6 +1104,7 @@ impl<'a> State<'a> {
             vremap: (0..mesh.vertex_count() as u32).collect(),
             pos_src,
             slid: Vec::new(),
+            drift: vec![0.0; mesh.vertex_count()],
             premap: (0..np as u32).collect(),
             inv_scale: diag,
             mirror,
@@ -1422,6 +1500,41 @@ impl<'a> State<'a> {
             }
         }
         // Link condition via marker arrays.
+        if !self.link_ok(p, q) {
+            return Validity::Link;
+        }
+        // Flips and degeneracy.
+        let qp = self.pos[q as usize];
+        for &t in self.adj.get(p) {
+            let ps = self.tpos[t as usize];
+            if ps.contains(&q) {
+                continue;
+            }
+            let pts = ps.map(|x| self.pos[x as usize]);
+            let n0 = (pts[1] - pts[0]).cross(pts[2] - pts[0]);
+            let moved = ps.map(|x| if x == p { qp } else { self.pos[x as usize] });
+            let n1 = (moved[1] - moved[0]).cross(moved[2] - moved[0]);
+            let (l0, l1) = (n0.length(), n1.length());
+            if l1 < 1e-14 {
+                return Validity::Degenerate;
+            }
+            if l0 > 1e-20 && n0.dot(n1) / (l0 * l1) < self.opts.min_face_dot as f64 {
+                return Validity::Flip;
+            }
+        }
+        if !self.mesh.uvs.is_empty() {
+            let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
+            let ok = self.uv_drift(p, q, &mut drift);
+            self.scratch().borrow_mut().drift = drift;
+            if !ok {
+                return Validity::Gutter;
+            }
+        }
+        Validity::Ok
+    }
+
+    /// The link condition: p and q share no neighbours beyond the triangles they share.
+    fn link_ok(&self, p: u32, q: u32) -> bool {
         let mut s = self.scratch().borrow_mut();
         let s = &mut *s;
         s.epoch = s.epoch.wrapping_add(1);
@@ -1448,29 +1561,141 @@ impl<'a> State<'a> {
             .iter()
             .filter(|&&t| self.tpos[t as usize].contains(&q))
             .count();
-        if common > shared {
-            return Validity::Link;
+        common <= shared
+    }
+
+    /// UV safety of collapsing p onto q, with the boundary drift it leaves in `out` as
+    /// (wedge, drift) to record (see [`State::drift`]). For each wedge of p merging into a
+    /// wedge of q on the same UV island, in every UV set: the moved triangles must not fold
+    /// over in UV, and where p sits on the island's boundary and q is its boundary neighbour,
+    /// the boundary loses its corner at p. If that corner is reflex (the island wraps more than
+    /// half way round p) the new edge cuts across texture outside the island: the gutter, which
+    /// shows as white cracks. Such drift is summed per boundary and capped at [`DRIFT_UV`].
+    /// Wedges that slide (keep their UVs) or tear onto another island change no UV island's
+    /// shape and are priced elsewhere.
+    fn uv_drift(&self, p: u32, q: u32, out: &mut Vec<(u32, f32)>) -> bool {
+        out.clear();
+        let (mut corners, mut map) = {
+            let mut s = self.scratch().borrow_mut();
+            (std::mem::take(&mut s.corners3), std::mem::take(&mut s.map3))
+        };
+        self.p_corners(p, &mut corners);
+        let ok = self.map_from_corners(&corners, q, &mut map).is_some()
+            && map
+                .iter()
+                .filter(|&&(pw, qw)| pw != qw)
+                .all(|&(pw, qw)| self.uv_merge_ok(&corners, q, pw, qw, out));
+        let mut s = self.scratch().borrow_mut();
+        s.corners3 = corners;
+        s.map3 = map;
+        ok
+    }
+
+    fn record_drift(&mut self, drift: &[(u32, f32)]) {
+        for &(w, d) in drift {
+            let x = &mut self.drift[w as usize];
+            *x = x.max(d);
         }
-        // Flips and degeneracy.
-        let qp = self.pos[q as usize];
-        for &t in self.adj.get(p) {
-            let ps = self.tpos[t as usize];
-            if ps.contains(&q) {
-                continue;
+    }
+
+    /// One wedge merge of [`State::uv_drift`]: in every UV set, p's fan on pw's island (its
+    /// corners with pw's UV, wedges split only by normals included) gets q's UV in place of
+    /// p's. Each moved triangle must keep its UV winding and stay inside the old fan, which
+    /// lies on the island; whatever it covers outside is texture gutter. That spill, as the
+    /// height of a sliver over the triangle's longest edge, is added to the drift already at
+    /// its corners and capped at [`DRIFT_UV`].
+    fn uv_merge_ok(
+        &self,
+        corners: &[Corner],
+        q: u32,
+        pw: u32,
+        qw: u32,
+        out: &mut Vec<(u32, f32)>,
+    ) -> bool {
+        let same =
+            |a: Vec2, b: Vec2| (a - b).length_squared() as f64 <= TEAR_SAME_UV * TEAR_SAME_UV;
+        let carried = self.drift[pw as usize];
+        if carried > 0.0 {
+            out.push((qw, carried));
+        }
+        for set in &self.mesh.uvs {
+            let uv = |w: u32| set[w as usize].as_dvec2();
+            let (up, uq) = (set[pw as usize], set[qw as usize]);
+            let fan = || corners.iter().filter(|c| same(set[c.pw as usize], up));
+            let at_q = |p: u32, w: u32| p == q && same(set[w as usize], uq);
+            if !fan().any(|c| at_q(c.pa, c.a) || at_q(c.pb, c.b)) {
+                continue; // q's wedge is on another island: a tear, priced in the cost
             }
-            let pts = ps.map(|x| self.pos[x as usize]);
-            let n0 = (pts[1] - pts[0]).cross(pts[2] - pts[0]);
-            let moved = ps.map(|x| if x == p { qp } else { self.pos[x as usize] });
-            let n1 = (moved[1] - moved[0]).cross(moved[2] - moved[0]);
-            let (l0, l1) = (n0.length(), n1.length());
-            if l1 < 1e-14 {
-                return Validity::Degenerate;
-            }
-            if l0 > 1e-20 && n0.dot(n1) / (l0 * l1) < self.opts.min_face_dot as f64 {
-                return Validity::Flip;
+            // A closed fan (every neighbour on both sides of p on this island) whose triangles
+            // keep their winding is covered exactly once from q: only open fans can spill.
+            let closed = fan()
+                .all(|c| fan().any(|d| d.pa == c.pb && same(set[d.a as usize], set[c.b as usize])));
+            let q2 = uq.as_dvec2();
+            for c in fan() {
+                if c.pa == q || c.pb == q {
+                    continue;
+                }
+                let (a, b) = (uv(c.a), uv(c.b));
+                let before = (a - uv(c.pw)).perp_dot(b - uv(c.pw));
+                let after = (a - q2).perp_dot(b - q2);
+                if before * after < 0.0 || (before != 0.0 && after == 0.0) {
+                    return false; // folds over in UV
+                }
+                if closed {
+                    continue;
+                }
+                let tri = [q2, a, b];
+                let area = after.abs() * 0.5;
+                let inside: f64 = fan()
+                    .map(|o| clip_area(tri, [uv(o.pw), uv(o.a), uv(o.b)]))
+                    .sum();
+                let spill = area - inside;
+                if spill <= 1e-6 * area + 1e-14 {
+                    continue;
+                }
+                // How far the spill reaches. It lies inside the triangle and the corners and
+                // a-b lie on the fan, so its farthest point out is on an edge through q: across
+                // from a fan vertex inside the triangle (p's old corner, for a reflex island
+                // boundary), or between two boundary edges (sampled).
+                let near = [qw, pw, c.a, c.b]
+                    .iter()
+                    .map(|&w| self.drift[w as usize])
+                    .fold(0.0f32, f32::max) as f64;
+                let gap = |x: DVec2| {
+                    fan()
+                        .map(|o| tri_distance(x, [uv(o.pw), uv(o.a), uv(o.b)]))
+                        .fold(f64::INFINITY, f64::min)
+                };
+                let mut reach = 0.0f64;
+                for end in [a, b] {
+                    let dir = end - q2;
+                    let l2 = dir.length_squared();
+                    if l2 == 0.0 {
+                        continue;
+                    }
+                    let eps = 1e-6 * l2.sqrt();
+                    let ring = fan().flat_map(|o| [uv(o.a), uv(o.b)]);
+                    let across = std::iter::once(up.as_dvec2())
+                        .chain(ring)
+                        .filter(|&v| tri_distance(v, tri) <= eps)
+                        .map(|v| (v - q2).dot(dir) / l2);
+                    let samples = (1..SPILL_SAMPLES).map(|k| k as f64 / SPILL_SAMPLES as f64);
+                    for t in across.chain(samples) {
+                        if t > 0.0 && t < 1.0 {
+                            reach = reach.max(gap(q2 + dir * t));
+                        }
+                    }
+                    if near + reach > DRIFT_UV {
+                        return false;
+                    }
+                }
+                let drift = near + reach;
+                for w in [qw, c.a, c.b] {
+                    out.push((w, drift as f32));
+                }
             }
         }
-        Validity::Ok
+        true
     }
 
     /// Debug (`LF_STALL`): why each live position has no collapse left.
@@ -1668,6 +1893,12 @@ impl<'a> State<'a> {
     /// Collapses `p` onto `q` in place (the serial path; `plan_collapse` + `apply_collapse`
     /// produce the same state).
     fn collapse(&mut self, p: u32, q: u32) -> usize {
+        if !self.mesh.uvs.is_empty() {
+            let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
+            self.uv_drift(p, q, &mut drift);
+            self.record_drift(&drift);
+            self.scratch().borrow_mut().drift = drift;
+        }
         let mut map = std::mem::take(&mut self.scratch().borrow_mut().map2);
         let ok = self.map_wedges(p, q, &mut map);
         debug_assert!(ok);
@@ -1806,7 +2037,12 @@ impl<'a> State<'a> {
         }
         let mut quadric = self.quadric[q as usize];
         quadric.add(&self.quadric[p as usize]);
+        let mut drift = Vec::new();
+        if !self.mesh.uvs.is_empty() {
+            self.uv_drift(p, q, &mut drift);
+        }
         CollapsePlan {
+            drift,
             p,
             q,
             map,
@@ -1821,6 +2057,7 @@ impl<'a> State<'a> {
     /// Writes a plan from [`plan_collapse`](Self::plan_collapse). Returns triangles removed.
     fn apply_collapse(&mut self, plan: &CollapsePlan) -> usize {
         let (p, q) = (plan.p, plan.q);
+        self.record_drift(&plan.drift);
         for &(a, b) in &plan.map {
             if a == b {
                 self.vpos[a as usize] = q;
@@ -3326,6 +3563,59 @@ pub(crate) mod tests {
                         span.max_element() < 2.0,
                         "{name} target {target}: triangle {t} spans UV islands: {a} {b} {c}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uv_islands_never_spill_into_the_gutter() {
+        // A flat sheet in two UV islands whose shared seam bows into the left island in UV: a
+        // chord between two of its seam vertices crosses texture outside the island (the
+        // Lantern's brace showed white cracks there). Every reduced triangle must stay on its
+        // source island, give or take the allowed drift.
+        let bow = |p: Vec3| {
+            let ramp = if p.x <= 8.0 { p.x } else { 16.0 - p.x } / 8.0;
+            Vec2::new(
+                p.x / 16.0 - 0.1 * (p.z / 16.0 * std::f32::consts::PI).sin() * ramp,
+                p.z / 16.0,
+            )
+        };
+        let m = with_islands(&grid(16), |c| u32::from(c.x >= 8.0), bow);
+        let src: Vec<[Vec2; 3]> = (0..m.triangle_count())
+            .map(|t| m.triangle(t).map(|v| m.uvs[0][v as usize]))
+            .collect();
+        let on_source = |x: Vec2| {
+            src.iter().any(|t| {
+                let s = (t[1] - t[0]).perp_dot(t[2] - t[0]).signum();
+                (0..3).all(|e| {
+                    let (a, b) = (t[e], t[(e + 1) % 3]);
+                    (b - a).perp_dot(x - a) * s / (b - a).length() > -1e-3
+                })
+            })
+        };
+        for seams in [SeamMode::Permissive, SeamMode::Strict] {
+            for target in [200, 100, 50, 24] {
+                let r = simplify(
+                    &m,
+                    &SimplifyOptions {
+                        target_triangles: Some(target),
+                        seams,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                for t in 0..r.mesh.triangle_count() {
+                    let [a, b, c] = r.mesh.triangle(t).map(|v| r.mesh.uvs[0][v as usize]);
+                    for i in 0..=8 {
+                        for j in 0..=8 - i {
+                            let x = a + (b - a) * (i as f32 / 8.0) + (c - a) * (j as f32 / 8.0);
+                            assert!(
+                                on_source(x),
+                                "{seams:?} target {target}: triangle {t} covers gutter at {x}: {a} {b} {c}"
+                            );
+                        }
+                    }
                 }
             }
         }
