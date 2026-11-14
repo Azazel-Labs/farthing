@@ -1113,25 +1113,32 @@ Raw data, including every cut's (triangles, mean px, max px) curve:
 [`benchmarks/results-clusters.jsonl`](benchmarks/results-clusters.jsonl). Machine: 22 threads,
 Windows 11, mimalloc. Lower is better.
 
-| Asset (triangles) | Method | Build | Levels / roots | ≤ 0.25 px | ≤ 0.5 px | ≤ 1 px | ≤ 2 px |
-|---|---|---|---|---|---|---|---|
-| DamagedHelmet (15k) | farthing | 67 ms | 8 / 1 | **5,927** | 5,927 | 3,888 | 1,943 |
-| | farthing fast | 31 ms | 8 / 1 | 7,270 | **4,400** | **1,943** | 1,943 |
-| | meshopt | 36 ms | 4 / 26 | 7,720 | 7,049 | 5,416 | 5,416 |
-| | meshopt attr | 57 ms | 8 / 1 | 7,721 | 7,721 | 3,858 | **1,926** |
-| pirate (5k) | farthing | 26 ms | 7 / 1 | 2,785 | 1,630 | 1,630 | 621 |
-| | farthing fast | 12 ms | 7 / 1 | 3,272 | **1,123** | **625** | **311** |
-| | meshopt | 11 ms | 6 / 2 | **2,503** | 1,250 | 1,250 | 625 |
-| | meshopt attr | 13 ms | 7 / 1 | 2,504 | 2,504 | 1,251 | 625 |
-| Lantern (5k) | farthing | 27 ms | 7 / 1 | 674 | 674 | 336 | 168 |
-| | farthing fast | 18 ms | 7 / 1 | 674 | 674 | 336 | 336 |
-| | meshopt | 10 ms | 4 / 6 | 1,347 | 1,347 | 1,347 | 672 |
-| | meshopt attr | 20 ms | 7 / 1 | **661** | **330** | **330** | **82** |
-| DragonAttenuation (135k) | farthing | 208 ms | 12 / 1 | 16,685 | 8,741 | 7,781 | 3,323 |
-| | farthing fast | 112 ms | 12 / 1 | **12,531** | **8,187** | **2,791** | **799** |
-| | meshopt | 397 ms | 7 / 363 | 47,457 | 38,607 | 38,607 | 38,607 |
-| | meshopt attr | 508 ms | 12 / 1 | 24,592 | 24,592 | 13,196 | 13,196 |
-| Avocado (682) | all four | 1–5 ms | 4 / 1 | 682 | 341–682 | 341–682 | 169–170 |
+| Asset (triangles) | Method | Build | Peak heap | Levels / roots | ≤ 0.25 px | ≤ 0.5 px | ≤ 1 px | ≤ 2 px |
+|---|---|---|---|---|---|---|---|---|
+| DamagedHelmet (15k) | farthing | 70 ms | 16.1 MB | 8 / 1 | **5,927** | 5,927 | 3,888 | 1,943 |
+| | farthing fast | 34 ms | 5.2 MB | 8 / 1 | 7,270 | **4,400** | **1,943** | 1,943 |
+| | meshopt | 41 ms | 1.5 MB | 4 / 26 | 7,720 | 7,049 | 5,416 | 5,416 |
+| | meshopt attr | 66 ms | 1.5 MB | 8 / 1 | 7,721 | 7,721 | 3,858 | **1,926** |
+| pirate (5k) | farthing | 30 ms | 7.9 MB | 7 / 1 | 2,785 | 1,630 | 1,630 | 621 |
+| | farthing fast | 15 ms | 1.7 MB | 7 / 1 | 3,272 | **1,123** | **625** | **311** |
+| | meshopt | 11 ms | 0.5 MB | 6 / 2 | **2,503** | 1,250 | 1,250 | 625 |
+| | meshopt attr | 14 ms | 0.5 MB | 7 / 1 | 2,504 | 2,504 | 1,251 | 625 |
+| Lantern (5k) | farthing | 32 ms | 8.2 MB | 7 / 1 | 674 | 674 | 336 | 168 |
+| | farthing fast | 21 ms | 1.9 MB | 7 / 1 | 674 | 674 | 336 | 336 |
+| | meshopt | 14 ms | 0.5 MB | 4 / 6 | 1,347 | 1,347 | 1,347 | 672 |
+| | meshopt attr | 27 ms | 0.5 MB | 7 / 1 | **661** | **330** | **330** | **82** |
+| DragonAttenuation (135k) | farthing | 287 ms | 29.1 MB | 12 / 1 | 16,685 | 8,741 | 7,781 | 3,323 |
+| | farthing fast | 143 ms | 12.4 MB | 12 / 1 | **12,531** | **8,187** | **2,791** | **799** |
+| | meshopt | 510 ms | 14.3 MB | 7 / 363 | 47,457 | 38,607 | 38,607 | 38,607 |
+| | meshopt attr | 553 ms | 14.4 MB | 12 / 1 | 24,592 | 24,592 | 13,196 | 13,196 |
+| Avocado (682) | all four | 1–9 ms | 0.1–1.1 MB | 4 / 1 | 682 | 341–682 | 341–682 | 169–170 |
+
+Build is the best of three on all 22 threads. Peak heap is the most heap live during the build,
+above what was live before it (the bench wraps mimalloc in a counting allocator). Most of
+farthing's peak comes from parallelism: each group being reduced at the same time holds its own
+reducer state. On one thread the dragon peaks at 9.7 MB (default) and 8.6 MB (fast), below
+meshopt's 14.3 MB. The machine was busier for this run than for the v16 one (meshopt's dragon
+build took 510 ms here, 397 ms then), so compare times within this table only.
 
 Build time on ABeautifulGame (1.5M triangles, 22 threads): farthing 1.85 s, fast 1.04 s,
 meshopt 3.3 s (973 roots), meshopt attr 3.9 s (160 roots).
@@ -1154,11 +1161,64 @@ What the numbers say:
   faster, with geometric error as low or lower. It keeps normals and UVs less faithfully, which
   this table, measuring positions only, doesn't show.
 - **Speed.** The meshopt baseline here is serial. clusterlod.h itself runs groups in parallel,
-  and zeux reports about 10.6M triangles/s on 16 threads, which is faster than farthing's
-  roughly 0.8M (default) and 1.4M (fast) triangles/s here. Per core (dragon, one thread):
-  farthing 1.2 s, fast 0.56 s, meshopt 0.39 s. farthing's levels are parallel: groups are reduced
-  concurrently, and clustering uses a parallel spatial bisection and parallel adjacency. With
-  the Windows system allocator, parallel scaling stalls; the bench links mimalloc, and engines should too.
+  and zeux reports about 10.6M triangles/s on 16 threads. That is faster than farthing's
+  roughly 0.5M (default) and 0.9M (fast) triangles/s in this run. farthing's levels are
+  parallel: groups are reduced at the same time, and clustering uses a parallel spatial
+  bisection and parallel adjacency. With the Windows system allocator, parallel scaling stalls;
+  the bench links mimalloc, and engines should too.
+- **Per core (v17).** Four changes came out of profiling one-thread builds. None of them changes
+  the output: the clusters and errors are bit-identical, so the quality columns can't move.
+  1. Part analysis is skipped when every part has a locked vertex. Group reductions lock their
+     whole border, so that is nearly always the case, and the analysis took about a fifth of
+     each group's reduction.
+  2. The reducer state no longer makes an allocation per face, and its position weld sorts
+     precomputed keys.
+  3. Cluster growth numbers a block's local vertices with one sort instead of binary searches.
+     It also skips candidates that already lose on their count of new vertices alone.
+  4. When cluster growth falls back to the nearest loose triangle, it walks outwards along the
+     sweep order with a distance bound, instead of scanning the whole block.
+
+  Before and after are each the best of three runs, alternating the two binaries
+  (`RAYON_NUM_THREADS=1` for one thread, `SPEED_ONLY=1`):
+
+  | Asset | Method | 1 thread, before | 1 thread, after | 22 threads, before | 22 threads, after |
+  |---|---|---|---|---|---|
+  | DragonAttenuation | farthing | 1,507 ms | **1,235 ms** | 251 ms | **236 ms** |
+  | | farthing fast | 690 ms | **653 ms** | 130 ms | **120 ms** |
+  | | meshopt | 527 ms | 500 ms | 400 ms | 417 ms |
+  | | meshopt attr | 541 ms | 546 ms | 500 ms | 517 ms |
+  | DamagedHelmet | farthing | 204 ms | **164 ms** | 79 ms | **72 ms** |
+  | | farthing fast | 84 ms | **73 ms** | 36 ms | **32 ms** |
+  | | meshopt | 32 ms | 31 ms | 40 ms | 35 ms |
+  | | meshopt attr | 54 ms | 56 ms | 61 ms | 53 ms |
+
+  meshopt's code did not change, so its rows show the run-to-run noise (5–10%). Per core,
+  farthing is still slower than meshoptimizer. On the dragon, default mode takes 2.3× as long as
+  meshopt attr and fast mode 1.2×; on the helmet, 2.9× and 1.3×. Most of what remains is the
+  reducer's own work (collapse costs with attribute quadrics, link and flip checks), plus
+  cluster growth. Peak heap on 22 threads fell too, from 36.3 MB to 30.7 MB on the dragon.
+
+### Packed GPU format (v17)
+
+`farthing::cluster::gpu` (CLI: `farthing clusters --gpu out.fcld`) packs a DAG into flat
+little-endian buffers a renderer can upload as they are. Every record is a whole number of
+16-byte vectors, so each array reads as a std430 struct array. The file holds:
+- 128-byte cluster headers and 48-byte group records;
+- a page table that lists each page's dependencies;
+- fixed-size streaming pages of quantized vertices and indices.
+
+Each vertex takes 16 bytes. Positions sit on one grid over the whole mesh (16 bits per axis by
+default), so cuts that mix pages stay crack-free. Normals are octahedral and UVs unorm16.
+
+The clusters one group produced always land in one page. Pages run coarse to fine, so a page's
+dependencies always come earlier in the file. `GpuClusterDag::select` is a CPU reference of the
+GPU's LOD test, and it picks the same clusters as `ClusterDag::select`. With the default 128 KiB
+pages and 16-bit positions:
+
+| Asset (triangles) | Pages | File size |
+|---|---|---|
+| DragonAttenuation (135k) | 55 | 7.0 MB (all 12 levels) |
+| DamagedHelmet (15k) | 6 | 0.7 MB |
 
 ### HLOD (v16)
 

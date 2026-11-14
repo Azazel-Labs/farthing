@@ -159,7 +159,7 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
 pub fn cluster_mode(assets: &[String]) {
     let mut rows = Vec::new();
     let targets = [0.25f32, 0.5, 1.0, 2.0];
-    println!("{:<18} {:<14} {:>7} {:>8} {:>6} {:>6} {:>8} | tris for measured mean error ≤ px {:?}", "asset", "method", "tris", "build ms", "levels", "roots", "fill", targets);
+    println!("{:<18} {:<14} {:>7} {:>8} {:>8} {:>6} {:>6} {:>8} | tris for measured mean error ≤ px {:?}", "asset", "method", "tris", "build ms", "peak MB", "levels", "roots", "fill", targets);
     for path in assets {
         let m = crate::load(path);
         let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
@@ -178,9 +178,19 @@ pub fn cluster_mode(assets: &[String]) {
             if std::env::var("ONLY").is_ok_and(|o| o != *label) {
                 continue;
             }
+            // REPEAT=n: best of n builds (timing noise); the peak heap is the first build's.
+            let reps: usize = std::env::var("REPEAT").ok().and_then(|r| r.parse().ok()).unwrap_or(1).max(1);
+            let base = crate::reset_peak();
             let t0 = Instant::now();
-            let dag = build();
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let mut dag = build();
+            let mut ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let peak_mb = (crate::peak() - base) as f64 / 1048576.0;
+            for _ in 1..reps {
+                drop(dag);
+                let t0 = Instant::now();
+                dag = build();
+                ms = ms.min(t0.elapsed().as_secs_f64() * 1000.0);
+            }
             let l0 = dag.clusters.iter().filter(|c| c.level == 0).count();
             let fill = m.triangle_count() as f32 / (l0 * MAX_T) as f32;
             // Sweep thresholds: (tris, measured mean px, measured max px).
@@ -196,10 +206,11 @@ pub fn cluster_mode(assets: &[String]) {
             let need = |e: f32| pts.iter().filter(|p| p.1 <= e).map(|p| p.0).min();
             let cells: Vec<String> = targets.iter().map(|&e| need(e).map_or("-".into(), |t| t.to_string())).collect();
             println!(
-                "{:<18} {:<14} {:>7} {:>8.0} {:>6} {:>6} {:>8.3} | {}",
-                name, label, m.triangle_count(), ms, dag.levels(), dag.roots().count(), fill, cells.join(" / ")
+                "{:<18} {:<14} {:>7} {:>8.0} {:>8.1} {:>6} {:>6} {:>8.3} | {}",
+                name, label, m.triangle_count(), ms, peak_mb, dag.levels(), dag.roots().count(), fill, cells.join(" / ")
             );
-            rows.push(json!({"asset": name, "method": label, "tris": m.triangle_count(), "ms": ms, "levels": dag.levels(),
+            rows.push(json!({"asset": name, "method": label, "tris": m.triangle_count(), "ms": ms, "peak_mb": peak_mb,
+                "threads": rayon_threads(), "levels": dag.levels(),
                 "roots": dag.roots().count(), "root_tris": dag.roots().map(|c| dag.clusters[c].triangle_count()).sum::<usize>(),
                 "fill": fill, "curve": pts, "targets": targets, "need": targets.iter().map(|&e| need(e)).collect::<Vec<_>>()}));
         }
@@ -208,4 +219,10 @@ pub fn cluster_mode(assets: &[String]) {
         let s: String = rows.iter().map(|r| r.to_string() + "\n").collect();
         std::fs::write(out, s).unwrap();
     }
+}
+
+fn rayon_threads() -> usize {
+    std::env::var("RAYON_NUM_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(|| {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    })
 }

@@ -28,6 +28,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
+pub mod gpu;
+pub use gpu::{decode_gpu, encode_gpu, GpuClusterDag, GpuOptions};
+
 /// A bounding sphere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Sphere {
@@ -523,16 +526,27 @@ impl Ctx<'_> {
         let (max_t, max_v) = (self.opts.max_triangles, self.opts.max_vertices);
         let m = block.len();
         let lt: Vec<[u32; 3]> = block.iter().map(|&i| tris[i as usize]).collect();
-        // Block-local wedge and position numbering.
+        // Block-local wedge and position numbering: ids are ranks among the distinct keys,
+        // from one sort of (key, corner) pairs.
         let local_ids = |key: &dyn Fn(u32) -> u32| {
-            let mut all: Vec<u32> = lt.iter().flatten().map(|&v| key(v)).collect();
-            all.sort_unstable();
-            all.dedup();
-            let ids: Vec<[u32; 3]> = lt
+            let mut all: Vec<u64> = lt
                 .iter()
-                .map(|t| t.map(|v| all.binary_search(&key(v)).unwrap() as u32))
+                .flatten()
+                .enumerate()
+                .map(|(i, &v)| (u64::from(key(v)) << 32) | i as u64)
                 .collect();
-            (ids, all.len())
+            all.sort_unstable();
+            let mut ids = vec![[0u32; 3]; m];
+            let (mut n, mut prev) = (0u32, u64::MAX);
+            for &k in &all {
+                if k >> 32 != prev {
+                    prev = k >> 32;
+                    n += 1;
+                }
+                let i = (k & 0xFFFF_FFFF) as usize;
+                ids[i / 3][i % 3] = n - 1;
+            }
+            (ids, n as usize)
         };
         let (tv, nv) = local_ids(&|v| v);
         let (tp, np) = local_ids(&|v| self.pos_id[v as usize]);
@@ -580,11 +594,19 @@ impl Ctx<'_> {
         let mut cstamp = vec![u32::MAX; m];
         let mut out = Vec::new();
         let mut cursor = 0;
+        let mut taken = 0;
         loop {
-            while cursor < m && assigned[sweep[cursor] as usize] {
+            // Drop assigned triangles from the sweep once they are the majority, so the
+            // nearest-loose-triangle walk below stays short (order is kept; everything before
+            // the cursor is assigned).
+            if taken * 2 > sweep.len() {
+                sweep.retain(|&t| !assigned[t as usize]);
+                (cursor, taken) = (0, 0);
+            }
+            while cursor < sweep.len() && assigned[sweep[cursor] as usize] {
                 cursor += 1;
             }
-            if cursor == m {
+            if cursor == sweep.len() {
                 break;
             }
             let cid = out.len() as u32;
@@ -597,6 +619,7 @@ impl Ctx<'_> {
             while let Some(t) = next {
                 let tu = t as usize;
                 assigned[tu] = true;
+                taken += 1;
                 cur.push(t);
                 for &v in &tv[tu] {
                     if vstamp[v as usize] != cid {
@@ -635,6 +658,11 @@ impl Ctx<'_> {
                     if nverts + nvc > max_v {
                         continue;
                     }
+                    // The other two terms are non-negative (up to rounding): a candidate whose
+                    // new-vertex count alone exceeds the best cost cannot win or tie.
+                    if best.is_some_and(|(bc, _)| nvc as f32 > bc + 0.01) {
+                        continue;
+                    }
                     let cost = nvc as f32
                         + cent[c].distance(center) / radius
                         + 0.5 * (1.0 - normal[c].dot(ndir));
@@ -647,15 +675,40 @@ impl Ctx<'_> {
                     // Nothing connected fits: take the nearest loose triangle of the block
                     // (foliage, debris; the block is spatially compact), so disconnected
                     // pieces still fill clusters.
+                    // Walk the sweep order outwards from the center (sorted by the axis
+                    // coordinate, so the squared axis gap bounds the distance from below),
+                    // keeping the lowest index among the nearest.
                     let mut bd = f32::INFINITY;
-                    for t in 0..m {
-                        if !assigned[t] {
-                            let d = cent[t].distance_squared(center);
-                            if d < bd {
+                    let mut bt = u32::MAX;
+                    let ca = center[axis];
+                    let mid =
+                        sweep.partition_point(|&t| cent[t as usize][axis].total_cmp(&ca).is_lt());
+                    let mut visit = |t: u32| {
+                        let gap = cent[t as usize][axis] - ca;
+                        if gap * gap > bd {
+                            return false;
+                        }
+                        if !assigned[t as usize] {
+                            let d = cent[t as usize].distance_squared(center);
+                            if d < bd || (d == bd && t < bt) {
                                 bd = d;
-                                next = Some(t as u32);
+                                bt = t;
                             }
                         }
+                        true
+                    };
+                    for &t in &sweep[mid..] {
+                        if !visit(t) {
+                            break;
+                        }
+                    }
+                    for &t in sweep[..mid].iter().rev() {
+                        if !visit(t) {
+                            break;
+                        }
+                    }
+                    if bt != u32::MAX {
+                        next = Some(bt);
                     }
                 }
             }
@@ -985,7 +1038,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// A bumpy closed sphere with shared vertices (a projected subdivided cube).
-    fn blob(n: i32) -> Mesh {
+    pub(super) fn blob(n: i32) -> Mesh {
         let mut ids: HashMap<[i32; 3], u32> = HashMap::new();
         let mut pos = Vec::new();
         let mut idx = Vec::new();
@@ -1026,7 +1079,7 @@ mod tests {
         m
     }
 
-    fn edge_counts(m: &Mesh) -> HashMap<(u32, u32), u32> {
+    pub(super) fn edge_counts(m: &Mesh) -> HashMap<(u32, u32), u32> {
         let mut e = HashMap::new();
         for t in 0..m.triangle_count() {
             let [a, b, c] = m.triangle(t);
