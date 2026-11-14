@@ -229,9 +229,12 @@ function syncLod() {
   lod.levels.length = 0;
   if (!original) return;
   lod.position.copy(original.center);
+  // Switch distances come for the run's view (info.ppr pixels per radian); rescale them to
+  // this canvas and camera.
+  const ppr = h / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
   let d = 0;
   for (const l of ready) {
-    d = Math.max(d, (l.info.switch_distance_1px * h) / 1080);
+    d = Math.max(d, (l.info.switch_distance_1px * ppr) / (l.info.ppr || REF_PPR));
     const g = new THREE.Group();
     g.position.copy(original.center).negate();
     // The level may be hidden in root (show() hides all but one); the clone copies that flag.
@@ -441,6 +444,8 @@ function fmtBytes(n) {
 }
 const fmtPx = (p) => (p < 1 ? p.toFixed(2) : p.toPrecision(2));
 const diag = () => assetInfo?.diagonal || 1;
+/** Pixels per radian of the reference view (1080 pixels high, 60° vertical FOV). */
+const REF_PPR = 1080 / (2 * Math.tan(Math.PI / 6));
 
 function wireFor(geometry) {
   let w = wires.get(geometry);
@@ -1448,6 +1453,7 @@ function showInfo(i) {
   const warn = $("#asset-warn");
   warn.hidden = !i.skinned;
   warn.textContent = i.skinned ? "Skinned: reduced levels keep the skin; baked proxies are static." : "";
+  syncViewHint();
 }
 
 function renderRows() {
@@ -1500,6 +1506,7 @@ function renderRows() {
     );
   }
   rowsEl.innerHTML = out.join("");
+  syncViewHint();
 }
 
 /** A level's texture memory; shared levels after the first draw with the first's atlas. */
@@ -1549,7 +1556,12 @@ function drawTextures(level) {
   if (shared)
     parts.push(
       `${i.atlas_width} × ${i.atlas_height}`,
-      `${(i.density_scale * 100).toFixed(0)}% of the artist's texel density`,
+      `${(i.density_scale * 100).toFixed(0)}% of the ${i.view_texel_density ? "capped" : "artist's"} texel density`,
+    );
+  if (shared && i.view_texel_density)
+    parts.push(
+      `capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit for the closest view` +
+        (i.view_texels != null ? ` (${(i.view_texels * 100).toPrecision(2)}% of the artist's texels)` : ""),
     );
   if (i?.coverage != null)
     parts.push(
@@ -1621,6 +1633,9 @@ function readOptions() {
     planar_uv: f.planar_uv.checked,
     textures: f.textures.value,
     shared_size: +f.shared_size.value,
+    view_distance: Math.max(0, +f.view_distance.value || 0),
+    view_fov: +f.view_fov.value,
+    view_height: +f.view_height.value,
     fast: f.fast.checked,
     strict_seams: f.strict_seams.checked,
     symmetry: f.symmetry.checked,
@@ -1645,6 +1660,30 @@ function syncModeUi() {
   for (const fs of form.querySelectorAll("fieldset[data-modes]")) fs.hidden = !fs.dataset.modes.split(" ").includes(m);
   $("#shared-size").hidden = form.elements.textures.value !== "shared";
   $("#mode-hint").textContent = MODE_HINTS[m] ?? "";
+  syncViewHint();
+}
+
+/** What the viewing budget means for this model: its size, and what a pixel is at the closest view. */
+function syncViewHint() {
+  const { view_distance: d, view_fov: fov, view_height: h } = readOptions();
+  const size = assetInfo ? `The model is ${fmtLen(assetInfo.diagonal)} across (bounding-box diagonal). ` : "";
+  if (!d) {
+    $("#view-hint").textContent = `${size}Set the closest distance it is ever seen from to drop detail that view cannot show.`;
+    return;
+  }
+  const ppu = h / (2 * d * Math.tan(THREE.MathUtils.degToRad(fov) / 2));
+  const spans = assetInfo ? ` it spans about ${fmtInt(Math.round(assetInfo.diagonal * ppu))} px, and` : "";
+  const kept = levels[0]?.stale ? null : levels[0]?.info?.view_texels;
+  const texels =
+    kept != null ? ` That view shows ${(kept * 100).toPrecision(2)}% of the artist's texels.` : "";
+  $("#view-hint").textContent = `${size}From ${fmtLen(d)}${spans} a pixel is ${fmtLen(1 / ppu)} (${fmtInt(Math.round(ppu))} px per unit).${texels}`;
+}
+
+/** A length in scene units, assumed metres (glTF). */
+function fmtLen(m) {
+  if (m >= 1) return `${m.toPrecision(3)} m`;
+  if (m >= 0.01) return `${(m * 100).toPrecision(3)} cm`;
+  return `${(m * 1000).toPrecision(3)} mm`;
 }
 
 let lastLevels = 4;

@@ -239,6 +239,93 @@ fn shared_atlas_carries_the_original_materials() {
     assert!(textures.iter().all(|t| t.0 == 1 || t.0 == 3));
 }
 
+/// Runs the chain and returns each level's info and the size of each texture it emitted.
+fn chain_levels(demo: &mut Demo, opts: &LodOptions) -> (Vec<LevelInfo>, Vec<(usize, u32, u32)>) {
+    let (mut levels, mut textures) = (vec![], vec![]);
+    demo.run(opts, &|| 0.0, &mut |e| match e {
+        Event::Level { info, .. } => levels.push(info.clone()),
+        Event::Texture {
+            level,
+            width,
+            height,
+            ..
+        } => textures.push((level, width, height)),
+        _ => {}
+    })
+    .unwrap();
+    (levels, textures)
+}
+
+#[test]
+fn viewing_budget_drops_what_the_view_cannot_show() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let full = LodOptions {
+        levels: 3,
+        bake_from: 3,
+        atlas: 256,
+        ..Default::default()
+    };
+    // The unit sphere seen from 200 units at 1080p, 60°: a pixel is 0.21 units, and the
+    // 64 × 64 checker (about 18 texels a unit) is far denser than the view's 4.7.
+    let far = LodOptions {
+        view_distance: 200.0,
+        ..full.clone()
+    };
+    let (a, a_tex) = chain_levels(&mut demo, &full);
+    let (b, b_tex) = chain_levels(&mut demo, &far);
+    let pixel = 200.0 / b[0].ppr;
+    assert!((b[0].ppr - a[0].ppr).abs() < 1e-3);
+
+    // The first level goes past one step, to about a pixel at the closest view.
+    assert!(b[1].triangles < a[1].triangles, "{:?} vs {:?}", b[1], a[1]);
+    assert!(b[1].error / pixel < 4.0, "{:?}", b[1]);
+    assert!(b[1].note.as_deref().unwrap().starts_with("Visible limit"));
+    assert!(a
+        .iter()
+        .all(|l| l.note.is_none() && l.view_texels.is_none()));
+    for w in b.windows(2) {
+        assert!(w[1].triangles < w[0].triangles, "{:?}", w[1]);
+    }
+    // The original shows a small part of its texels from there.
+    let kept = b[0].view_texels.unwrap();
+    assert!(kept > 0.0 && kept < 0.2, "{kept}");
+
+    // The baked level's atlas is sized for where it appears, not the 256 asked for.
+    let baked = |tex: &[(usize, u32, u32)]| *tex.iter().find(|t| t.0 == 3).unwrap();
+    assert_eq!(baked(&a_tex), (3, 256, 256));
+    let (_, w, h) = baked(&b_tex);
+    assert!(w < 256 && h < 256, "{w}×{h}");
+    assert_eq!((b[3].atlas_width, b[3].atlas_height), (Some(w), Some(h)));
+    assert!(b[3].coverage.unwrap() > 0.2, "{:?}", b[3]);
+
+    // The shared atlas is capped at the view's density.
+    let shared = |o: &LodOptions| LodOptions {
+        textures: TextureMode::Shared,
+        shared_size: 512,
+        ..o.clone()
+    };
+    let (sa, _) = chain_levels(&mut demo, &shared(&full));
+    let (sb, _) = chain_levels(&mut demo, &shared(&far));
+    let area = |l: &LevelInfo| l.atlas_width.unwrap() * l.atlas_height.unwrap();
+    assert!(area(&sb[1]) < area(&sa[1]), "{:?} vs {:?}", sb[1], sa[1]);
+    assert!((sb[1].view_texel_density.unwrap() - 1.0 / pixel).abs() < 1e-3);
+    assert!(sb[1].view_texels.unwrap() < 0.2);
+    assert!(sb[1].triangles < sa[1].triangles);
+
+    // Switch distances are for the view's screen: twice the pixels, twice the distance.
+    let (c, _) = chain_levels(
+        &mut demo,
+        &LodOptions {
+            view_height: 2160,
+            ..full.clone()
+        },
+    );
+    assert!((c[1].ppr / a[1].ppr - 2.0).abs() < 1e-4);
+    for l in &c[1..] {
+        assert!((l.switch_distance_1px - l.error * l.ppr).abs() <= 1e-4 * l.switch_distance_1px);
+    }
+}
+
 #[test]
 fn reports_missing_files() {
     let (gltf, _) = split_glb(&textured_sphere(), "missing.bin");

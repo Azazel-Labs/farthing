@@ -96,6 +96,15 @@ pub struct LodOptions {
     /// Shared atlas: largest side (at most [`MAX_SHARED_SIZE`]). The atlas keeps the artist's
     /// texel density when that fits, and shrinks every chart by the same factor when it does not.
     pub shared_size: u32,
+    /// Closest distance the scene is ever seen from, in its own units (glTF: metres); 0 = no
+    /// viewing budget. With one, nothing is kept that would not show there: the first level is
+    /// reduced until it deviates about a pixel at that distance, the shared atlas is capped at
+    /// a texel per pixel, and each baked atlas is sized for the distance its level appears at.
+    pub view_distance: f32,
+    /// Vertical field of view of that view, degrees. Switch distances are given for it.
+    pub view_fov: f32,
+    /// Screen height of that view, pixels.
+    pub view_height: u32,
 
     pub mode: DemoMode,
     /// Option examples: triangle fraction every configuration reduces to.
@@ -135,6 +144,9 @@ impl Default for LodOptions {
             planar_uv: false,
             textures: TextureMode::Original,
             shared_size: 2048,
+            view_distance: 0.0,
+            view_fov: 60.0,
+            view_height: 1080,
             mode: DemoMode::Chain,
             preset_ratio: 0.25,
             cluster_layout: "nanite".into(),
@@ -151,6 +163,20 @@ impl Default for LodOptions {
 }
 
 impl LodOptions {
+    /// Pixels per radian of the view: `view_height` pixels over `view_fov` degrees (the
+    /// defaults give [`reference_ppr`]).
+    pub(crate) fn ppr(&self) -> f32 {
+        let half = self.view_fov.clamp(5.0, 150.0).to_radians() / 2.0;
+        self.view_height.clamp(120, 8640) as f32 / (2.0 * half.tan())
+    }
+
+    /// With a viewing budget: the deviation (world units) that spans one pixel at the closest
+    /// distance. Its inverse is the most texels per unit that view can show.
+    pub(crate) fn visible_error(&self) -> Option<f32> {
+        (self.view_distance > 0.0 && self.view_distance.is_finite())
+            .then(|| self.view_distance / self.ppr())
+    }
+
     fn simplify_options(&self) -> SimplifyOptions {
         SimplifyOptions {
             seams: if self.strict_seams {
@@ -210,8 +236,10 @@ pub struct LevelInfo {
     pub relative_error: f32,
     /// The simplifier's own estimate, summed over the chain: an upper bound, often loose.
     pub error_bound: f32,
-    /// Camera distance at which `error` projects to one pixel (1080p, 60° vertical FOV).
+    /// Camera distance at which `error` projects to one pixel, for `ppr`.
     pub switch_distance_1px: f32,
+    /// Pixels per radian of the view `switch_distance_1px` is given for.
+    pub ppr: f32,
     /// Time to build the level (measuring it not included).
     pub ms: f64,
     /// Baked levels: fraction of texels that found the source surface.
@@ -233,6 +261,10 @@ pub struct LevelInfo {
     pub density_scale: Option<f32>,
     /// Shared levels: the level whose GLB carries the atlas (the others reuse its material).
     pub shared_textures: Option<usize>,
+    /// With a viewing budget: the most texels per world unit the closest view can show (the
+    /// shared atlas is capped there), and the fraction of the artist's texels under that cap.
+    pub view_texel_density: Option<f32>,
+    pub view_texels: Option<f32>,
 }
 
 impl LevelInfo {
@@ -246,6 +278,7 @@ impl LevelInfo {
             relative_error: 0.0,
             error_bound: 0.0,
             switch_distance_1px: 0.0,
+            ppr: reference_ppr(),
             ms: 0.0,
             coverage: None,
             charts: None,
@@ -258,6 +291,8 @@ impl LevelInfo {
             atlas_height: None,
             density_scale: None,
             shared_textures: None,
+            view_texel_density: None,
+            view_texels: None,
         }
     }
 }
@@ -447,29 +482,32 @@ impl Demo {
         let base = opts.simplify_options();
         let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
         let input_tris = self.scene.triangle_count();
-        let switch = |e: f32| e * reference_ppr();
+        let ppr = opts.ppr();
+        let visible = opts.visible_error();
         let source = self.scene.flatten().0;
-        let level_info = |level, kind, s: &Scene, bound: f32, ms| {
-            let error = if level == 0 {
-                0.0
-            } else {
-                surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff
-            };
-            LevelInfo {
-                triangles: s.triangle_count(),
-                vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
-                error,
-                relative_error: error / diag,
-                error_bound: bound,
-                switch_distance_1px: switch(error),
-                ms,
-                ..LevelInfo::new(level, kind)
-            }
+        let measure =
+            |s: &Scene| surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
+        let level_info = |level, kind, s: &Scene, error: f32, bound: f32, ms| LevelInfo {
+            triangles: s.triangle_count(),
+            vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
+            error,
+            relative_error: error / diag,
+            error_bound: bound,
+            switch_distance_1px: error * ppr,
+            ppr,
+            ms,
+            note: visible.map(|v| view_note(level, error, v, opts.view_distance)),
+            ..LevelInfo::new(level, kind)
         };
 
         let original_bytes = texture_bytes(&original_textures(&self.materials));
-        let mut info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0);
+        let mut info = level_info(0, LevelKind::Original, &self.scene, 0.0, 0.0, 0.0);
         info.texture_bytes = Some(original_bytes);
+        if let Some(v) = visible {
+            let dens = self.artist_density(&source);
+            info.view_texel_density = Some(1.0 / v);
+            info.view_texels = texels_under(&source, &dens, 1.0 / v);
+        }
         emit(Event::Level {
             info: &info,
             glb: &[],
@@ -480,6 +518,10 @@ impl Demo {
         let mut prev: Vec<(Mesh, f32)> =
             self.scene.meshes.iter().map(|m| (m.clone(), 0.0)).collect();
         let mesh_scale = crate::modes::mesh_scales(&self.scene);
+        // Triangle counts the steps compound from: the original's, or with a viewing budget,
+        // the first level's (which may already be well past one step).
+        let mut from: Vec<usize> = self.scene.meshes.iter().map(Mesh::triangle_count).collect();
+        let mut from_level = 0;
         let shared = opts.textures == TextureMode::Shared;
         if shared && bake_from > 1 {
             self.shared_levels(opts, bake_from, now, emit)?;
@@ -488,25 +530,32 @@ impl Demo {
         for level in first_reduced..bake_from {
             emit(Event::Stage(&format!("LOD{level}: reducing")));
             let t0 = now();
-            let ratio = step.powi(level as i32);
-            let mut next = Vec::with_capacity(prev.len());
-            for (mi, (mesh, error)) in prev.iter().enumerate() {
-                let target =
-                    ((self.scene.meshes[mi].triangle_count() as f32 * ratio) as usize).max(1);
-                let r = simplify(
-                    mesh,
-                    &SimplifyOptions {
-                        target_triangles: Some(target),
-                        ..base.clone()
-                    },
-                )
-                .map_err(err)?;
-                next.push((r.mesh, error + r.error));
-            }
+            let ratio = step.powi((level - from_level) as i32);
+            let limit = visible.filter(|_| level == 1);
+            let ((next, s), error) = fit_visible(limit, |k| {
+                let mut next = Vec::with_capacity(prev.len());
+                let mut extended = false;
+                for (mi, (mesh, error)) in prev.iter().enumerate() {
+                    let target = ((from[mi] as f32 * ratio) as usize).max(1);
+                    // In mesh units: the largest instance scale turns them into world units.
+                    let limit = limit
+                        .filter(|_| mesh_scale[mi] > 0.0)
+                        .map(|v| k * v / mesh_scale[mi]);
+                    let (m, e, x) = reduce_to(mesh, &base, target, limit).map_err(err)?;
+                    extended |= x;
+                    next.push((m, error + e));
+                }
+                let mut s = self.scene.clone();
+                for (mi, (m, _)) in next.iter().enumerate() {
+                    s.meshes[mi] = m.clone();
+                }
+                let error = measure(&s);
+                Ok(((next, s), error, extended))
+            })?;
             prev = next;
-            let mut s = self.scene.clone();
-            for (mi, (m, _)) in prev.iter().enumerate() {
-                s.meshes[mi] = m.clone();
+            if limit.is_some() {
+                from = prev.iter().map(|(m, _)| m.triangle_count()).collect();
+                from_level = 1;
             }
             // Mesh errors are in mesh units; the bound is the largest in world units.
             let bound = prev
@@ -515,7 +564,8 @@ impl Demo {
                 .map(|(mi, p)| p.1 * mesh_scale[mi])
                 .fold(0.0, f32::max);
             let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
-            let mut info = level_info(level, LevelKind::Reduced, &s, bound, now() - t0);
+            let ms = now() - t0;
+            let mut info = level_info(level, LevelKind::Reduced, &s, error, bound, ms);
             info.bytes = Some(glb.len());
             info.texture_bytes = Some(original_bytes);
             emit(Event::Level {
@@ -528,6 +578,11 @@ impl Demo {
             emit(Event::Stage("done"));
             return Ok(());
         }
+        // The far levels compound from the first level when the budget made it.
+        let far_from = match self.levels.get(1) {
+            Some((s, _)) if visible.is_some() => (s.triangle_count(), 1),
+            _ => (input_tris, 0),
+        };
 
         // Far levels: one world-space mesh without seams, re-parameterized and baked.
         emit(Event::Stage("Proxy: merging the scene"));
@@ -540,28 +595,38 @@ impl Demo {
         };
         let mut geo_error = 0.0;
         let mut host = MaterialHost::new(&self.materials, false);
+        let far_base = SimplifyOptions {
+            seams: SeamMode::Permissive,
+            ..base.clone()
+        };
         for level in bake_from..=levels {
             let t0 = now();
             emit(Event::Stage(&format!("LOD{level}: reducing")));
-            let target = ((input_tris as f32 * step.powi(level as i32)) as usize).max(4);
-            let r = simplify(
-                &geo,
-                &SimplifyOptions {
-                    target_triangles: Some(target),
-                    seams: SeamMode::Permissive,
-                    ..base.clone()
-                },
-            )
-            .map_err(err)?;
-            geo = r.mesh;
-            geo_error += r.error;
-            let mut mesh = geo.clone();
-            mesh.compute_normals(60.0);
+            let ratio = step.powi((level - far_from.1) as i32);
+            let target = ((far_from.0 as f32 * ratio) as usize).max(4);
+            let limit = visible.filter(|_| level == 1);
+            // Measured before the unwrap (which only splits vertices), so a budget can size the
+            // atlas for the distance the level appears at.
+            let ((m, e, mesh), error) = fit_visible(limit, |k| {
+                let (m, e, x) =
+                    reduce_to(&geo, &far_base, target, limit.map(|v| k * v)).map_err(err)?;
+                let mut mesh = m.clone();
+                mesh.compute_normals(60.0);
+                let error = measure(&Scene::from_mesh(mesh.clone()));
+                Ok(((m, e, mesh), error, x))
+            })?;
+            geo = m;
+            geo_error += e;
 
             emit(Event::Stage(&format!("LOD{level}: unwrapping UVs")));
+            // With a budget: a texel per pixel where the level first shows, at its switch
+            // distance or the closest view, whichever is farther (but at least about 64 × 64).
+            let floor = 64.0 * (0.5 / mesh.surface_area().max(f32::MIN_POSITIVE)).sqrt();
+            let density = visible.map(|v| (1.0 / error.max(v)).max(floor));
             let popts = ParamOptions {
                 atlas_size: opts.atlas,
                 padding: 2,
+                texel_density: density.map(|d| vec![d; mesh.triangle_count()]),
                 ..if opts.planar_uv {
                     ParamOptions::planar()
                 } else {
@@ -569,21 +634,19 @@ impl Demo {
                 }
             };
             let p = parameterize(&mesh, &popts).map_err(err)?;
+            let (w, h) = (p.width, p.height);
             let mut mesh = p.mesh;
             compute_tangents(&mut mesh, 0).map_err(err)?;
 
-            emit(Event::Stage(&format!(
-                "LOD{level}: baking {0}×{0}",
-                opts.atlas
-            )));
+            emit(Event::Stage(&format!("LOD{level}: baking {w}×{h}")));
             let bake = bake_with_host(
                 &mut host,
                 &mesh,
                 Mat4::IDENTITY,
                 &self.scene,
                 &BakeOptions {
-                    width: opts.atlas,
-                    height: opts.atlas,
+                    width: w,
+                    height: h,
                     supersample: opts.supersample.clamp(1, 4),
                     gutter: 4,
                     channels: vec![
@@ -599,14 +662,15 @@ impl Demo {
             let mut s = Scene::from_mesh(mesh);
             s.materials[0].name = "baked".into();
             let glb = glb_bytes(&s, &tex).map_err(err)?;
-            let mut info = level_info(level, LevelKind::Baked, &s, geo_error, now() - t0);
+            let ms = now() - t0;
+            let mut info = level_info(level, LevelKind::Baked, &s, error, geo_error, ms);
             info.coverage = Some(bake.coverage);
             info.charts = Some(p.charts);
             info.utilization = Some(p.utilization);
             info.bytes = Some(glb.len());
             info.texture_bytes = Some(texture_bytes(&tex));
-            info.atlas_width = Some(opts.atlas);
-            info.atlas_height = Some(opts.atlas);
+            info.atlas_width = Some(w);
+            info.atlas_height = Some(h);
             emit(Event::Level {
                 info: &info,
                 glb: &glb,
@@ -631,37 +695,13 @@ impl Demo {
         let mut t0 = now();
         emit(Event::Stage("Shared atlas: merging the scene"));
         let (flat, refs) = self.scene.flatten();
-        // The artist's density per triangle, from the largest texture of its material.
-        let largest: Vec<Option<(u32, u32, u32)>> = (0..self.scene.materials.len())
-            .map(|slot| {
-                let m = self
-                    .materials
-                    .get(self.scene.material_id(slot as u32).0 as usize)?;
-                [
-                    m.base_color_texture.as_ref().map(|(t, s)| (t, *s)),
-                    m.metallic_roughness_texture.as_ref().map(|(t, s)| (t, *s)),
-                    m.normal_texture.as_ref().map(|(t, s, _)| (t, *s)),
-                ]
-                .into_iter()
-                .flatten()
-                .max_by_key(|(t, _)| u64::from(t.width) * u64::from(t.height))
-                .map(|(t, s)| (t.width, t.height, s))
-            })
-            .collect();
-        let sizes = |set: u32| -> Vec<(u32, u32)> {
-            largest
-                .iter()
-                .map(|x| match x {
-                    Some((w, h, s)) if *s == set => (*w, *h),
-                    _ => (0, 0),
-                })
-                .collect()
-        };
-        let dens: Vec<f32> = texel_density(&flat, 0, &sizes(0))
-            .into_iter()
-            .zip(texel_density(&flat, 1, &sizes(1)))
-            .map(|(a, b)| a.max(b))
-            .collect();
+        let mut dens = self.artist_density(&flat);
+        // A viewing budget caps it at a texel per pixel of the closest view.
+        let cap = opts.visible_error().map(|v| 1.0 / v);
+        let view_texels = cap.and_then(|c| texels_under(&flat, &dens, c));
+        if let Some(c) = cap {
+            dens.iter_mut().for_each(|d| *d = d.min(c));
+        }
         let textured = dens.iter().any(|&d| d > 0.0);
         let source = flat.clone();
         let mut mesh = flat;
@@ -683,7 +723,15 @@ impl Demo {
         // Charts sit in their own block × block cells, `block` texels apart, so mips stay inside
         // a chart down to the level where a block is one texel: mip 3 of a 2048 atlas, mip 2 of
         // a 1024 one. Scenes with many charts get smaller blocks when those do not fit.
-        let mut block = (size / 256).clamp(2, 8);
+        // With a cap the atlas can come out far smaller than `size`; blocks sized for `size`
+        // would then be most of it, so they follow the side the capped texels need instead.
+        let need = cap.map(|_| {
+            let texels = texels_needed(&mesh, &dens).max(1.0);
+            ((texels / 0.5).sqrt().ceil() as u32)
+                .next_power_of_two()
+                .min(size)
+        });
+        let mut block = (need.unwrap_or(size) / 256).clamp(2, 8);
         let p = loop {
             let r = parameterize(
                 &mesh,
@@ -750,24 +798,31 @@ impl Demo {
         let input_tris = self.scene.triangle_count();
         let base = opts.simplify_options();
         let step = opts.step.clamp(0.05, 0.95);
+        let ppr = opts.ppr();
+        let visible = opts.visible_error();
         let mut error_bound = 0.0;
+        // Steps compound from the original, or with a budget from the first level.
+        let mut from = (input_tris, 0);
         for level in 1..bake_from {
             emit(Event::Stage(&format!("LOD{level}: reducing")));
-            let target = ((input_tris as f32 * step.powi(level as i32)) as usize).max(4);
-            let r = simplify(
-                &mesh,
-                &SimplifyOptions {
-                    target_triangles: Some(target),
-                    ..base.clone()
-                },
-            )
-            .map_err(err)?;
-            mesh = r.mesh;
-            error_bound += r.error;
-            let mut m = mesh.clone();
-            compute_tangents(&mut m, 0).map_err(err)?;
-            let mut s = Scene::from_mesh(m);
-            s.materials[0].name = "shared".into();
+            let ratio = step.powi((level - from.1) as i32);
+            let target = ((from.0 as f32 * ratio) as usize).max(4);
+            let limit = visible.filter(|_| level == 1);
+            let ((m, e, s), error) = fit_visible(limit, |k| {
+                let (m, e, x) =
+                    reduce_to(&mesh, &base, target, limit.map(|v| k * v)).map_err(err)?;
+                let mut t = m.clone();
+                compute_tangents(&mut t, 0).map_err(err)?;
+                let mut s = Scene::from_mesh(t);
+                s.materials[0].name = "shared".into();
+                let error = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
+                Ok(((m, e, s), error, x))
+            })?;
+            mesh = m;
+            error_bound += e;
+            if limit.is_some() {
+                from = (mesh.triangle_count(), 1);
+            }
             let glb = if level == 1 {
                 glb_bytes(&s, &tex)
             } else {
@@ -775,15 +830,18 @@ impl Demo {
             }
             .map_err(err)?;
             let ms = now() - t0;
-            let error = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
             let info = LevelInfo {
                 triangles: s.triangle_count(),
                 vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
                 error,
                 relative_error: error / diag,
                 error_bound,
-                switch_distance_1px: error * reference_ppr(),
+                switch_distance_1px: error * ppr,
+                ppr,
                 ms,
+                note: visible.map(|v| view_note(level, error, v, opts.view_distance)),
+                view_texel_density: cap,
+                view_texels,
                 coverage: Some(coverage),
                 charts: Some(p.charts),
                 utilization: Some(p.utilization),
@@ -803,6 +861,152 @@ impl Demo {
             t0 = now();
         }
         Ok(())
+    }
+
+    /// The artist's texel density per triangle of the flattened scene, from the largest
+    /// texture of its material (texels per world unit; 0 where untextured).
+    fn artist_density(&self, flat: &Mesh) -> Vec<f32> {
+        let largest: Vec<Option<(u32, u32, u32)>> = (0..self.scene.materials.len())
+            .map(|slot| {
+                let m = self
+                    .materials
+                    .get(self.scene.material_id(slot as u32).0 as usize)?;
+                [
+                    m.base_color_texture.as_ref().map(|(t, s)| (t, *s)),
+                    m.metallic_roughness_texture.as_ref().map(|(t, s)| (t, *s)),
+                    m.normal_texture.as_ref().map(|(t, s, _)| (t, *s)),
+                ]
+                .into_iter()
+                .flatten()
+                .max_by_key(|(t, _)| u64::from(t.width) * u64::from(t.height))
+                .map(|(t, s)| (t.width, t.height, s))
+            })
+            .collect();
+        let sizes = |set: u32| -> Vec<(u32, u32)> {
+            largest
+                .iter()
+                .map(|x| match x {
+                    Some((w, h, s)) if *s == set => (*w, *h),
+                    _ => (0, 0),
+                })
+                .collect()
+        };
+        texel_density(flat, 0, &sizes(0))
+            .into_iter()
+            .zip(texel_density(flat, 1, &sizes(1)))
+            .map(|(a, b)| a.max(b))
+            .collect()
+    }
+}
+
+/// Reduces `mesh` to `target` triangles, then with `limit` (an estimated deviation, mesh
+/// units) on until the simplifier's estimate reaches it: the coarser of the two. Returns the
+/// mesh, its estimated deviation, and whether the limit took it past the target.
+fn reduce_to(
+    mesh: &Mesh,
+    opts: &SimplifyOptions,
+    target: usize,
+    limit: Option<f32>,
+) -> Result<(Mesh, f32, bool), Error> {
+    let r = simplify(
+        mesh,
+        &SimplifyOptions {
+            target_triangles: Some(target),
+            ..opts.clone()
+        },
+    )?;
+    match limit {
+        Some(l) if r.error < l => {
+            let more = simplify(
+                &r.mesh,
+                &SimplifyOptions {
+                    target_ratio: None,
+                    target_triangles: None,
+                    max_error: Some(l - r.error),
+                    ..opts.clone()
+                },
+            )?;
+            Ok((more.mesh, r.error + more.error, true))
+        }
+        _ => Ok((r.mesh, r.error, false)),
+    }
+}
+
+/// Builds a level that may go to a visible limit of `limit` world units: `build(k)` reduces
+/// with the limit scaled by `k` and returns the level, its measured deviation (world units),
+/// and whether the limit took it past its step. The simplifier's estimate can run well below
+/// the measured Hausdorff distance (thin parts, small pieces), so when the measured deviation
+/// is over a pixel and a quarter, the scale is bisected (a few builds at most) for the coarsest
+/// level that measures within it.
+fn fit_visible<T>(
+    limit: Option<f32>,
+    mut build: impl FnMut(f32) -> Result<(T, f32, bool), String>,
+) -> Result<(T, f32), String> {
+    let (level, error, extended) = build(1.0)?;
+    let v = match limit {
+        Some(v) if extended && error > 1.25 * v => 1.25 * v,
+        _ => return Ok((level, error)),
+    };
+    // The finest scale that measured too coarse, and the coarsest that fit.
+    let (mut bad, mut finest) = (1.0f32, (level, error));
+    let mut good: Option<(f32, (T, f32))> = None;
+    let mut k = (v / finest.1).clamp(0.2, 0.7);
+    for _ in 0..4 {
+        let (level, error, extended) = build(k)?;
+        if extended && error > v {
+            bad = k;
+            finest = (level, error);
+        } else {
+            good = Some((k, (level, error)));
+            if !extended {
+                break; // the step alone: a smaller scale changes nothing
+            }
+        }
+        k = match &good {
+            Some((g, _)) if bad / g < 1.15 => break,
+            Some((g, _)) => (g * bad).sqrt(),
+            None => k * (v / finest.1).clamp(0.2, 0.7),
+        };
+    }
+    Ok(good.map_or(finest, |g| g.1))
+}
+
+/// The fraction of the artist's texels (area × density², over textured triangles) that a cap
+/// of `cap` texels per unit keeps; `None` when nothing is textured.
+fn texels_under(flat: &Mesh, dens: &[f32], cap: f32) -> Option<f32> {
+    let (mut all, mut kept) = (0.0f64, 0.0f64);
+    for (t, &d) in dens.iter().enumerate() {
+        if d > 0.0 {
+            let [a, b, c] = flat.triangle_positions(t);
+            let area = f64::from(farthing::math::triangle_area(a, b, c));
+            all += area * f64::from(d) * f64::from(d);
+            kept += area * f64::from(d.min(cap)).powi(2);
+        }
+    }
+    (all > 0.0).then(|| (kept / all) as f32)
+}
+
+/// Texels `dens` (per triangle, texels per unit) asks for over `mesh`: area × density².
+fn texels_needed(mesh: &Mesh, dens: &[f32]) -> f32 {
+    dens.iter()
+        .enumerate()
+        .map(|(t, &d)| {
+            let [a, b, c] = mesh.triangle_positions(t);
+            f64::from(farthing::math::triangle_area(a, b, c)) * f64::from(d) * f64::from(d)
+        })
+        .sum::<f64>() as f32
+}
+
+/// How a level looks from the closest view of a budget: `visible` is one pixel there.
+fn view_note(level: usize, error: f32, visible: f32, distance: f32) -> String {
+    let px = error / visible;
+    match level {
+        0 => format!("Finer than the closest view ({distance} away) can show"),
+        1 => format!(
+            "Visible limit: reduced until it deviates about a pixel at {distance}; measured {px:.1} px"
+        ),
+        _ if px <= 1.0 => format!("Within a pixel of LOD0 even at {distance}"),
+        _ => format!("{px:.1} px from LOD0 at {distance}"),
     }
 }
 

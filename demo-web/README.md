@@ -21,9 +21,19 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
   (LSCM, or planar charts) and the original's base color, normals (including normal maps) and
   roughness/metalness are baked into an atlas.
   The textures appear in the panel as soon as they are baked.
+- **Viewing budget** is for models that are only ever seen from so close: a rock that never
+  comes nearer than a metre doesn't need detail finer than a pixel there. Set *Closest view*
+  (in the model's units: metres for glTF), the camera's field of view and the screen height,
+  and the chain keeps nothing that view can't show. LOD1 is reduced until it deviates about a
+  pixel at that distance (or by one step, if that goes further), and the later levels step
+  from it. The shared atlas is capped at a texel per pixel there, and each baked atlas is
+  sized for the distance its level first appears at. The panel shows how big the model is,
+  what a pixel is at that distance, and how much of the artist's texture detail the view can
+  ever see.
 - **Error** is the measured deviation from LOD0: a sampled two-way Hausdorff distance,
   relative to the scene's bounding-box diagonal. *Switch at* is the camera distance where that
-  error drops below one pixel (1080p, 60° FOV). **Auto LOD** mode switches levels using those
+  error drops below one pixel, for the viewing budget's field of view and screen (1080p,
+  60° unless you change them). **Auto LOD** mode switches levels using those
   distances, scaled to your window. Zoom out, or drag the distance slider (its ticks mark the
   switches), to watch it change. Auto mode orbits the model's center, and once the model is
   small a magnifier shows its rendered pixels up close.
