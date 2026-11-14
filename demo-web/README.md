@@ -8,10 +8,13 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
   unique file name.
 - **Near levels** (LOD1 up to *Bake proxy from*) are reduced mesh by mesh. Each level is built
   from the previous one and keeps the original's UVs and materials.
-- **Near textures: Shared atlas** re-unwraps the whole scene once instead, with farthing
-  choosing the chart cuts. The original materials are baked into that one atlas by exact
-  transfer, at the artist's texel density (the densest texture on each surface), and every
-  near level is reduced from that mesh. Charts sit in whole 2ᵏ-texel cells, so mipmaps never
+- **Near textures: Shared atlas** lays the whole scene out in one atlas instead. With *Keep
+  the artist's UV layout* (the default), the artist's UV islands are repacked whole, so the
+  bake copies the original texels one to one, and islands that reuse the same texels (mirrored
+  halves, repeated parts) share them. Unticked, farthing re-unwraps the scene and chooses the
+  chart cuts. The original materials are baked into that one atlas by exact transfer, at the
+  artist's texel density (the densest texture on each surface), and every near level is
+  reduced from that mesh. Charts sit in whole 2ᵏ-texel cells, so mipmaps never
   mix two charts. *Shared atlas up to* caps the side (2048 at most: a larger bake doesn't fit
   in a browser's WebAssembly memory). When the artist's density doesn't fit the cap, every
   chart shrinks by the same factor, which the panel shows. Every shared level's download
@@ -26,7 +29,8 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
   (in the model's units: metres for glTF), the camera's field of view and the screen height,
   and the chain keeps nothing that view can't show. LOD1 is reduced until it deviates about a
   pixel at that distance (or by one step, if that goes further), and the later levels step
-  from it. The shared atlas is capped at a texel per pixel there, and each baked atlas is
+  from it. The shared atlas is capped at a texel per pixel there (re-unwrapped, when that cap
+  is below the artist's resolution), and each baked atlas is
   sized for the distance its level first appears at. The panel shows how big the model is,
   what a pixel is at that distance, and how much of the artist's texture detail the view can
   ever see.

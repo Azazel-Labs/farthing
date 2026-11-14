@@ -415,8 +415,12 @@ fn samples_reduce_and_bake() {
         for w in levels.windows(2) {
             assert!(w[1].triangles < w[0].triangles, "{file}: {:?}", w[1]);
         }
+        // The bake finds the surface under (nearly) every charted texel. How much of the atlas
+        // the charts fill depends on how many there are: FlightHelmet's LOD3 has about 800 in
+        // 256 × 256.
         let baked = &levels[opts.bake_from];
-        assert!(baked.coverage.unwrap() > 0.2, "{file}: {baked:?}");
+        let (c, u) = (baked.coverage.unwrap(), baked.utilization.unwrap());
+        assert!(c > 0.9 * u && u > 0.15, "{file}: {baked:?}");
         // What the page calls: the original for the viewer, then each level's download.
         demo.original_glb()
             .unwrap_or_else(|e| panic!("{file}: {e}"));
