@@ -156,7 +156,7 @@ fn zipped_gltf_reduces_and_bakes() {
     let names: Vec<&str> = textures.iter().map(|t| t.0.as_str()).collect();
     assert_eq!(names, ["base_color", "normal", "orm"]);
     // The checker survives: the baked base color has both red and white texels.
-    let px = textures[0].1.chunks_exact(4);
+    let px = textures[0].1.as_chunks::<4>().0.iter();
     let red = px.clone().filter(|p| p[0] > 200 && p[1] < 60).count();
     let white = px.filter(|p| p[0] > 200 && p[1] > 200).count();
     assert!(red > 100 && white > 100, "red {red}, white {white}");
