@@ -6,7 +6,7 @@ use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
 use farthing::{Mesh, Scene};
 use farthing_demo_web::modes::ViewRequest;
 use farthing_demo_web::pipeline::{
-    Buffer, Demo, DemoMode, Event, LevelInfo, LodOptions, TextureMode,
+    Buffer, Demo, DemoMode, Event, LevelInfo, LevelKind, LodOptions, TextureMode,
 };
 use glam::{Vec2, Vec3, Vec4};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -156,6 +156,7 @@ fn zipped_gltf_reduces_and_bakes() {
         assert_eq!(s.triangle_count(), info.triangles);
         assert!(info.error > 0.0 && info.relative_error < 0.2, "{info:?}");
     }
+    check_measured(&levels, demo.info().diagonal);
     let baked = &levels[3].0;
     assert!(baked.coverage.unwrap() > 0.2, "{baked:?}");
     let names: Vec<&str> = textures.iter().map(|t| t.0.as_str()).collect();
@@ -170,6 +171,30 @@ fn zipped_gltf_reduces_and_bakes() {
     let full = demo.level_glb(3).unwrap();
     assert!(full.windows(9).any(|w| w == b"image/png"));
     assert!(full.windows(24).any(|w| w == b"metallicRoughnessTexture"));
+}
+
+/// Measured levels (all but LOD0) report a mean and RMS distance between zero and the error,
+/// a normal deviation unless baked, and switch where the error is a pixel even on the side of
+/// the model nearest the camera: the error at the reference scale plus half the diagonal.
+fn check_measured(levels: &[(LevelInfo, Vec<u8>)], diagonal: f32) {
+    let ppr = 1080.0 / (2.0 * 30f32.to_radians().tan());
+    let original = &levels[0].0;
+    assert_eq!(original.switch_distance_1px, 0.0);
+    assert!(original.mean_error.is_none() && original.normal_error.is_none());
+    for (info, _) in &levels[1..] {
+        let switch = info.error * ppr + 0.5 * diagonal;
+        assert!(
+            (info.switch_distance_1px - switch).abs() <= 1e-4 * switch,
+            "{info:?}"
+        );
+        let (mean, rms) = (info.mean_error.unwrap(), info.rms_error.unwrap());
+        assert!(0.0 < mean && mean <= rms && rms <= info.error, "{info:?}");
+        let baked = matches!(info.kind, LevelKind::Baked);
+        assert_eq!(info.normal_error.is_none(), baked, "{info:?}");
+        if let Some(n) = info.normal_error {
+            assert!((0.0..30.0).contains(&n), "{info:?}");
+        }
+    }
 }
 
 #[test]
@@ -213,6 +238,7 @@ fn shared_atlas_carries_the_original_materials() {
         assert!(d > 0.0 && d <= 1.0, "{info:?}");
         assert!(info.coverage.unwrap() > 0.2, "{info:?}");
     }
+    check_measured(&levels, demo.info().diagonal);
     let (w, h) = (one.atlas_width.unwrap(), one.atlas_height.unwrap());
     assert!(w <= 512 && h <= 512 && w.is_power_of_two(), "{w}×{h}");
     // Three textures (base color, normal, ORM) with mips.

@@ -14,8 +14,8 @@
 //! only what selection and downloads need in [`Extra`].
 
 use crate::pipeline::{
-    original_textures, reference_ppr, Buffer, Demo, Event, LevelInfo, LevelKind, LodOptions,
-    MaterialHost, MEASURE_SAMPLES,
+    original_textures, reference_ppr, switch_distance, Buffer, Demo, Event, LevelInfo, LevelKind,
+    LodOptions, MaterialHost,
 };
 use farthing::bake::BakeOptions;
 use farthing::cluster::{
@@ -28,7 +28,6 @@ use farthing::impostor::footprint::{average_surfel_channel, ChannelSpec, Footpri
 use farthing::impostor::splats::{surfels_to_splats, write_splat_ply, Splat, SplatOptions};
 use farthing::impostor::surfels::{progressive_surfel_cloud, SurfelOptions};
 use farthing::io::{glb_bytes, ExportTextures, GltfMaterial};
-use farthing::metrics::surface_distance;
 use farthing::reduce::{
     repair, screen_size_to_max_error, simplify, Quality, SeamMode, SimplifyOptions, Symmetry,
 };
@@ -379,20 +378,17 @@ pub(crate) fn run_presets(
         // download gets the original's textures.
         let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
         let ms = now() - t0;
-        let error = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
-        let info = LevelInfo {
+        let mut info = LevelInfo {
             triangles: s.triangle_count(),
             vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
-            error,
-            relative_error: error / diag,
             error_bound: bound,
-            switch_distance_1px: error * reference_ppr(),
             ms,
             label: Some(p.label.into()),
             note: Some(p.note.into()),
             bytes: Some(glb.len()),
             ..LevelInfo::new(level, LevelKind::Reduced)
         };
+        info.measure(&source, &s, diag);
         emit(Event::Level {
             info: &info,
             glb: &glb,
@@ -884,7 +880,7 @@ pub(crate) fn run_splats(
             vertices: k,
             error: radius,
             relative_error: radius / diag,
-            switch_distance_1px: reference_ppr() / ppu.max(1e-12),
+            switch_distance_1px: switch_distance(1.0 / ppu.max(1e-12), diag),
             ms: now() - t1 + if level == 1 { cloud_ms } else { 0.0 },
             bytes: Some(ply_bytes),
             label: Some(format!("{k} splats")),

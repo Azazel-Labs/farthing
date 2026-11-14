@@ -37,6 +37,19 @@ pub(crate) fn reference_ppr() -> f32 {
     1080.0 / (2.0 * 30f32.to_radians().tan())
 }
 
+/// Distance from the scene's bounding-box center beyond which a deviation of `error` projects
+/// to at most one pixel in the reference view, wherever on the model it is: half the diagonal
+/// more than the error alone needs, since the near side of the model is that much closer.
+/// Measured from the center like `HlodNode::switch_distance`, and like THREE.LOD on the page.
+/// Zero when there is no error.
+pub(crate) fn switch_distance(error: f32, diagonal: f32) -> f32 {
+    if error > 0.0 {
+        error * reference_ppr() + 0.5 * diagonal
+    } else {
+        0.0
+    }
+}
+
 /// Which example the page runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -204,14 +217,23 @@ pub struct LevelInfo {
     pub kind: LevelKind,
     pub triangles: usize,
     pub vertices: usize,
-    /// Measured deviation from LOD0: sampled two-way Hausdorff distance, world units.
+    /// Measured deviation from LOD0: two-way Hausdorff distance over area-weighted samples and
+    /// every vertex of both, world units.
     pub error: f32,
     /// `error` relative to the scene's bounding-box diagonal.
     pub relative_error: f32,
     /// The simplifier's own estimate, summed over the chain: an upper bound, often loose.
     pub error_bound: f32,
-    /// Camera distance at which `error` projects to one pixel (1080p, 60° vertical FOV).
+    /// Camera distance from the bounding-box center beyond which `error` projects to at most
+    /// one pixel (1080p, 60° vertical FOV); see [`switch_distance`].
     pub switch_distance_1px: f32,
+    /// Measured levels: mean distance to LOD0 over the area-weighted samples, both ways.
+    pub mean_error: Option<f32>,
+    /// Measured levels: root mean square of the same distances.
+    pub rms_error: Option<f32>,
+    /// Measured levels: mean angle in degrees between the level's shading normals and LOD0's
+    /// at matching points. `None` for baked levels, whose normal maps make up for it.
+    pub normal_error: Option<f32>,
     /// Time to build the level (measuring it not included).
     pub ms: f64,
     /// Baked levels: fraction of texels that found the source surface.
@@ -246,6 +268,9 @@ impl LevelInfo {
             relative_error: 0.0,
             error_bound: 0.0,
             switch_distance_1px: 0.0,
+            mean_error: None,
+            rms_error: None,
+            normal_error: None,
             ms: 0.0,
             coverage: None,
             charts: None,
@@ -259,6 +284,20 @@ impl LevelInfo {
             density_scale: None,
             shared_textures: None,
         }
+    }
+
+    /// Measures the level `scene` against LOD0 (`source`, flattened): its error, mean and RMS
+    /// distance, normal deviation and switch distance. `diagonal` is LOD0's bounding-box
+    /// diagonal.
+    pub(crate) fn measure(&mut self, source: &Mesh, scene: &Scene, diagonal: f32) {
+        let d = surface_distance(source, &scene.flatten().0, MEASURE_SAMPLES);
+        self.error = d.hausdorff;
+        self.relative_error = d.hausdorff / diagonal;
+        self.switch_distance_1px = switch_distance(d.hausdorff, diagonal);
+        self.mean_error = Some(d.mean);
+        self.rms_error = Some(d.rms);
+        self.normal_error =
+            (!matches!(self.kind, LevelKind::Baked)).then_some(d.normal_mean_degrees);
     }
 }
 
@@ -447,24 +486,19 @@ impl Demo {
         let base = opts.simplify_options();
         let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
         let input_tris = self.scene.triangle_count();
-        let switch = |e: f32| e * reference_ppr();
         let source = self.scene.flatten().0;
         let level_info = |level, kind, s: &Scene, bound: f32, ms| {
-            let error = if level == 0 {
-                0.0
-            } else {
-                surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff
-            };
-            LevelInfo {
+            let mut info = LevelInfo {
                 triangles: s.triangle_count(),
                 vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
-                error,
-                relative_error: error / diag,
                 error_bound: bound,
-                switch_distance_1px: switch(error),
                 ms,
                 ..LevelInfo::new(level, kind)
+            };
+            if level > 0 {
+                info.measure(&source, s, diag);
             }
+            info
         };
 
         let original_bytes = texture_bytes(&original_textures(&self.materials));
@@ -775,14 +809,10 @@ impl Demo {
             }
             .map_err(err)?;
             let ms = now() - t0;
-            let error = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES).hausdorff;
-            let info = LevelInfo {
+            let mut info = LevelInfo {
                 triangles: s.triangle_count(),
                 vertices: s.meshes.iter().map(Mesh::vertex_count).sum(),
-                error,
-                relative_error: error / diag,
                 error_bound,
-                switch_distance_1px: error * reference_ppr(),
                 ms,
                 coverage: Some(coverage),
                 charts: Some(p.charts),
@@ -795,6 +825,7 @@ impl Demo {
                 shared_textures: Some(1),
                 ..LevelInfo::new(level, LevelKind::Shared)
             };
+            info.measure(&source, &s, diag);
             emit(Event::Level {
                 info: &info,
                 glb: &glb,

@@ -229,9 +229,12 @@ function syncLod() {
   lod.levels.length = 0;
   if (!original) return;
   lod.position.copy(original.center);
+  // Switch distances are the bounding radius plus a part that scales with the canvas height.
+  const r = diag() / 2;
   let d = 0;
   for (const l of ready) {
-    d = Math.max(d, (l.info.switch_distance_1px * h) / 1080);
+    const s = l.info.switch_distance_1px;
+    d = Math.max(d, s > 0 ? r + ((s - r) * h) / 1080 : 0);
     const g = new THREE.Group();
     g.position.copy(original.center).negate();
     // The level may be hidden in root (show() hides all but one); the clone copies that flag.
@@ -1467,9 +1470,15 @@ function renderRows() {
     const of = info?.full_triangles || total;
     const errTitle =
       info?.error_title ??
-      (info?.error_bound != null
-        ? `${info.error.toPrecision(3)} measured; simplifier bound ${info.error_bound.toPrecision(3)}`
-        : `${info?.error?.toPrecision(3)}`);
+      [
+        info?.error_bound != null
+          ? `${info.error.toPrecision(3)} measured; simplifier bound ${info.error_bound.toPrecision(3)}`
+          : `${info?.error?.toPrecision(3)}`,
+        info?.mean_error != null ? `mean ${info.mean_error.toPrecision(3)}, RMS ${info.rms_error.toPrecision(3)}` : "",
+        info?.normal_error != null ? `normals off by ${info.normal_error.toFixed(1)}° on average` : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
     const splats = kind === "splats";
     const cells = info
       ? [
