@@ -174,69 +174,77 @@ fn zipped_gltf_reduces_and_bakes() {
 
 #[test]
 fn shared_atlas_carries_the_original_materials() {
-    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
-    let opts = LodOptions {
-        levels: 3,
-        bake_from: 3,
-        atlas: 64,
-        textures: TextureMode::Shared,
-        shared_size: 512,
-        ..Default::default()
-    };
-    let (mut levels, mut textures) = (vec![], vec![]);
-    let t0 = std::time::Instant::now();
-    demo.run(
-        &opts,
-        &|| t0.elapsed().as_secs_f64() * 1e3,
-        &mut |e| match e {
-            Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
-            Event::Texture {
-                level,
-                channel,
-                width,
-                height,
-                rgba,
-            } => textures.push((level, channel.to_owned(), width, height, rgba.to_vec())),
-            _ => {}
-        },
-    )
-    .unwrap();
+    // Keeping the artist's UV layout (the default) and unwrapping afresh.
+    let mut charts = vec![];
+    for keep in [true, false] {
+        let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+        let opts = LodOptions {
+            levels: 3,
+            bake_from: 3,
+            atlas: 64,
+            textures: TextureMode::Shared,
+            shared_size: 512,
+            shared_keep_layout: keep,
+            ..Default::default()
+        };
+        let (mut levels, mut textures) = (vec![], vec![]);
+        let t0 = std::time::Instant::now();
+        demo.run(
+            &opts,
+            &|| t0.elapsed().as_secs_f64() * 1e3,
+            &mut |e| match e {
+                Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+                Event::Texture {
+                    level,
+                    channel,
+                    width,
+                    height,
+                    rgba,
+                } => textures.push((level, channel.to_owned(), width, height, rgba.to_vec())),
+                _ => {}
+            },
+        )
+        .unwrap();
 
-    let kinds: Vec<String> = levels.iter().map(|l| format!("{:?}", l.0.kind)).collect();
-    assert_eq!(kinds, ["Original", "Shared", "Shared", "Baked"]);
-    let (one, two) = (&levels[1].0, &levels[2].0);
-    assert!(two.triangles < one.triangles);
-    for info in [one, two] {
-        assert_eq!(info.shared_textures, Some(1));
-        assert!(info.relative_error < 0.05, "{info:?}");
-        let d = info.density_scale.unwrap();
-        assert!(d > 0.0 && d <= 1.0, "{info:?}");
-        assert!(info.coverage.unwrap() > 0.2, "{info:?}");
+        let kinds: Vec<String> = levels.iter().map(|l| format!("{:?}", l.0.kind)).collect();
+        assert_eq!(kinds, ["Original", "Shared", "Shared", "Baked"]);
+        let (one, two) = (&levels[1].0, &levels[2].0);
+        assert!(two.triangles < one.triangles);
+        for info in [one, two] {
+            assert_eq!(info.shared_textures, Some(1));
+            assert!(info.relative_error < 0.05, "{info:?}");
+            let d = info.density_scale.unwrap();
+            assert!(d > 0.0 && d <= 1.0, "{info:?}");
+            assert!(info.coverage.unwrap() > 0.2, "{info:?}");
+        }
+        let (w, h) = (one.atlas_width.unwrap(), one.atlas_height.unwrap());
+        assert!(w <= 512 && h <= 512 && w.is_power_of_two(), "{w}×{h}");
+        // Three textures (base color, normal, ORM) with mips.
+        assert_eq!(one.texture_bytes, Some(3 * ((w * h) as usize * 16 / 3)));
+
+        // Level 1's GLB carries the atlas; level 2 reuses it, but downloads embed it.
+        assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
+        assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
+        assert!(demo
+            .level_glb(2)
+            .unwrap()
+            .windows(9)
+            .any(|w| w == b"image/png"));
+
+        // The atlas comes from level 1 and keeps the checker.
+        let shared: Vec<_> = textures.iter().filter(|t| t.0 == 1).collect();
+        let names: Vec<&str> = shared.iter().map(|t| t.1.as_str()).collect();
+        assert_eq!(names, ["base_color", "normal", "orm"]);
+        assert_eq!((shared[0].2, shared[0].3), (w, h));
+        let px = shared[0].4.as_chunks::<4>().0.iter();
+        let red = px.clone().filter(|p| p[0] > 200 && p[1] < 60).count();
+        let white = px.filter(|p| p[0] > 200 && p[1] > 200).count();
+        assert!(red > 1000 && white > 1000, "red {red}, white {white}");
+        assert!(textures.iter().all(|t| t.0 == 1 || t.0 == 3));
+        charts.push(one.charts.unwrap());
     }
-    let (w, h) = (one.atlas_width.unwrap(), one.atlas_height.unwrap());
-    assert!(w <= 512 && h <= 512 && w.is_power_of_two(), "{w}×{h}");
-    // Three textures (base color, normal, ORM) with mips.
-    assert_eq!(one.texture_bytes, Some(3 * (w * h) as usize * 16 / 3));
-
-    // Level 1's GLB carries the atlas; level 2 reuses it, but downloads embed it.
-    assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
-    assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
-    assert!(demo
-        .level_glb(2)
-        .unwrap()
-        .windows(9)
-        .any(|w| w == b"image/png"));
-
-    // The atlas comes from level 1 and keeps the checker.
-    let shared: Vec<_> = textures.iter().filter(|t| t.0 == 1).collect();
-    let names: Vec<&str> = shared.iter().map(|t| t.1.as_str()).collect();
-    assert_eq!(names, ["base_color", "normal", "orm"]);
-    assert_eq!((shared[0].2, shared[0].3), (w, h));
-    let px = shared[0].4.as_chunks::<4>().0.iter();
-    let red = px.clone().filter(|p| p[0] > 200 && p[1] < 60).count();
-    let white = px.filter(|p| p[0] > 200 && p[1] > 200).count();
-    assert!(red > 1000 && white > 1000, "red {red}, white {white}");
-    assert!(textures.iter().all(|t| t.0 == 1 || t.0 == 3));
+    // The sphere's UV islands are kept whole; unwrapped afresh it is cut into more charts.
+    assert!(charts[0] < charts[1], "{charts:?}");
 }
 
 #[test]

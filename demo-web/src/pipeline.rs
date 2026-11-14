@@ -3,7 +3,7 @@
 //! * [`Demo::load`]: glTF / GLB from dropped files or a zip (external buffers and textures
 //!   resolved by relative path).
 //! * [`Demo::run`]: a LOD chain. Near levels are reduced per mesh and keep the original
-//!   materials, or ([`TextureMode::Shared`]) are reduced from one re-unwrapped copy of the
+//!   materials, or ([`TextureMode::Shared`]) are reduced from one copy of the
 //!   whole scene whose atlas holds the original materials at the artist's resolution; far levels (from `bake_from`) are geometry-only proxies of the whole scene with
 //!   fresh UVs and base color, normal and roughness/metalness maps baked from the original. Every finished level and
 //!   baked texture is reported through an [`Event`] as soon as it exists.
@@ -21,9 +21,9 @@ use farthing::image::{linear_to_srgb, Image, Texture};
 use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
 use farthing::metrics::surface_distance;
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
-use farthing::uv::{parameterize, texel_density, ParamOptions};
+use farthing::uv::{parameterize, texel_density, ParamOptions, SourceTexels};
 use farthing::{Error, MaterialId, Mesh, Scene};
-use glam::{Mat4, Vec4};
+use glam::{Mat4, Vec2, Vec4};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
@@ -66,9 +66,10 @@ pub enum TextureMode {
     /// Each mesh reduced on its own, keeping the original UVs and materials.
     #[default]
     Original,
-    /// The whole scene re-unwrapped once (charts cut where farthing wants them, mip-safe
-    /// 8 × 8 blocks), the original materials baked into that one atlas at the artist's
-    /// texel density, and every near level reduced from that mesh.
+    /// The whole scene laid out once in one atlas (the artist's UV islands repacked, or with
+    /// [`LodOptions::shared_keep_layout`] off, charts cut afresh; mip-safe 8 × 8 blocks), the
+    /// original materials baked into it at the artist's texel density, and every near level
+    /// reduced from that mesh.
     Shared,
 }
 
@@ -96,6 +97,10 @@ pub struct LodOptions {
     /// Shared atlas: largest side (at most [`MAX_SHARED_SIZE`]). The atlas keeps the artist's
     /// texel density when that fits, and shrinks every chart by the same factor when it does not.
     pub shared_size: u32,
+    /// Shared atlas: keep the artist's UV islands (moved, not reshaped) so the bake copies the
+    /// original texels one to one, and store texels that several islands reuse (mirrored
+    /// halves, repeated parts) once. Off: unwrap the scene afresh.
+    pub shared_keep_layout: bool,
 
     pub mode: DemoMode,
     /// Option examples: triangle fraction every configuration reduces to.
@@ -135,6 +140,7 @@ impl Default for LodOptions {
             planar_uv: false,
             textures: TextureMode::Original,
             shared_size: 2048,
+            shared_keep_layout: true,
             mode: DemoMode::Chain,
             preset_ratio: 0.25,
             cluster_layout: "nanite".into(),
@@ -617,9 +623,10 @@ impl Demo {
         Ok(())
     }
 
-    /// Shared-atlas near levels (1 until `bake_from`): the whole scene as one mesh, re-unwrapped
-    /// at the artist's texel density (up to `opts.shared_size` per side) and baked by exact
-    /// transfer, then reduced level by level. Level 1's GLB carries the atlas.
+    /// Shared-atlas near levels (1 until `bake_from`): the whole scene as one mesh, its UV
+    /// islands repacked (or re-unwrapped) at the artist's texel density (up to
+    /// `opts.shared_size` per side) and baked by exact transfer, then reduced level by level.
+    /// Level 1's GLB carries the atlas.
     fn shared_levels(
         &mut self,
         opts: &LodOptions,
@@ -663,6 +670,21 @@ impl Demo {
             .map(|(a, b)| a.max(b))
             .collect();
         let textured = dens.iter().any(|&d| d > 0.0);
+        // Materials that read textures through two UV sets: their islands may overlap in one
+        // set and not in the other.
+        let one_set = self.materials.iter().all(|m| {
+            let mut sets = [
+                m.base_color_texture.as_ref().map(|t| t.1),
+                m.metallic_roughness_texture.as_ref().map(|t| t.1),
+                m.normal_texture.as_ref().map(|t| t.1),
+            ]
+            .into_iter()
+            .flatten();
+            let first = sets.next();
+            sets.all(|s| Some(s) == first)
+        });
+        let keep =
+            (opts.shared_keep_layout && textured).then(|| source_texels(&flat, &largest, one_set));
         let source = flat.clone();
         let mut mesh = flat;
         mesh.uvs.clear();
@@ -692,6 +714,7 @@ impl Demo {
                     padding: block,
                     block,
                     texel_density: textured.then(|| dens.clone()),
+                    source_texels: keep.clone(),
                     ..if opts.planar_uv {
                         ParamOptions::planar()
                     } else {
@@ -803,6 +826,43 @@ impl Demo {
             t0 = now();
         }
         Ok(())
+    }
+}
+
+/// Where each triangle of the flattened scene reads its material's largest texture (`largest`
+/// per slot: width, height, UV set), for keeping the artist's UV layout in the shared atlas.
+/// Islands that cover the same texels share them if `share` and no vertex colors tint the
+/// copies differently.
+fn source_texels(flat: &Mesh, largest: &[Option<(u32, u32, u32)>], share: bool) -> SourceTexels {
+    let mut uvs = Vec::with_capacity(flat.indices.len());
+    let texture = (0..flat.triangle_count())
+        .map(|t| {
+            let slot = flat.material_ids[t] as usize;
+            let set = largest.get(slot).copied().flatten();
+            match set.and_then(|(_, _, s)| flat.uvs.get(s as usize)) {
+                Some(uv) => {
+                    uvs.extend(flat.triangle(t).map(|v| uv[v as usize]));
+                    Some(slot as u32)
+                }
+                None => {
+                    uvs.extend([Vec2::ZERO; 3]);
+                    None
+                }
+            }
+        })
+        .collect();
+    let tinted = flat
+        .colors
+        .as_ref()
+        .is_some_and(|c| c.iter().any(|&c| c != Vec4::ONE));
+    SourceTexels {
+        uvs,
+        texture,
+        sizes: largest
+            .iter()
+            .map(|x| x.map_or((0, 0), |(w, h, _)| (w, h)))
+            .collect(),
+        share: share && !tinted,
     }
 }
 

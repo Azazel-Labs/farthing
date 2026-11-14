@@ -88,6 +88,35 @@ pub struct ParamOptions {
     /// that level. 1: pixel placement.
     #[serde(default = "default_block")]
     pub block: u32,
+    /// Keep the source's own texel layout instead of unwrapping afresh: triangles that read a
+    /// texture are grouped into the source's UV islands, and each island becomes a chart whose
+    /// new UVs are its source UVs moved by whole texels and turned by quarter turns, one texel
+    /// per source texel (times [`ParamResult::density_scale`] when the atlas is too small). A
+    /// bake into such a chart copies the source texels. Triangles without a texture are
+    /// unwrapped as usual, at their [`texel_density`] or else at the kept texels' density.
+    /// Implies the atlas sizing of `texel_density`.
+    #[serde(skip)]
+    pub source_texels: Option<SourceTexels>,
+}
+
+/// Where each triangle's texels are in the source textures, for
+/// [`ParamOptions::source_texels`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SourceTexels {
+    /// Per input corner (three per triangle, in index order): the UV it reads its texture at.
+    /// Textures repeat (glTF's default wrapping), so an island one texture width to the side
+    /// reads the same texels.
+    pub uvs: Vec<Vec2>,
+    /// Per input triangle: the texture it reads, as an index into `sizes`; None to unwrap the
+    /// triangle afresh. Triangles of different textures never share a chart.
+    pub texture: Vec<Option<u32>>,
+    /// Texture sizes in texels.
+    pub sizes: Vec<(u32, u32)>,
+    /// Islands of one texture that cover the same texels (mirrored halves, repeated parts) share
+    /// one chart, so the atlas stores those texels once. Only correct when overlapping
+    /// triangles bake to the same values: one material, and no vertex colors that differ
+    /// between the copies.
+    pub share: bool,
 }
 
 fn default_true() -> bool {
@@ -110,6 +139,7 @@ impl Default for ParamOptions {
             split_sprawling: true,
             texel_density: None,
             block: 1,
+            source_texels: None,
         }
     }
 }
@@ -149,6 +179,9 @@ pub struct ParamResult {
     pub mean_stretch: f32,
     /// For each output vertex, the input vertex it was copied from.
     pub source_vertex: Vec<u32>,
+    /// With [`ParamOptions::source_texels`]: how many of `charts` keep source texels (the
+    /// rest were unwrapped).
+    pub island_charts: usize,
 }
 
 struct Chart {
@@ -559,6 +592,9 @@ fn merge_charts(mesh: &Mesh, topo: &Topo, charts: Vec<Chart>) -> Vec<Chart> {
         let mut shared: Vec<((u32, u32), f32)> = Vec::new();
         for f in 0..nf {
             let cf = owner[f];
+            if cf == u32::MAX {
+                continue; // in no chart (kept source texels)
+            }
             let [p0, p1, p2] = mesh.triangle_positions(f);
             let full = p0.distance(p1) + p1.distance(p2) + p2.distance(p0);
             let mut inner = 0.0;
@@ -566,7 +602,7 @@ fn merge_charts(mesh: &Mesh, topo: &Topo, charts: Vec<Chart>) -> Vec<Chart> {
                 let l = edge_len(f, g);
                 if owner[g] == cf {
                     inner += l;
-                } else if f < g {
+                } else if f < g && owner[g] != u32::MAX {
                     let (a, b) = (cf.min(owner[g]), cf.max(owner[g]));
                     shared.push(((a, b), l));
                 }
@@ -818,6 +854,261 @@ fn chart_densities(charts: &[Chart], topo: &Topo, dens: &[f32]) -> Vec<f32> {
     out
 }
 
+/// Union-find root with path halving.
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// Joins two sets; the smaller index stays the root, so results don't depend on join order.
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let (a, b) = (uf_find(parent, a), uf_find(parent, b));
+    if a != b {
+        parent[a.max(b)] = a.min(b);
+    }
+}
+
+/// Bits of a coordinate for exact matching, with -0 and +0 the same.
+fn key_bits(x: f32) -> u32 {
+    if x == 0.0 {
+        0
+    } else {
+        x.to_bits()
+    }
+}
+
+/// Overlap grids hold at most this many cells; larger textures are looked at in coarser
+/// cells (a coarse cell can join islands that only come close, which costs space, not
+/// correctness).
+const OVERLAP_CELLS: u64 = 1 << 22;
+
+/// The kept charts, each with its texel area.
+type IslandCharts = Vec<(Chart, f32)>;
+
+/// Charts for [`ParamOptions::source_texels`]: the source's UV islands in texel units (one
+/// unit per source texel), moved by whole texture tiles to start in the first tile, with their
+/// texel areas; the triangles left to unwrap; and the kept texels' mean density in texels per
+/// world unit (0 if nothing is kept).
+fn island_charts(
+    mesh: &Mesh,
+    topo: &Topo,
+    src: &SourceTexels,
+) -> Result<(IslandCharts, Vec<usize>, f32)> {
+    let tc = mesh.triangle_count();
+    if src.uvs.len() != 3 * tc || src.texture.len() != tc {
+        return Err(Error::InvalidInput(format!(
+            "source_texels has {} UVs and {} textures for {tc} triangles",
+            src.uvs.len(),
+            src.texture.len()
+        )));
+    }
+    let size_of = |k: u32| {
+        let (w, h) = src.sizes[k as usize];
+        Vec2::new(w as f32, h as f32)
+    };
+    // Per triangle: its texture and corner texels, if it can keep them.
+    let texels: Vec<Option<(u32, [Vec2; 3])>> = (0..tc)
+        .map(|t| {
+            let k = src.texture[t]?;
+            let &(w, h) = src.sizes.get(k as usize)?;
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let q = [0, 1, 2].map(|c| src.uvs[3 * t + c] * size_of(k));
+            q.iter().all(|p| p.is_finite()).then_some((k, q))
+        })
+        .collect();
+    // Islands: triangles of one texture joined at corners with equal position and texel
+    // (positions rather than vertex ids, so split normals don't cut an island).
+    let mut parent: Vec<usize> = (0..tc).collect();
+    let mut first: HashMap<(u32, [u32; 3], [u32; 2]), usize> = HashMap::default();
+    for (t, tex) in texels.iter().enumerate() {
+        let Some((k, q)) = tex else { continue };
+        for (c, p) in q.iter().enumerate() {
+            let pos = mesh.positions[mesh.indices[3 * t + c] as usize];
+            let key = (*k, pos.to_array().map(key_bits), p.to_array().map(key_bits));
+            let g = *first.entry(key).or_insert(t);
+            uf_union(&mut parent, t, g);
+        }
+    }
+    // Members of each island, islands in order of their first triangle.
+    let mut members: Vec<Vec<usize>> = Vec::new();
+    let mut slot: HashMap<usize, usize> = HashMap::default();
+    let mut unwrap = Vec::new();
+    for t in 0..tc {
+        if texels[t].is_none() {
+            unwrap.push(t);
+            continue;
+        }
+        let r = uf_find(&mut parent, t);
+        let i = *slot.entry(r).or_insert_with(|| {
+            members.push(Vec::new());
+            members.len() - 1
+        });
+        members[i].push(t);
+    }
+    struct Island {
+        k: u32,
+        shift: Vec2,
+        area: f32,
+        keep: bool,
+        /// Within one tile after the shift, so its texels can be compared with others'.
+        tiled: bool,
+    }
+    let islands: Vec<Island> = members
+        .iter()
+        .map(|faces| {
+            let k = texels[faces[0]].unwrap().0;
+            let size = size_of(k);
+            let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+            let mut area = 0.0;
+            for &f in faces {
+                let q = texels[f].unwrap().1;
+                area += 0.5 * (q[1] - q[0]).perp_dot(q[2] - q[0]).abs();
+                for p in q {
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+            }
+            let shift = (lo / size).floor() * size;
+            // Islands under a texel, or wider than the texture (tiling), are unwrapped.
+            let keep = area >= 1.0 && (hi - lo).cmple(size).all();
+            let tiled = keep && (hi - shift).cmple(size).all();
+            Island {
+                k,
+                shift,
+                area,
+                keep,
+                tiled,
+            }
+        })
+        .collect();
+    for (faces, isl) in members.iter().zip(&islands) {
+        if !isl.keep {
+            unwrap.extend(faces);
+        }
+    }
+    unwrap.sort_unstable();
+
+    // Islands of one texture that cover a common texel center share a chart.
+    let mut group: Vec<usize> = (0..islands.len()).collect();
+    let mut cells = vec![0u64; islands.len()];
+    if src.share {
+        let mut grids: HashMap<u32, (u32, u32, u32, Vec<u32>)> = HashMap::default();
+        for (i, isl) in islands.iter().enumerate() {
+            if !isl.tiled {
+                continue;
+            }
+            let (w, h) = src.sizes[isl.k as usize];
+            let (gw, gh, step, grid) = grids.entry(isl.k).or_insert_with(|| {
+                let mut step = 1u32;
+                while u64::from(w.div_ceil(step)) * u64::from(h.div_ceil(step)) > OVERLAP_CELLS {
+                    step *= 2;
+                }
+                let (gw, gh) = (w.div_ceil(step), h.div_ceil(step));
+                (gw, gh, step, vec![u32::MAX; (gw * gh) as usize])
+            });
+            for &f in &members[i] {
+                let q = texels[f].unwrap().1.map(|p| (p - isl.shift) / *step as f32);
+                let s = (q[1] - q[0]).perp_dot(q[2] - q[0]);
+                if s == 0.0 {
+                    continue;
+                }
+                let lo = q[0].min(q[1]).min(q[2]);
+                let hi = q[0].max(q[1]).max(q[2]);
+                let x0 = (lo.x - 0.5).ceil().max(0.0) as i64;
+                let y0 = (lo.y - 0.5).ceil().max(0.0) as i64;
+                let x1 = ((hi.x - 0.5).floor() as i64).min(i64::from(*gw) - 1);
+                let y1 = ((hi.y - 0.5).floor() as i64).min(i64::from(*gh) - 1);
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        let p = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                        let inside =
+                            (0..3).all(|e| (q[(e + 1) % 3] - q[e]).perp_dot(p - q[e]) * s >= 0.0);
+                        if !inside {
+                            continue;
+                        }
+                        let cell = &mut grid[y as usize * *gw as usize + x as usize];
+                        if *cell == u32::MAX {
+                            *cell = i as u32;
+                        } else if *cell != i as u32 {
+                            uf_union(&mut group, *cell as usize, i);
+                        }
+                    }
+                }
+            }
+        }
+        // Covered cells per group, for its texel area.
+        for (_, _, step, grid) in grids.values() {
+            for &c in grid.iter().filter(|&&c| c != u32::MAX) {
+                let r = uf_find(&mut group, c as usize);
+                cells[r] += u64::from(step * step);
+            }
+        }
+    }
+
+    let mut by_root: HashMap<usize, usize> = HashMap::default();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (i, isl) in islands.iter().enumerate() {
+        if !isl.keep {
+            continue;
+        }
+        let r = uf_find(&mut group, i);
+        let g = *by_root.entry(r).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(i);
+    }
+    let mut charts = Vec::with_capacity(groups.len());
+    let (mut texel_area, mut world_area) = (0.0f64, 0.0f64);
+    for g in &groups {
+        let mut faces = Vec::new();
+        let mut uv = HashMap::default();
+        let (mut lo, mut hi) = (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY));
+        for &i in g {
+            for &f in &members[i] {
+                faces.push(f);
+                world_area += f64::from(topo.areas[f]);
+                for (c, p) in texels[f].unwrap().1.into_iter().enumerate() {
+                    let p = p - islands[i].shift;
+                    uv.insert((f, c), p);
+                    lo = lo.min(p);
+                    hi = hi.max(p);
+                }
+            }
+        }
+        faces.sort_unstable();
+        let sum: f32 = g.iter().map(|&i| islands[i].area).sum();
+        texel_area += f64::from(sum);
+        let area = if g.len() == 1 {
+            sum
+        } else {
+            let largest = g.iter().map(|&i| islands[i].area).fold(0.0, f32::max);
+            (cells[uf_find(&mut group, g[0])] as f32)
+                .max(largest)
+                .min(sum)
+        };
+        let chart = Chart {
+            faces,
+            uv,
+            min: lo.floor(),
+            max: hi,
+            lscm: false,
+        };
+        charts.push((chart, area));
+    }
+    let density = if world_area > 0.0 {
+        (texel_area / world_area).sqrt() as f32
+    } else {
+        0.0
+    };
+    Ok((charts, unwrap, density))
+}
+
 /// [`texel_density`] skips triangles whose shape quality is below this.
 const SLIVER_QUALITY: f32 = 1e-3;
 
@@ -860,7 +1151,11 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
         return Err(Error::InvalidMesh("no triangles to parameterize".into()));
     }
     let topo = topology(mesh);
-    let all: Vec<usize> = (0..tri_count).collect();
+    // Triangles that keep their source texels become island charts; `all` are unwrapped.
+    let (islands, all, island_density) = match &opts.source_texels {
+        Some(src) => island_charts(mesh, &topo, src)?,
+        None => (Vec::new(), (0..tri_count).collect(), 0.0),
+    };
     let mut charts: Vec<Chart> = Vec::new();
     match opts.method {
         ParamMethod::Planar => {
@@ -886,23 +1181,42 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
             }
         }
     }
+    let unwrapped = charts.len();
+    let mut areas: Vec<f32> = charts.iter().map(chart_area).collect();
+    for (chart, area) in islands {
+        charts.push(chart);
+        areas.push(area);
+    }
 
     let atlas = opts.atlas_size;
     let pad = opts.padding;
     let block = opts.block.max(1);
-    let areas: Vec<f32> = charts.iter().map(chart_area).collect();
+    let kept = charts.len() > unwrapped;
+    let density_mode = opts.texel_density.is_some() || kept;
     // Each chart is drawn at `d × rel[c]` texels per chart unit.
-    let rel: Vec<f32> = match &opts.texel_density {
-        Some(dens) => {
-            if dens.len() != tri_count {
-                return Err(Error::InvalidInput(format!(
-                    "texel_density has {} entries for {tri_count} triangles",
-                    dens.len()
-                )));
-            }
-            chart_densities(&charts, &topo, dens)
+    let rel: Vec<f32> = match (&opts.texel_density, &opts.source_texels) {
+        (Some(dens), _) if dens.len() != tri_count => {
+            return Err(Error::InvalidInput(format!(
+                "texel_density has {} entries for {tri_count} triangles",
+                dens.len()
+            )));
         }
-        None => vec![1.0; charts.len()],
+        (Some(dens), None) => chart_densities(&charts, &topo, dens),
+        (dens, Some(_)) if kept => {
+            // Unwrapped triangles that ask for nothing get the kept texels' density; island
+            // charts are in source texels already.
+            let dens: Vec<f32> = (0..tri_count)
+                .map(|t| match dens.as_ref().map_or(0.0, |d| d[t]) {
+                    d if d.is_finite() && d > 0.0 => d,
+                    _ => island_density,
+                })
+                .collect();
+            let mut rel = chart_densities(&charts[..unwrapped], &topo, &dens);
+            rel.resize(charts.len(), 1.0);
+            rel
+        }
+        (Some(dens), Some(_)) => chart_densities(&charts, &topo, dens),
+        (None, _) => vec![1.0; charts.len()],
     };
     // Packs at `d` into an atlas `width` wide; returns the placements, frames and used height.
     let try_pack = |d: f32, width: u32| -> Option<(Vec<MaskPlacement>, Vec<(u32, u32)>, u32)> {
@@ -975,7 +1289,7 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
         }
         best.ok_or_else(|| Error::InvalidInput("could not pack charts".into()))
     };
-    let (density, placements, frames, width, height) = if opts.texel_density.is_some() {
+    let (density, placements, frames, width, height) = if density_mode {
         // Full density in the smallest atlas: power-of-two widths around the square that
         // holds the charts, each with the height it needs.
         let w0 = ((need / 0.75).sqrt().ceil() as u32)
@@ -1016,7 +1330,8 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
     };
     let scale = Vec2::new(width as f32, height as f32);
 
-    let mut vmap: HashMap<(usize, u32), u32> = HashMap::default();
+    // Island charts may give one vertex several source texels; those become separate vertices.
+    let mut vmap: HashMap<(usize, u32, [u32; 2]), u32> = HashMap::default();
     let mut source_vertex = Vec::new();
     let mut new_uv = Vec::new();
     let mut indices = vec![0u32; mesh.indices.len()];
@@ -1026,9 +1341,14 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
             let tri = mesh.triangle(f);
             for c in 0..3 {
                 let v = tri[c];
-                let id = *vmap.entry((ci, v)).or_insert_with(|| {
-                    let local = (chart.uv[&(f, c)] - chart.min) * (density * rel[ci])
-                        + Vec2::splat(pad as f32);
+                let uv = chart.uv[&(f, c)];
+                let key = if ci >= unwrapped {
+                    [uv.x.to_bits(), uv.y.to_bits()]
+                } else {
+                    [0; 2]
+                };
+                let id = *vmap.entry((ci, v, key)).or_insert_with(|| {
+                    let local = (uv - chart.min) * (density * rel[ci]) + Vec2::splat(pad as f32);
                     let (fw, fh) = frames[ci];
                     let px = rotate_point(local, fw, fh, pl.rotation);
                     new_uv.push((Vec2::new(pl.x as f32, pl.y as f32) + px) / scale);
@@ -1055,18 +1375,15 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
         mesh: out,
         charts: charts.len(),
         lscm_charts: charts.iter().filter(|c| c.lscm).count(),
-        texels_per_unit: if opts.texel_density.is_some() {
+        island_charts: charts.len() - unwrapped,
+        texels_per_unit: if density_mode {
             (used / area3d.max(1e-12)).sqrt()
         } else {
             density
         },
         width,
         height,
-        density_scale: if opts.texel_density.is_some() {
-            density
-        } else {
-            1.0
-        },
+        density_scale: if density_mode { density } else { 1.0 },
         utilization: used / (width as f32 * height as f32),
         mean_stretch,
         source_vertex,
@@ -1423,5 +1740,145 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Source texels for `cube()`: face i is a 30-texel square of a 256² texture at
+    /// (10 + 40 i, 20.25), face 5 one tile to the right, and face 4 without a texture.
+    fn cube_texels() -> SourceTexels {
+        let corner = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let mut uvs = Vec::new();
+        for face in 0..6 {
+            let base = Vec2::new(10.0 + 40.0 * face as f32, 20.25);
+            let tile = if face == 5 { 256.0 } else { 0.0 };
+            for c in [0, 1, 2, 0, 2, 3] {
+                let (x, y) = corner[c];
+                uvs.push((base + Vec2::new(x, y) * 30.0 + Vec2::new(tile, 0.0)) / 256.0);
+            }
+        }
+        SourceTexels {
+            uvs,
+            texture: (0..12).map(|t| (t / 2 != 4).then_some(0)).collect(),
+            sizes: vec![(256, 256)],
+            share: true,
+        }
+    }
+
+    #[test]
+    fn source_texels_keep_the_texel_layout() {
+        let m = cube();
+        let src = cube_texels();
+        let r = parameterize(
+            &m,
+            &ParamOptions {
+                atlas_size: 1024,
+                padding: 4,
+                block: 4,
+                source_texels: Some(src.clone()),
+                ..ParamOptions::default()
+            },
+        )
+        .unwrap();
+        assert_valid_atlas(&r);
+        assert_eq!(r.island_charts, 5);
+        assert_eq!(r.density_scale, 1.0);
+        let scale = Vec2::new(r.width as f32, r.height as f32);
+        let uv = &r.mesh.uvs[0];
+        for t in (0..12).filter(|t| t / 2 != 4) {
+            // Atlas texels are the source texels moved by a whole number of texels, maybe
+            // turned by quarter turns.
+            let q = r.mesh.triangle(t).map(|v| uv[v as usize] * scale);
+            let s: [Vec2; 3] = std::array::from_fn(|c| src.uvs[3 * t + c] * 256.0);
+            let aligned = (0..4).any(|k| {
+                let turn = |p: Vec2| snugly::rotate_point(p, 0, 0, k);
+                let d = q[0] - turn(s[0]);
+                let whole = (d - d.round()).abs().max_element() < 1e-3;
+                whole && (1..3).all(|c| (q[c] - turn(s[c]) - d).abs().max_element() < 1e-3)
+            });
+            assert!(aligned, "triangle {t}: {q:?} from {s:?}");
+        }
+        // The untextured face is unwrapped at the kept faces' 30 texels per unit.
+        let got = texel_density(&r.mesh, 0, &[(r.width, r.height)]);
+        for t in [8, 9] {
+            assert!((got[t] / 30.0 - 1.0).abs() < 0.02, "{}", got[t]);
+        }
+    }
+
+    /// A quad and its mirror image `gap` to the left, both reading the same 32-texel square of
+    /// a 64² texture.
+    fn mirrored_quads(gap: f32, share: bool) -> (Mesh, ParamOptions) {
+        let quad = [Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y];
+        let texel = [
+            Vec2::new(8.0, 8.0),
+            Vec2::new(40.0, 8.0),
+            Vec2::new(40.0, 40.0),
+            Vec2::new(8.0, 40.0),
+        ];
+        let mut positions = quad.to_vec();
+        positions.extend(quad.map(|p| Vec3::new(-p.x - gap, p.y, p.z)));
+        // The mirror keeps facing +z: its triangles turn the other way.
+        let corners = [[0, 1, 2], [0, 2, 3], [4, 6, 5], [4, 7, 6]];
+        let m = Mesh::new(
+            positions,
+            corners.iter().flatten().map(|&v| v as u32).collect(),
+        );
+        let uvs = corners
+            .iter()
+            .flatten()
+            .map(|&v| texel[v % 4] / 64.0)
+            .collect();
+        let opts = ParamOptions {
+            atlas_size: 1024,
+            padding: 2,
+            block: 1,
+            source_texels: Some(SourceTexels {
+                uvs,
+                texture: vec![Some(0); 4],
+                sizes: vec![(64, 64)],
+                share,
+            }),
+            ..ParamOptions::default()
+        };
+        (m, opts)
+    }
+
+    #[test]
+    fn mirrored_islands_share_their_texels() {
+        let (m, opts) = mirrored_quads(1.0, true);
+        let shared = parameterize(&m, &opts).unwrap();
+        assert_eq!((shared.charts, shared.island_charts), (1, 1));
+        // Both copies read the same atlas texels.
+        let uv = &shared.mesh.uvs[0];
+        let at = |t: usize, c: usize| uv[shared.mesh.triangle(t)[c] as usize];
+        for (a, b) in [(0, 2), (1, 3)] {
+            let src_b = |c: usize| m.triangle(b)[c] as usize % 4;
+            for c in 0..3 {
+                let cb = (0..3)
+                    .find(|&k| src_b(k) == m.triangle(a)[c] as usize)
+                    .unwrap();
+                assert_eq!(at(a, c), at(b, cb));
+            }
+        }
+        assert_eq!(parameterize(&m, &opts).unwrap().mesh, shared.mesh);
+
+        let (m, opts) = mirrored_quads(1.0, false);
+        let apart = parameterize(&m, &opts).unwrap();
+        assert_eq!(apart.island_charts, 2);
+        assert!(apart.width * apart.height > shared.width * shared.height);
+        // (Not `assert_valid_atlas`: the mirrored copy's UVs turn the other way, by design.)
+        apart.mesh.validate().unwrap();
+        assert!(apart.mesh.uvs[0]
+            .iter()
+            .all(|t| (0.0..=1.0).contains(&t.x) && (0.0..=1.0).contains(&t.y)));
+
+        // Touching at the mirror line, the halves are one island either way.
+        let (m, opts) = mirrored_quads(0.0, false);
+        assert_eq!(parameterize(&m, &opts).unwrap().island_charts, 1);
+    }
+
+    #[test]
+    fn source_texels_must_match_the_mesh() {
+        let (m, mut opts) = mirrored_quads(1.0, true);
+        opts.source_texels.as_mut().unwrap().texture.pop();
+        assert!(parameterize(&m, &opts).is_err());
     }
 }
