@@ -12,6 +12,10 @@
 //! 4. Convert world-space normals to the destination's MikkTSpace frame, resolve
 //!    supersampling and dilate into gutters.
 //!
+//! [`bake_with_host`] runs these steps a band of rows at a time, so only the finished
+//! textures are held for the whole atlas; [`bake_rows_with_host`] hands the finished rows
+//! over instead, for callers that store textures in another form.
+//!
 //! Displacement (signed distance along the normal) is pure geometry and is produced here.
 
 #![forbid(unsafe_code)]
@@ -27,8 +31,8 @@ pub mod raster;
 pub mod tangents;
 
 pub use cast::{
-    bake_flattened, bake_with_host, finish_bake, prepare_bake, BakeOptions, BakeOutput,
-    FlattenedTextures, PreparedBake, DISPLACEMENT,
+    bake_flattened, bake_rows_with_host, bake_with_host, finish_bake, prepare_bake, BakeOptions,
+    BakeOutput, BakedRows, FlattenedTextures, PreparedBake, DISPLACEMENT,
 };
 pub use correspondence::{
     build_correspondence, copy_correspondence, Correspondence, CorrespondenceEntry,
