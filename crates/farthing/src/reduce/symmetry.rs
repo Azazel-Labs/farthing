@@ -141,7 +141,7 @@ pub(crate) fn mirror_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reduce::{simplify, SimplifyOptions};
+    use crate::reduce::{SimplifyOptions, simplify};
 
     /// A symmetric (about x = 0) bumpy surface with an asymmetric triangulation.
     fn symmetric_patch(n: u32) -> Mesh {

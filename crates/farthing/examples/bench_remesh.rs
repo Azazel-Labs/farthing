@@ -1,7 +1,7 @@
 //! Voxel proxy timing: `bench_remesh [-n runs] <assets...>` (resolution 128, 3000 triangles).
 //! Prints the best of `runs` per asset and an output hash, so runs at different thread counts
 //! can be checked for identical output.
-use farthing::voxel::{remesh, RemeshOptions};
+use farthing::voxel::{RemeshOptions, remesh};
 use std::time::Instant;
 
 fn main() {

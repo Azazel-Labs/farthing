@@ -20,19 +20,11 @@ fn bad(what: &str) -> Error {
 }
 
 fn zigzag8(v: u8) -> u8 {
-    if v & 0x80 != 0 {
-        !(v << 1)
-    } else {
-        v << 1
-    }
+    if v & 0x80 != 0 { !(v << 1) } else { v << 1 }
 }
 
 fn unzigzag8(v: u8) -> u8 {
-    if v & 1 != 0 {
-        !(v >> 1)
-    } else {
-        v >> 1
-    }
+    if v & 1 != 0 { !(v >> 1) } else { v >> 1 }
 }
 
 /// Elements per attribute block.

@@ -13,9 +13,9 @@
 //! already accepted, and, when collapses stall above the target, deletes the cheapest part and
 //! carries on.
 
+use crate::Mesh;
 use crate::bvh::Bvh;
 use crate::reduce::SimplifyResult;
-use crate::Mesh;
 use glam::Vec3;
 use rayon::prelude::*;
 

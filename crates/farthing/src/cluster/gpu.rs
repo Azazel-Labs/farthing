@@ -1189,7 +1189,7 @@ impl GpuClusterDag {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{blob, edge_counts};
-    use super::super::{build_cluster_dag, ClusterOptions};
+    use super::super::{ClusterOptions, build_cluster_dag};
     use super::*;
     use std::collections::HashMap;
 

@@ -18,7 +18,7 @@
 
 use crate::reduce::kernels;
 use crate::reduce::quadric::Quadric;
-use crate::reduce::symmetry::{mirror_map, Symmetry};
+use crate::reduce::symmetry::{Symmetry, mirror_map};
 use crate::{Error, Mesh, Result, Scene};
 use glam::{DVec2, DVec3, Vec2};
 use rayon::prelude::*;
@@ -604,11 +604,7 @@ struct State<'a> {
 
 #[inline]
 fn ekey(a: u32, b: u32) -> (u32, u32) {
-    if a < b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a < b { (a, b) } else { (b, a) }
 }
 
 /// Distance from `x` to triangle `t` (0 inside; either winding).
@@ -1036,10 +1032,10 @@ impl<'a> State<'a> {
                         };
                         q.add(&f.plane);
                         for (i, bq) in f.border.iter().enumerate() {
-                            if let Some(bq) = bq {
-                                if f.p[i] as usize == p || f.p[(i + 1) % 3] as usize == p {
-                                    q.add(bq);
-                                }
+                            if let Some(bq) = bq
+                                && (f.p[i] as usize == p || f.p[(i + 1) % 3] as usize == p)
+                            {
+                                q.add(bq);
                             }
                         }
                     }
@@ -1257,23 +1253,22 @@ impl<'a> State<'a> {
         out.clear();
         // Fast path: p has a single wedge (no seam through it) and seams may move. The general
         // rule then maps it to q's wedge in the first triangle the two share.
-        if !self.strict {
-            if let Some(first) = corners.first() {
-                if corners.iter().all(|c| c.pw == first.pw) {
-                    for c in corners {
-                        let qw = if c.pa == q {
-                            c.a
-                        } else if c.pb == q {
-                            c.b
-                        } else {
-                            continue;
-                        };
-                        out.push((first.pw, qw));
-                        return Some(0.0);
-                    }
-                    return None;
-                }
+        if !self.strict
+            && let Some(first) = corners.first()
+            && corners.iter().all(|c| c.pw == first.pw)
+        {
+            for c in corners {
+                let qw = if c.pa == q {
+                    c.a
+                } else if c.pb == q {
+                    c.b
+                } else {
+                    continue;
+                };
+                out.push((first.pw, qw));
+                return Some(0.0);
             }
+            return None;
         }
         let mut shared = 0;
         for c in corners {
@@ -2281,26 +2276,27 @@ fn run_loop(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         });
         match st.evaluate(p, q) {
             Some((cost, geom)) if cost <= cost_c * 1.0001 + 1e-12 => {
-                if let Some((mp, mq)) = partner {
-                    if st.pos_alive[mp as usize] && st.evaluate(mp, mq).is_none() {
-                        continue; // mirrored collapse invalid: skip to stay symmetric
-                    }
+                if let Some((mp, mq)) = partner
+                    && st.pos_alive[mp as usize]
+                    && st.evaluate(mp, mq).is_none()
+                {
+                    continue; // mirrored collapse invalid: skip to stay symmetric
                 }
                 worst_geom2 = worst_geom2.max(geom);
                 alive_tris -= st.collapse(p, q);
                 collapses += 1;
                 heap.remove(p);
                 st.refresh(p, q, &mut heap);
-                if let Some((mp, mq)) = partner {
-                    if st.pos_alive[mp as usize] && st.pos_alive[mq as usize] {
-                        if let Some((_, g2)) = st.evaluate(mp, mq) {
-                            worst_geom2 = worst_geom2.max(g2);
-                            alive_tris -= st.collapse(mp, mq);
-                            collapses += 1;
-                            heap.remove(mp);
-                            st.refresh(mp, mq, &mut heap);
-                        }
-                    }
+                if let Some((mp, mq)) = partner
+                    && st.pos_alive[mp as usize]
+                    && st.pos_alive[mq as usize]
+                    && let Some((_, g2)) = st.evaluate(mp, mq)
+                {
+                    worst_geom2 = worst_geom2.max(g2);
+                    alive_tris -= st.collapse(mp, mq);
+                    collapses += 1;
+                    heap.remove(mp);
+                    st.refresh(mp, mq, &mut heap);
                 }
             }
             _ => st.requeue(p, &mut heap),
@@ -2490,10 +2486,11 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 .map(|&li| {
                     let p = list_ref[li].1;
                     let q = cand_ref[p as usize].unwrap().q;
-                    if let Some((at, set)) = &cache_ref[li] {
-                        if mark_ref[p as usize] <= *at && mark_ref[q as usize] <= *at {
-                            return set.clone();
-                        }
+                    if let Some((at, set)) = &cache_ref[li]
+                        && mark_ref[p as usize] <= *at
+                        && mark_ref[q as usize] <= *at
+                    {
+                        return set.clone();
                     }
                     let (mut a, mut b) = (Vec::new(), Vec::new());
                     shared.ring(p, &mut a);
@@ -2530,7 +2527,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             let winners: Vec<usize> = pending[..prefix]
                 .iter()
                 .zip(&won)
-                .filter(|(_, &w)| w)
+                .filter(|&(_, &w)| w)
                 .map(|(&li, _)| li)
                 .collect();
             let (touched_ref, checked_ref, pre_ref) = (&touched, &checked_at, &pre);
@@ -2814,15 +2811,15 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 .collect()
         };
         for ((x, u), &(_, q)) in updates.into_iter().zip(inc.iter()) {
-            if let (Some((c, g)), Some(old)) = (u, cand[x as usize]) {
-                if c < old.cost {
-                    cand[x as usize] = Some(Candidate {
-                        cost: c,
-                        geom: g,
-                        q,
-                        checked: false,
-                    });
-                }
+            if let (Some((c, g)), Some(old)) = (u, cand[x as usize])
+                && c < old.cost
+            {
+                cand[x as usize] = Some(Candidate {
+                    cost: c,
+                    geom: g,
+                    q,
+                    checked: false,
+                });
             }
         }
         inc.clear();
@@ -3078,12 +3075,12 @@ pub fn simplify(mesh: &Mesh, opts: &SimplifyOptions) -> Result<SimplifyResult> {
 fn simplify_top(mesh: &Mesh, opts: &SimplifyOptions) -> Result<SimplifyResult> {
     if opts.quality == Quality::Fast {
         mesh.validate()?;
-        if let Some(r) = opts.target_ratio {
-            if !(0.0..=1.0).contains(&r) {
-                return Err(Error::InvalidInput(format!(
-                    "target_ratio {r} must be within 0..=1"
-                )));
-            }
+        if let Some(r) = opts.target_ratio
+            && !(0.0..=1.0).contains(&r)
+        {
+            return Err(Error::InvalidInput(format!(
+                "target_ratio {r} must be within 0..=1"
+            )));
         }
         let target = resolve_target(mesh.triangle_count(), opts);
         let mut r = crate::reduce::fast::simplify_fast(mesh, opts, target)?;
@@ -3127,23 +3124,22 @@ fn simplify_frame(
     parts_mode: PartsMode,
 ) -> Result<SimplifyResult> {
     mesh.validate()?;
-    if let Some(r) = opts.target_ratio {
-        if !(0.0..=1.0).contains(&r) {
-            return Err(Error::InvalidInput(format!(
-                "target_ratio {r} must be within 0..=1"
-            )));
-        }
+    if let Some(r) = opts.target_ratio
+        && !(0.0..=1.0).contains(&r)
+    {
+        return Err(Error::InvalidInput(format!(
+            "target_ratio {r} must be within 0..=1"
+        )));
     }
     let input_tris = mesh.triangle_count();
     let target = resolve_target(input_tris, opts);
-    if let Some(t) = target {
-        if opts.cluster_threshold > 0
-            && input_tris >= opts.cluster_threshold.max(2 * CLUSTER_TRIS)
-            && opts.symmetry == Symmetry::Off
-            && t < input_tris
-        {
-            return simplify_clustered(mesh, opts, t);
-        }
+    if let Some(t) = target
+        && opts.cluster_threshold > 0
+        && input_tris >= opts.cluster_threshold.max(2 * CLUSTER_TRIS)
+        && opts.symmetry == Symmetry::Off
+        && t < input_tris
+    {
+        return simplify_clustered(mesh, opts, t);
     }
     let wants_parts = opts.remove_parts
         && opts.symmetry == Symmetry::Off
@@ -3652,20 +3648,21 @@ pub(crate) mod tests {
     fn attribute_quadrics_protect_uv_discontinuity() {
         // Flat grid whose UVs fold sharply along x = 10: the fold should survive reduction.
         let mut g = grid(20);
-        g.uvs = vec![g
-            .positions
-            .iter()
-            .map(|p| {
-                Vec2::new(
-                    if p.x <= 10.0 {
-                        p.x / 10.0
-                    } else {
-                        1.0 + (p.x - 10.0) * 2.0
-                    },
-                    p.z / 20.0,
-                )
-            })
-            .collect()];
+        g.uvs = vec![
+            g.positions
+                .iter()
+                .map(|p| {
+                    Vec2::new(
+                        if p.x <= 10.0 {
+                            p.x / 10.0
+                        } else {
+                            1.0 + (p.x - 10.0) * 2.0
+                        },
+                        p.z / 20.0,
+                    )
+                })
+                .collect(),
+        ];
         let r = simplify(
             &g,
             &SimplifyOptions {
@@ -4188,10 +4185,11 @@ mod part_tests {
             crate::reduce::parts::parts_of(&kept.mesh).1
         );
         // Every input vertex maps to a real output vertex.
-        assert!(r
-            .vertex_remap
-            .iter()
-            .all(|&v| (v as usize) < r.mesh.vertex_count()));
+        assert!(
+            r.vertex_remap
+                .iter()
+                .all(|&v| (v as usize) < r.mesh.vertex_count())
+        );
         r.mesh.validate().unwrap();
         // Same output on a second run.
         assert_eq!(simplify(&m, &opts).unwrap().mesh, r.mesh);

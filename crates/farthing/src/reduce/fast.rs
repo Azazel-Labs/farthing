@@ -321,21 +321,20 @@ pub(crate) fn simplify_fast(
         // need.
         if let Some(t) =
             target.filter(|&t| opts.remove_parts && alive_tris <= 4 * t && 10 * t <= nt)
+            && let Some(parts) = parts.get_or_insert_with(analyze).as_mut()
         {
-            if let Some(parts) = parts.get_or_insert_with(analyze).as_mut() {
-                let thr = 0.25 * worst2.sqrt() * diag;
-                while let Some((n, e)) = take_part(
-                    &mut st,
-                    parts,
-                    thr,
-                    opts.max_error,
-                    alive_tris,
-                    t,
-                    &mut pos_alive,
-                ) {
-                    alive_tris -= n;
-                    part_err2 = part_err2.max((e / diag) * (e / diag));
-                }
+            let thr = 0.25 * worst2.sqrt() * diag;
+            while let Some((n, e)) = take_part(
+                &mut st,
+                parts,
+                thr,
+                opts.max_error,
+                alive_tris,
+                t,
+                &mut pos_alive,
+            ) {
+                alive_tris -= n;
+                part_err2 = part_err2.max((e / diag) * (e / diag));
             }
         }
         pass += 1;
@@ -936,8 +935,8 @@ fn ekey(a: u32, b: u32) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::reduce::simplify::{simplify, Quality, SimplifyOptions};
     use crate::Mesh;
+    use crate::reduce::simplify::{Quality, SimplifyOptions, simplify};
 
     fn opts(ratio: f32) -> SimplifyOptions {
         SimplifyOptions {
@@ -993,10 +992,11 @@ mod tests {
                 edge_counts(&r.mesh).values().all(|&c| c == 2),
                 "{ratio}: not closed and manifold"
             );
-            assert!(r
-                .vertex_remap
-                .iter()
-                .all(|&v| (v as usize) < r.mesh.vertex_count()));
+            assert!(
+                r.vertex_remap
+                    .iter()
+                    .all(|&v| (v as usize) < r.mesh.vertex_count())
+            );
             let d = crate::metrics::surface_distance(&m, &r.mesh, 4000);
             assert!(d.relative_mean < mean, "{ratio}: {d:?}");
         }

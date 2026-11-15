@@ -36,13 +36,7 @@ pub fn lscm(pos: &[Vec3], tris: &[[u32; 3]]) -> Option<Vec<Vec2>> {
     }
     let dist = (pos[p1] - pos[p0]).length() as f64;
     let pinned = |k: usize| k == p0 || k == p1;
-    let pin_val = |k: usize, comp: usize| -> f64 {
-        if k == p1 && comp == 0 {
-            dist
-        } else {
-            0.0
-        }
-    };
+    let pin_val = |k: usize, comp: usize| -> f64 { if k == p1 && comp == 0 { dist } else { 0.0 } };
     // Build rows.
     let mut rows = Vec::with_capacity(tris.len() * 2);
     for t in tris {
@@ -325,11 +319,7 @@ pub fn layout_overlaps(uv: &[Vec2], tris: &[[u32; 3]], _res: usize) -> bool {
         .flat_map(|t| {
             (0..3).map(move |k| {
                 let (a, b) = (t[k], t[(k + 1) % 3]);
-                if a < b {
-                    (a, b)
-                } else {
-                    (b, a)
-                }
+                if a < b { (a, b) } else { (b, a) }
             })
         })
         .collect();
@@ -630,11 +620,7 @@ pub fn arap_refine(pos: &[Vec3], tris: &[[u32; 3]], uv: &mut [Vec2], iterations:
                 }
             }
             for i in 0..n {
-                if c == 0 {
-                    u[i].x = x[i]
-                } else {
-                    u[i].y = x[i]
-                }
+                if c == 0 { u[i].x = x[i] } else { u[i].y = x[i] }
             }
         }
         // Keep the last flip-free iterate; stop at the first fold.

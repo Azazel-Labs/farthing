@@ -1,7 +1,7 @@
 //! The correspondence buffer: for every (supersampled) destination texel, which source
 //! surface point it maps to.
 
-use crate::bake::raster::{band_triangles, rasterize_rows, TexelSample};
+use crate::bake::raster::{TexelSample, band_triangles, rasterize_rows};
 use crate::bvh::Bvh;
 use crate::scene::TriRef;
 use crate::{Error, Mesh, Result, Scene};
@@ -323,9 +323,5 @@ fn mirrored(source: &Scene) -> Vec<bool> {
 
 /// World-order barycentrics to the source mesh's corner order.
 fn mesh_order(b: Vec3, flip: bool) -> Vec3 {
-    if flip {
-        Vec3::new(b.x, b.z, b.y)
-    } else {
-        b
-    }
+    if flip { Vec3::new(b.x, b.z, b.y) } else { b }
 }

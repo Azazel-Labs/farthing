@@ -33,12 +33,12 @@ pub mod splats;
 pub mod surfels;
 
 pub use billboard::{
-    billboard_cloud, build_billboard_cloud, BillboardCloud, BillboardOptions, BillboardPlane,
+    BillboardCloud, BillboardOptions, BillboardPlane, billboard_cloud, build_billboard_cloud,
 };
 
 use crate::host::{
-    channels, BakedMaterialDesc, BakedMaterialKind, ChannelImage, ChannelImages, MaterialClass,
-    RenderHost, View, ViewImages, ViewRenderRequest,
+    BakedMaterialDesc, BakedMaterialKind, ChannelImage, ChannelImages, MaterialClass, RenderHost,
+    View, ViewImages, ViewRenderRequest, channels,
 };
 use crate::image::Image;
 use crate::{Aabb, Error, MaterialId, Mesh, Result, Scene};
@@ -51,11 +51,7 @@ pub const REFERENCE_SHADER: &str = include_str!("../../shaders/octahedral_impost
 
 #[inline]
 fn sign_nz(v: f32) -> f32 {
-    if v >= 0.0 {
-        1.0
-    } else {
-        -1.0
-    }
+    if v >= 0.0 { 1.0 } else { -1.0 }
 }
 
 /// Full octahedral encoding, y-up: unit direction → [0, 1]².
@@ -719,9 +715,10 @@ mod layer_tests {
         assert!(matches!(err, Err(Error::Unsupported(_))));
         let one = build_impostor(&mut Peeler { peel: false }, &scene, &kind, 16, false).unwrap();
         assert_eq!(one.params.layers, 1);
-        assert!(!one
-            .atlas
-            .contains_key(&layer_channel(channels::BASE_COLOR, 1)));
+        assert!(
+            !one.atlas
+                .contains_key(&layer_channel(channels::BASE_COLOR, 1))
+        );
         // Half of each frame has a surface behind it: the benefit is that share × the gap.
         let b = layer_benefit(&imp.atlas).unwrap();
         assert!(b > 0.25, "{b}");

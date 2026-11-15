@@ -370,8 +370,8 @@ pub fn copy_tangent_normals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::ChannelEncoding;
     use crate::Instance;
+    use crate::host::ChannelEncoding;
     use glam::{Mat4, Vec3};
 
     fn quad() -> Mesh {
@@ -413,9 +413,11 @@ mod tests {
         assert_eq!(r.placements.len(), 4);
         let m = &r.scene.meshes[0];
         m.validate().unwrap();
-        assert!(m.uvs[0]
-            .iter()
-            .all(|u| (0.0..=1.0).contains(&u.x) && (0.0..=1.0).contains(&u.y)));
+        assert!(
+            m.uvs[0]
+                .iter()
+                .all(|u| (0.0..=1.0).contains(&u.x) && (0.0..=1.0).contains(&u.y))
+        );
         // Copy texels: slot 0 red, slot 1 green.
         let mut flat = FlattenedTextures::default();
         flat.insert(

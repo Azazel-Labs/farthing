@@ -7,7 +7,7 @@ exclude = ["engine-poc", "bench-compare", "demo-web"]
 
 [workspace.package]
 version = "0.15.0"
-edition = "2021"
+edition = "2024"
 license = "MIT-0"
 rust-version = "1.88"
 repository = "https://github.com/Azazel-Labs/farthing"

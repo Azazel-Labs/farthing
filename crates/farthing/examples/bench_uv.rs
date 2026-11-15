@@ -1,5 +1,5 @@
 //! UV timing + output hash: `cargo run --release -p farthing --example bench_uv -- [-n RUNS] files...`
-use farthing::uv::{parameterize, ParamOptions};
+use farthing::uv::{ParamOptions, parameterize};
 use std::time::Instant;
 
 fn main() {

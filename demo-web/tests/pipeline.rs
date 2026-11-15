@@ -2,7 +2,7 @@
 //! through reduced and baked levels.
 
 use farthing::image::Image;
-use farthing::io::{glb_bytes, load_gltf_slice, ExportTextures};
+use farthing::io::{ExportTextures, glb_bytes, load_gltf_slice};
 use farthing::{Mesh, Scene};
 use farthing_demo_web::modes::ViewRequest;
 use farthing_demo_web::pipeline::{
@@ -252,11 +252,12 @@ fn shared_atlas_carries_the_original_materials() {
         // Level 1's GLB carries the atlas; level 2 reuses it, but downloads embed it.
         assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
         assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
-        assert!(demo
-            .level_glb(2, false)
-            .unwrap()
-            .windows(9)
-            .any(|w| w == b"image/png"));
+        assert!(
+            demo.level_glb(2, false)
+                .unwrap()
+                .windows(9)
+                .any(|w| w == b"image/png")
+        );
 
         // The atlas comes from level 1 and keeps the checker.
         let shared: Vec<_> = textures.iter().filter(|t| t.0 == 1).collect();
@@ -297,9 +298,11 @@ fn recut_keeps_every_triangle_then_reduces() {
         .map(|l| l.0.label.clone().unwrap())
         .collect();
     assert_eq!(names, ["LOD0", "LOD1", "LOD2", "LOD3"]);
-    assert!(levels[1..]
-        .iter()
-        .all(|l| matches!(l.0.kind, LevelKind::Shared) && l.0.shared_textures == Some(1)));
+    assert!(
+        levels[1..]
+            .iter()
+            .all(|l| matches!(l.0.kind, LevelKind::Shared) && l.0.shared_textures == Some(1))
+    );
     assert!(textures.iter().all(|&l| l == 1), "{textures:?}");
     let lod0 = &levels[1].0;
     assert_eq!(lod0.triangles, demo.info().triangles);
@@ -388,9 +391,10 @@ fn viewing_budget_drops_what_the_view_cannot_show() {
     assert!(b[1].triangles < a[1].triangles, "{:?} vs {:?}", b[1], a[1]);
     assert!(b[1].error / pixel < 4.0, "{:?}", b[1]);
     assert!(b[1].note.as_deref().unwrap().starts_with("Visible limit"));
-    assert!(a
-        .iter()
-        .all(|l| l.note.is_none() && l.view_texels.is_none()));
+    assert!(
+        a.iter()
+            .all(|l| l.note.is_none() && l.view_texels.is_none())
+    );
     for w in b.windows(2) {
         assert!(w[1].triangles < w[0].triangles, "{:?}", w[1]);
     }

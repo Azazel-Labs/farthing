@@ -11,7 +11,7 @@
 
 use super::meshopt;
 use crate::{Error, Result};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 const QUANTIZATION: &str = "KHR_mesh_quantization";

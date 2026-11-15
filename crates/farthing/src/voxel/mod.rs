@@ -20,7 +20,7 @@ mod sdf;
 
 use crate::bvh::Bvh;
 use crate::metrics::sample_surface;
-use crate::reduce::{simplify, SimplifyOptions};
+use crate::reduce::{SimplifyOptions, simplify};
 use crate::{Aabb, Error, Mesh, Result, Scene};
 use glam::{Vec3, Vec4};
 use grid::Grid;
@@ -592,8 +592,8 @@ pub fn box_occluders(scene: &Scene, resolution: usize, max_boxes: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::surface_distance;
     use crate::Instance;
+    use crate::metrics::surface_distance;
     use glam::Mat4;
 
     fn cube(size: f32) -> Mesh {
@@ -874,11 +874,12 @@ mod tests {
         assert!(r.outside_fraction <= 0.01, "outside {}", r.outside_fraction);
         // Strictly inside the union's bounds.
         let b = s.bounds();
-        assert!(r
-            .mesh
-            .positions
-            .iter()
-            .all(|p| p.cmpge(b.min).all() && p.cmple(b.max).all()));
+        assert!(
+            r.mesh
+                .positions
+                .iter()
+                .all(|p| p.cmpge(b.min).all() && p.cmple(b.max).all())
+        );
     }
 
     #[test]

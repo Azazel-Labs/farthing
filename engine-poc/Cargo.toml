@@ -2,7 +2,7 @@
 name = "farthing-poc-engine"
 description = "Proof-of-concept wgpu engine: a RenderHost with its own material system, used to prove the farthing boundary end to end."
 version = "0.15.0"
-edition = "2021"
+edition = "2024"
 license = "MIT-0"
 publish = false
 

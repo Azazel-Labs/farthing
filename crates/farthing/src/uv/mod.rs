@@ -21,7 +21,7 @@ pub use snugly as pack;
 mod param;
 pub mod sparse;
 
-pub use pack::{pack_rects, Placement};
+pub use pack::{Placement, pack_rects};
 pub use param::{
-    parameterize, texel_density, ParamMethod, ParamOptions, ParamResult, SourceTexels,
+    ParamMethod, ParamOptions, ParamResult, SourceTexels, parameterize, texel_density,
 };

@@ -8,7 +8,7 @@
 //! Prints the build time, nodes and triangles per level, and an output hash, so runs at
 //! different thread counts can be checked for identical output.
 use farthing::bake::BakeOptions;
-use farthing::hlod::{build_hlod_tree_with, HlodOptions, HlodTreeOptions, ParentSource};
+use farthing::hlod::{HlodOptions, HlodTreeOptions, ParentSource, build_hlod_tree_with};
 use farthing::host::{
     BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, MaterialInfo,
     SurfaceBakeRequest, ViewImages, ViewRenderRequest,

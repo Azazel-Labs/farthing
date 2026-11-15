@@ -465,9 +465,11 @@ mod tests {
             let other = t.rgba8_as(!srgb);
             let back = Texture::from_rgba8(7, 5, &other, !srgb).unwrap().to_image();
             let close = back.pixels.iter().zip(&img.pixels);
-            assert!(close
-                .into_iter()
-                .all(|(a, b)| (*a - *b).abs().max_element() < 0.02));
+            assert!(
+                close
+                    .into_iter()
+                    .all(|(a, b)| (*a - *b).abs().max_element() < 0.02)
+            );
         }
         assert!(Texture::from_rgba8(2, 2, &[0; 15], false).is_err());
     }

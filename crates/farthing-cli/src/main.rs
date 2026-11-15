@@ -4,11 +4,11 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use farthing::host::{GeometryOnlyHost, MaterialInfo};
 use farthing::metrics::surface_distance;
-use farthing::reduce::{lod_chain, screen_size_to_max_error, simplify, SimplifyOptions};
+use farthing::reduce::{SimplifyOptions, lod_chain, screen_size_to_max_error, simplify};
 use farthing::{Mesh, Scene};
 use glam::Vec4;
 use serde_json::json;
@@ -342,14 +342,14 @@ fn load(p: &Path) -> Result<Scene> {
 }
 
 fn save(s: &Scene, p: &Path) -> Result<()> {
-    if let Some(dir) = p.parent() {
-        if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)?;
-        }
+    if let Some(dir) = p.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir)?;
     }
     let glb = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("glb"));
     if glb && COMPACT.load(Ordering::Relaxed) {
-        use farthing::io::{save_glb_with, ExportTextures, GlbOptions};
+        use farthing::io::{ExportTextures, GlbOptions, save_glb_with};
         save_glb_with(s, p, &ExportTextures::default(), &GlbOptions::compact())
     } else {
         farthing::io::save(s, p)
@@ -374,7 +374,7 @@ fn hlod_tree(
     pixel_error: f32,
     t0: Instant,
 ) -> Result<()> {
-    use farthing::hlod::{build_hlod_tree_with, CellGrid, HlodNode};
+    use farthing::hlod::{CellGrid, HlodNode, build_hlod_tree_with};
     std::fs::create_dir_all(dir)?;
     let file_name =
         |n: &HlodNode| format!("l{}_{}_{}_{}.glb", n.level, n.cell[0], n.cell[1], n.cell[2]);
@@ -387,10 +387,11 @@ fn hlod_tree(
             hidden.resize(i as usize + 1, 0);
         }
         hidden[i as usize] = proxy.hidden_triangles;
-        if proxy.mesh.triangle_count() > 0 && write_err.is_none() {
-            if let Err(e) = save(&Scene::from_mesh(proxy.mesh), &dir.join(file_name(node))) {
-                write_err = Some(e);
-            }
+        if proxy.mesh.triangle_count() > 0
+            && write_err.is_none()
+            && let Err(e) = save(&Scene::from_mesh(proxy.mesh), &dir.join(file_name(node)))
+        {
+            write_err = Some(e);
         }
         Ok(())
     })?;
@@ -672,7 +673,7 @@ fn main() -> Result<()> {
         } => {
             let s = load(&input)?;
             use farthing::visibility::{
-                compute_visibility, cull_invisible, CameraSet, VisibilityOptions,
+                CameraSet, VisibilityOptions, compute_visibility, cull_invisible,
             };
             let set = if hemisphere {
                 CameraSet::Hemisphere {
@@ -764,7 +765,7 @@ fn main() -> Result<()> {
             fov,
             pixel_error,
         } => {
-            use farthing::hlod::{build_hlod, HlodGeometry, HlodOptions};
+            use farthing::hlod::{HlodGeometry, HlodOptions, build_hlod};
             use farthing::visibility::{CameraSet, VisibilityOptions};
             let s = load(&input)?;
             let d = HlodOptions::default();
@@ -973,11 +974,11 @@ fn main() -> Result<()> {
             samples_per_surfel,
         } => {
             use farthing::impostor::footprint::{
-                average_surfel_channel, surfel_footprints, ChannelSpec, FootprintOptions,
+                ChannelSpec, FootprintOptions, average_surfel_channel, surfel_footprints,
             };
-            use farthing::impostor::splats::{surfels_to_splats, write_splat_ply, SplatOptions};
+            use farthing::impostor::splats::{SplatOptions, surfels_to_splats, write_splat_ply};
             use farthing::impostor::surfels::{
-                progressive_surfel_cloud, SurfelChannel, SurfelOptions,
+                SurfelChannel, SurfelOptions, progressive_surfel_cloud,
             };
             let mesh = single_mesh(&load(&input)?);
             let cloud = progressive_surfel_cloud(

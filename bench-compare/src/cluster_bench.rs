@@ -7,9 +7,11 @@
 //! pixels at a 1080p, 60° view). The table gives the triangles each method needs to stay under
 //! a measured error, so a method that under-reports its error doesn't win by drawing less.
 
-use farthing::cluster::{build_cluster_dag, Cluster, ClusterDag, ClusterOptions, Cone, LodView, Sphere};
-use farthing::metrics::surface_distance;
 use farthing::Mesh;
+use farthing::cluster::{
+    Cluster, ClusterDag, ClusterOptions, Cone, LodView, Sphere, build_cluster_dag,
+};
+use farthing::metrics::surface_distance;
 use glam::Vec3;
 use serde_json::json;
 use std::time::Instant;
@@ -53,12 +55,20 @@ fn mo_cluster(m: &Mesh, idx: Vec<u32>, level: u32, err: f32, lod: Option<Sphere>
 /// The clusterlod.h scheme with meshoptimizer's own primitives.
 fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
     let pos: Vec<[f32; 3]> = m.positions.iter().map(|p| p.to_array()).collect();
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, pos.len() * 12) };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, pos.len() * 12) };
     let adapter = meshopt::VertexDataAdapter::new(bytes, 12, 0).unwrap();
     let pid = weld(m);
     let npos = pid.iter().map(|&p| p as usize + 1).max().unwrap_or(0);
-    let n = m.normals.clone().unwrap_or_else(|| vec![Vec3::Z; m.vertex_count()]);
-    let uv = m.uvs.first().cloned().unwrap_or_else(|| vec![glam::Vec2::ZERO; m.vertex_count()]);
+    let n = m
+        .normals
+        .clone()
+        .unwrap_or_else(|| vec![Vec3::Z; m.vertex_count()]);
+    let uv = m
+        .uvs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| vec![glam::Vec2::ZERO; m.vertex_count()]);
     let mut a = Vec::with_capacity(m.vertex_count() * 5);
     for i in 0..m.vertex_count() {
         a.extend_from_slice(&[n[i].x, n[i].y, n[i].z, uv[i].x, uv[i].y]);
@@ -68,7 +78,12 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
     let split = |idx: &[u32]| -> Vec<Vec<u32>> {
         let ml = meshopt::build_meshlets(idx, &adapter, MAX_V, MAX_T, 0.0);
         ml.iter()
-            .map(|l| l.triangles.iter().map(|&t| l.vertices[t as usize]).collect())
+            .map(|l| {
+                l.triangles
+                    .iter()
+                    .map(|&t| l.vertices[t as usize])
+                    .collect()
+            })
             .collect()
     };
     let mut dag = ClusterDag::default();
@@ -85,7 +100,8 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
             counts.push(dag.clusters[c as usize].indices.len() as u32);
         }
         let mut part = vec![0u32; current.len()];
-        let np = meshopt::partition_clusters_with_positions(&mut part, &cidx, &counts, &adapter, 16);
+        let np =
+            meshopt::partition_clusters_with_positions(&mut part, &cidx, &counts, &adapter, 16);
         let mut groups: Vec<Vec<u32>> = vec![Vec::new(); np];
         for (i, &p) in part.iter().enumerate() {
             groups[p as usize].push(current[i]);
@@ -104,11 +120,16 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
                 }
             }
         }
-        let locks: Vec<bool> = (0..m.vertex_count()).map(|v| border[pid[v] as usize]).collect();
+        let locks: Vec<bool> = (0..m.vertex_count())
+            .map(|v| border[pid[v] as usize])
+            .collect();
         let mut next = Vec::new();
         let mut progress = false;
         for mem in &groups {
-            let idx: Vec<u32> = mem.iter().flat_map(|&c| dag.clusters[c as usize].indices.clone()).collect();
+            let idx: Vec<u32> = mem
+                .iter()
+                .flat_map(|&c| dag.clusters[c as usize].indices.clone())
+                .collect();
             if mem.len() < 2 {
                 next.extend_from_slice(mem);
                 continue;
@@ -119,9 +140,28 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
             let out = if attrs {
                 // clusterlod.h's attribute path: seams may move (Permissive), as farthing's do.
                 let flags = flags | meshopt::SimplifyOptions::Permissive;
-                meshopt::simplify_with_attributes_and_locks(&idx, &adapter, &a, &w, 20, &locks, target, f32::MAX, flags, Some(&mut err))
+                meshopt::simplify_with_attributes_and_locks(
+                    &idx,
+                    &adapter,
+                    &a,
+                    &w,
+                    20,
+                    &locks,
+                    target,
+                    f32::MAX,
+                    flags,
+                    Some(&mut err),
+                )
             } else {
-                meshopt::simplify_with_locks(&idx, &adapter, &locks, target, f32::MAX, flags, Some(&mut err))
+                meshopt::simplify_with_locks(
+                    &idx,
+                    &adapter,
+                    &locks,
+                    target,
+                    f32::MAX,
+                    flags,
+                    Some(&mut err),
+                )
             };
             if out.len() as f32 > 0.85 * idx.len() as f32 {
                 next.extend_from_slice(mem);
@@ -129,8 +169,15 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
             }
             progress = true;
             let gi = dag.groups.len() as u32;
-            let bounds = Sphere::enclose(&mem.iter().map(|&c| dag.clusters[c as usize].lod_bounds).collect::<Vec<_>>());
-            let error = mem.iter().map(|&c| dag.clusters[c as usize].lod_error).fold(err, f32::max);
+            let bounds = Sphere::enclose(
+                &mem.iter()
+                    .map(|&c| dag.clusters[c as usize].lod_bounds)
+                    .collect::<Vec<_>>(),
+            );
+            let error = mem
+                .iter()
+                .map(|&c| dag.clusters[c as usize].lod_error)
+                .fold(err, f32::max);
             for &c in mem {
                 let c = &mut dag.clusters[c as usize];
                 c.parent_error = error;
@@ -145,7 +192,13 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
                 next.push(dag.clusters.len() as u32);
                 dag.clusters.push(cl);
             }
-            dag.groups.push(farthing::cluster::ClusterGroup { level, children: mem.clone(), clusters: produced, error, bounds });
+            dag.groups.push(farthing::cluster::ClusterGroup {
+                level,
+                children: mem.clone(),
+                clusters: produced,
+                error,
+                bounds,
+            });
         }
         if !progress {
             break;
@@ -159,18 +212,31 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
 pub fn cluster_mode(assets: &[String]) {
     let mut rows = Vec::new();
     let targets = [0.25f32, 0.5, 1.0, 2.0];
-    println!("{:<18} {:<14} {:>7} {:>8} {:>8} {:>6} {:>6} {:>8} | tris for measured mean error ≤ px {:?}", "asset", "method", "tris", "build ms", "peak MB", "levels", "roots", "fill", targets);
+    println!(
+        "{:<18} {:<14} {:>7} {:>8} {:>8} {:>6} {:>6} {:>8} | tris for measured mean error ≤ px {:?}",
+        "asset", "method", "tris", "build ms", "peak MB", "levels", "roots", "fill", targets
+    );
     for path in assets {
         let m = crate::load(path);
-        let name = std::path::Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         let b = m.bounds();
         let r = b.radius();
         let eye = b.center() + Vec3::new(0.3, 0.5, 0.81).normalize() * 4.0 * r;
         let ppr = 1080.0 / (2.0 * (30f32.to_radians()).tan());
         let px = ppr / (3.0 * r); // pixels per world unit at the nearest point of the bounds
         let methods: Vec<(&str, Box<dyn Fn() -> ClusterDag>)> = vec![
-            ("farthing", Box::new(|| build_cluster_dag(&m, &ClusterOptions::default()).unwrap())),
-            ("farthing fast", Box::new(|| build_cluster_dag(&m, &ClusterOptions::fast()).unwrap())),
+            (
+                "farthing",
+                Box::new(|| build_cluster_dag(&m, &ClusterOptions::default()).unwrap()),
+            ),
+            (
+                "farthing fast",
+                Box::new(|| build_cluster_dag(&m, &ClusterOptions::fast()).unwrap()),
+            ),
             ("meshopt", Box::new(|| meshopt_dag(&m, false))),
             ("meshopt attr", Box::new(|| meshopt_dag(&m, true))),
         ];
@@ -179,7 +245,11 @@ pub fn cluster_mode(assets: &[String]) {
                 continue;
             }
             // REPEAT=n: best of n builds (timing noise); the peak heap is the first build's.
-            let reps: usize = std::env::var("REPEAT").ok().and_then(|r| r.parse().ok()).unwrap_or(1).max(1);
+            let reps: usize = std::env::var("REPEAT")
+                .ok()
+                .and_then(|r| r.parse().ok())
+                .unwrap_or(1)
+                .max(1);
             let base = crate::reset_peak();
             let t0 = Instant::now();
             let mut dag = build();
@@ -195,19 +265,38 @@ pub fn cluster_mode(assets: &[String]) {
             let fill = m.triangle_count() as f32 / (l0 * MAX_T) as f32;
             // Sweep thresholds: (tris, measured mean px, measured max px).
             let mut pts: Vec<(usize, f32, f32)> = Vec::new();
-            let mut thr = if std::env::var("SPEED_ONLY").is_ok() { 1e9 } else { 0.02f32 };
+            let mut thr = if std::env::var("SPEED_ONLY").is_ok() {
+                1e9
+            } else {
+                0.02f32
+            };
             while thr < 200.0 {
-                let sel = dag.select(&LodView { eye, pixels_per_radian: ppr, threshold: thr });
+                let sel = dag.select(&LodView {
+                    eye,
+                    pixels_per_radian: ppr,
+                    threshold: thr,
+                });
                 let cut = dag.to_mesh(&m, &sel);
                 let d = surface_distance(&m, &cut, 40_000);
                 pts.push((cut.triangle_count(), d.mean * px, d.hausdorff * px));
                 thr *= 1.5;
             }
             let need = |e: f32| pts.iter().filter(|p| p.1 <= e).map(|p| p.0).min();
-            let cells: Vec<String> = targets.iter().map(|&e| need(e).map_or("-".into(), |t| t.to_string())).collect();
+            let cells: Vec<String> = targets
+                .iter()
+                .map(|&e| need(e).map_or("-".into(), |t| t.to_string()))
+                .collect();
             println!(
                 "{:<18} {:<14} {:>7} {:>8.0} {:>8.1} {:>6} {:>6} {:>8.3} | {}",
-                name, label, m.triangle_count(), ms, peak_mb, dag.levels(), dag.roots().count(), fill, cells.join(" / ")
+                name,
+                label,
+                m.triangle_count(),
+                ms,
+                peak_mb,
+                dag.levels(),
+                dag.roots().count(),
+                fill,
+                cells.join(" / ")
             );
             rows.push(json!({"asset": name, "method": label, "tris": m.triangle_count(), "ms": ms, "peak_mb": peak_mb,
                 "threads": rayon_threads(), "levels": dag.levels(),
@@ -222,7 +311,8 @@ pub fn cluster_mode(assets: &[String]) {
 }
 
 fn rayon_threads() -> usize {
-    std::env::var("RAYON_NUM_THREADS").ok().and_then(|t| t.parse().ok()).unwrap_or_else(|| {
-        std::thread::available_parallelism().map_or(1, |n| n.get())
-    })
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }

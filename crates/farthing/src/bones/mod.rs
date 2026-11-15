@@ -91,12 +91,12 @@ pub fn plan_bone_reduction(
     if n == 0 {
         return Err(Error::InvalidInput("skeleton has no joints".into()));
     }
-    if let Some(p) = poses {
-        if p.iter().any(|f| f.len() != n) {
-            return Err(Error::InvalidInput(
-                "every pose must have one matrix per joint".into(),
-            ));
-        }
+    if let Some(p) = poses
+        && p.iter().any(|f| f.len() != n)
+    {
+        return Err(Error::InvalidInput(
+            "every pose must have one matrix per joint".into(),
+        ));
     }
     // Per joint: list of (bind-space position, weight).
     let mut infl: Vec<Vec<(Vec3, f32)>> = vec![Vec::new(); n];
@@ -401,19 +401,21 @@ mod tests {
         let (sk, m) = chain();
         // Animation: only joint 2 rotates; joints 3 and 4 follow rigidly (world matrices).
         let rot = Mat4::from_rotation_z(0.8);
-        let frames: Vec<Vec<Mat4>> = vec![(0..5)
-            .map(|i| {
-                let bind = sk.bind_world(i);
-                if i >= 2 {
-                    Mat4::from_translation(Vec3::Y * 2.0)
-                        * rot
-                        * Mat4::from_translation(-Vec3::Y * 2.0)
-                        * bind
-                } else {
-                    bind
-                }
-            })
-            .collect()];
+        let frames: Vec<Vec<Mat4>> = vec![
+            (0..5)
+                .map(|i| {
+                    let bind = sk.bind_world(i);
+                    if i >= 2 {
+                        Mat4::from_translation(Vec3::Y * 2.0)
+                            * rot
+                            * Mat4::from_translation(-Vec3::Y * 2.0)
+                            * bind
+                    } else {
+                        bind
+                    }
+                })
+                .collect(),
+        ];
         let red = plan_bone_reduction(
             &sk,
             &[&m],

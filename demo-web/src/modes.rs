@@ -14,22 +14,22 @@
 //! only what selection and downloads need in [`Extra`].
 
 use crate::pipeline::{
-    compact_glb, original_textures, reference_ppr, switch_distance, Buffer, Demo, Event, LevelInfo,
-    LevelKind, LodOptions, MaterialHost,
+    Buffer, Demo, Event, LevelInfo, LevelKind, LodOptions, MaterialHost, compact_glb,
+    original_textures, reference_ppr, switch_distance,
 };
 use farthing::bake::BakeOptions;
 use farthing::cluster::{
-    build_cluster_dag, ClusterDag, ClusterOptions, GpuClusterDag, GpuOptions, LodView,
+    ClusterDag, ClusterOptions, GpuClusterDag, GpuOptions, LodView, build_cluster_dag,
 };
-use farthing::hlod::{build_hlod_tree_with, CellGrid, HlodOptions, HlodTree, HlodTreeOptions};
-use farthing::host::{channels, MaterialClass};
+use farthing::hlod::{CellGrid, HlodOptions, HlodTree, HlodTreeOptions, build_hlod_tree_with};
+use farthing::host::{MaterialClass, channels};
 use farthing::image::Texture;
-use farthing::impostor::footprint::{average_surfel_channel, ChannelSpec, FootprintOptions};
-use farthing::impostor::splats::{surfels_to_splats, write_splat_ply, Splat, SplatOptions};
-use farthing::impostor::surfels::{progressive_surfel_cloud, SurfelOptions};
+use farthing::impostor::footprint::{ChannelSpec, FootprintOptions, average_surfel_channel};
+use farthing::impostor::splats::{Splat, SplatOptions, surfels_to_splats, write_splat_ply};
+use farthing::impostor::surfels::{SurfelOptions, progressive_surfel_cloud};
 use farthing::io::{ExportTextures, GltfMaterial};
 use farthing::reduce::{
-    repair, screen_size_to_max_error, simplify, Quality, SeamMode, SimplifyOptions, Symmetry,
+    Quality, SeamMode, SimplifyOptions, Symmetry, repair, screen_size_to_max_error, simplify,
 };
 use farthing::uv::ParamOptions;
 use farthing::{Error, Instance, Mesh, Scene};
@@ -765,11 +765,11 @@ fn base_color_at(
         return Vec4::new(0.7, 0.7, 0.7, 1.0);
     };
     color *= m.base_color_factor;
-    if let Some((tex, set)) = &m.base_color_texture {
-        if let Some(uv) = mesh.uvs.get(*set as usize).or(mesh.uvs.first()) {
-            let p = uv[a] * bary.x + uv[b] * bary.y + uv[c] * bary.z;
-            color *= tex.sample_bilinear(p, true);
-        }
+    if let Some((tex, set)) = &m.base_color_texture
+        && let Some(uv) = mesh.uvs.get(*set as usize).or(mesh.uvs.first())
+    {
+        let p = uv[a] * bary.x + uv[b] * bary.y + uv[c] * bary.z;
+        color *= tex.sample_bilinear(p, true);
     }
     if m.info.class == MaterialClass::Opaque {
         color.w = 1.0;

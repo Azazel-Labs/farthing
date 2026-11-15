@@ -88,7 +88,7 @@ dependencies = [
  "nalgebra",
  "rectangle-pack",
  "serde_json",
- "snugly",
+ "snugly 0.1.2",
  "xatlas-rs-v2",
 ]
 
@@ -446,7 +446,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
- "snugly",
+ "snugly 0.2.0",
  "thiserror 2.0.21",
  "thread_local",
  "tobj",
@@ -1772,6 +1772,16 @@ name = "snugly"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d0d49fc7b62f4da6c9e520739a05c3f3e9f7f0045950454aed3d3cf9cf72c6f"
+dependencies = [
+ "glam 0.34.3",
+ "rayon",
+]
+
+[[package]]
+name = "snugly"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50c78755d8f5f064b3fe3349b1fe86f1da9efee4e8e5b3b6d8d7141be3d907ae"
 dependencies = [
  "glam 0.34.3",
  "rayon",

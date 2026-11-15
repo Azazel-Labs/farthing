@@ -1,7 +1,7 @@
 //! Mesh repair: welding, degenerate and duplicate triangle removal, small-part removal.
 
-use crate::math::triangle_area;
 use crate::Mesh;
+use crate::math::triangle_area;
 use std::collections::{HashMap, HashSet};
 
 /// Merges vertices whose positions fall in the same `epsilon` grid cell (or match exactly when

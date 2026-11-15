@@ -1,5 +1,5 @@
 //! `diag_target file ratio...`: output triangles and error per ratio (aggressive-target diagnosis).
-use farthing::reduce::{simplify, SimplifyOptions};
+use farthing::reduce::{SimplifyOptions, simplify};
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let (mut m, _) = farthing::io::load(&a[0]).unwrap().flatten();
@@ -125,7 +125,18 @@ pub fn stats(m: &farthing::Mesh) {
     }
     let mut sizes: Vec<usize> = cnt.values().copied().collect();
     sizes.sort_unstable();
-    println!("positions {} edges {} border {} nonmanifold {} degenerate {} parts {} (tiny ≤12 tris: {}, median {} max {})", ids.len(), edges.len(), border, nm, degenerate, sizes.len(), sizes.iter().filter(|&&s| s <= 12).count(), sizes[sizes.len()/2], sizes.last().unwrap());
+    println!(
+        "positions {} edges {} border {} nonmanifold {} degenerate {} parts {} (tiny ≤12 tris: {}, median {} max {})",
+        ids.len(),
+        edges.len(),
+        border,
+        nm,
+        degenerate,
+        sizes.len(),
+        sizes.iter().filter(|&&s| s <= 12).count(),
+        sizes[sizes.len() / 2],
+        sizes.last().unwrap()
+    );
 }
 
 fn worst(input: &farthing::Mesh, out: &farthing::Mesh) {

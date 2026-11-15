@@ -10,7 +10,7 @@ pub mod pipeline;
 mod web {
     use crate::modes::ViewRequest;
     use crate::pipeline::{Buffer, Demo, Event, LodOptions};
-    use js_sys::{Array, Float32Array, Function, Uint32Array, Uint8Array};
+    use js_sys::{Array, Float32Array, Function, Uint8Array, Uint32Array};
     use wasm_bindgen::prelude::*;
 
     #[wasm_bindgen(start)]

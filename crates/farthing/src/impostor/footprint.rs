@@ -599,8 +599,8 @@ impl Reducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::impostor::splats::{surfels_to_splats, SplatOptions};
-    use crate::impostor::surfels::{progressive_surfel_cloud, surfel_cloud, SurfelOptions};
+    use crate::impostor::splats::{SplatOptions, surfels_to_splats};
+    use crate::impostor::surfels::{SurfelOptions, progressive_surfel_cloud, surfel_cloud};
     use glam::Vec4;
 
     /// Grid of quads over [0, w] × [0, h] in the XZ plane (normal +Y).

@@ -21,9 +21,9 @@ mod obj;
 mod obj_quads;
 
 pub use gltf_export::{
-    glb_bytes, glb_bytes_with, save_glb, save_glb_with, ExportTextures, GlbOptions,
+    ExportTextures, GlbOptions, glb_bytes, glb_bytes_with, save_glb, save_glb_with,
 };
-pub use gltf_import::{load_gltf, load_gltf_slice, load_gltf_with, GltfMaterial};
+pub use gltf_import::{GltfMaterial, load_gltf, load_gltf_slice, load_gltf_with};
 pub use obj::{load_obj, save_obj};
 pub use obj_quads::{load_obj_quads, save_obj_quads};
 
@@ -175,12 +175,13 @@ mod tests {
             m.validate().unwrap();
             assert!(m.skin.is_some() && m.colors.is_some() && m.uvs.len() == 1);
             assert_eq!(m.morph_targets.len(), 1);
-            assert!(m
-                .normals
-                .as_ref()
-                .unwrap()
-                .iter()
-                .all(|n| n.dot(Vec3::Z) > 0.999));
+            assert!(
+                m.normals
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|n| n.dot(Vec3::Z) > 0.999)
+            );
             assert!((back.bounds().min.x - 1.0).abs() < 1e-5);
             let mut uvs = m.uvs[0]
                 .iter()
@@ -240,11 +241,13 @@ mod tests {
 
         let doc = glb_json(&compact);
         for ext in ["KHR_mesh_quantization", "EXT_meshopt_compression"] {
-            assert!(doc["extensionsRequired"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|e| e == ext));
+            assert!(
+                doc["extensionsRequired"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e == ext)
+            );
         }
         let prim = &doc["meshes"][0]["primitives"][0];
         let component = |a: &serde_json::Value| {

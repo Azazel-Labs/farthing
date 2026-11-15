@@ -92,14 +92,14 @@ pub fn surfels_to_splats(
     color: Option<&SurfelChannel>,
     opts: &SplatOptions,
 ) -> Result<Vec<Splat>> {
-    if let Some(f) = footprints {
-        if f.len() != surfels.len() {
-            return Err(Error::InvalidInput(format!(
-                "{} footprints for {} surfels",
-                f.len(),
-                surfels.len()
-            )));
-        }
+    if let Some(f) = footprints
+        && f.len() != surfels.len()
+    {
+        return Err(Error::InvalidInput(format!(
+            "{} footprints for {} surfels",
+            f.len(),
+            surfels.len()
+        )));
     }
     if let Some(c) = color {
         if !(3..=4).contains(&c.components) {

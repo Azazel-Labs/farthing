@@ -21,7 +21,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::reduce::{simplify, SimplifyOptions};
+use crate::reduce::{SimplifyOptions, simplify};
 use crate::{Error, Mesh, Result};
 use glam::Vec3;
 use rayon::prelude::*;
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 pub mod gpu;
-pub use gpu::{decode_gpu, encode_gpu, GpuClusterDag, GpuOptions};
+pub use gpu::{GpuClusterDag, GpuOptions, decode_gpu, encode_gpu};
 
 /// A bounding sphere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]

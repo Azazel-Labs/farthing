@@ -1,6 +1,6 @@
 //! Indexed triangle meshes with per-vertex ("wedge") attributes.
 
-use crate::math::{triangle_area, Aabb};
+use crate::math::{Aabb, triangle_area};
 use crate::{Error, Result};
 use glam::{Vec2, Vec3, Vec4};
 use std::collections::HashMap;
@@ -130,10 +130,10 @@ impl Mesh {
         if self.uvs.iter().any(|a| a.len() != n) {
             return bad("uvs");
         }
-        if let Some(s) = &self.skin {
-            if s.joints.len() != n || s.weights.len() != n {
-                return bad("skin");
-            }
+        if let Some(s) = &self.skin
+            && (s.joints.len() != n || s.weights.len() != n)
+        {
+            return bad("skin");
         }
         if self
             .morph_targets

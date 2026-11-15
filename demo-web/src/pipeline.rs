@@ -14,17 +14,17 @@
 //!   live in [`crate::modes`]; [`Demo::run`] dispatches on [`LodOptions::mode`].
 
 use crate::modes::Extra;
-use farthing::bake::{bake_rows_with_host, compute_tangents, BakeOptions};
+use farthing::bake::{BakeOptions, bake_rows_with_host, compute_tangents};
 use farthing::host::{
-    channels, BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, IdImage,
-    IdRenderRequest, MaterialClass, MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages,
-    ViewRenderRequest,
+    BakedMaterialDesc, ChannelEncoding, ChannelImage, ChannelImages, IdImage, IdRenderRequest,
+    MaterialClass, MaterialInfo, RenderHost, SurfaceBakeRequest, ViewImages, ViewRenderRequest,
+    channels,
 };
-use farthing::image::{linear_to_srgb, Image, Texture};
-use farthing::io::{glb_bytes_with, load_gltf_with, ExportTextures, GlbOptions, GltfMaterial};
-use farthing::metrics::{surface_distance, SurfaceDistance};
-use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
-use farthing::uv::{parameterize, texel_density, ParamOptions, SourceTexels};
+use farthing::image::{Image, Texture, linear_to_srgb};
+use farthing::io::{ExportTextures, GlbOptions, GltfMaterial, glb_bytes_with, load_gltf_with};
+use farthing::metrics::{SurfaceDistance, surface_distance};
+use farthing::reduce::{Quality, SeamMode, SimplifyOptions, Symmetry, repair, simplify};
+use farthing::uv::{ParamOptions, SourceTexels, parameterize, texel_density};
 use farthing::{Error, MaterialId, Mesh, Scene};
 use glam::{Mat4, Vec2, Vec4};
 use serde::{Deserialize, Serialize};
@@ -929,8 +929,7 @@ impl Demo {
         let step = opts.step.clamp(0.05, 0.95);
         let ppr = opts.ppr();
         let visible = opts.visible_error();
-        let note = |level: usize, error: f32| {
-            match (visible, allowed) {
+        let note = |level: usize, error: f32| match (visible, allowed) {
             (_, Some(a)) if level == 1 && Some(a) != visible => Some(format!(
                 "LOD0 error: reduced until it deviates about {:.3}% of the diagonal; measured {:.3}%",
                 100.0 * a / diag,
@@ -938,7 +937,6 @@ impl Demo {
             )),
             (Some(v), _) => Some(view_note(level, error, v, opts.view_distance)),
             _ => None,
-        }
         };
         let mut error_bound = 0.0;
         // Steps compound from the original (a recut's LOD0 is a step of none), or with a
@@ -1584,7 +1582,7 @@ impl RenderHost for MaterialHost<'_> {
                 _ => {
                     return Err(Error::Unsupported(
                         "channel (demo host: base_color, normal, orm)",
-                    ))
+                    ));
                 }
             };
             out.insert(

@@ -1,6 +1,6 @@
 //! Reduction throughput benchmark: `cargo run --release -p farthing --example bench_reduce [segments]`
-use farthing::reduce::{simplify, SeamMode, SimplifyOptions};
 use farthing::Mesh;
+use farthing::reduce::{SeamMode, SimplifyOptions, simplify};
 use glam::{Vec2, Vec3};
 use std::time::Instant;
 
@@ -72,7 +72,11 @@ fn main() {
         let d = farthing::metrics::surface_distance(&m, &r.mesh, 20000);
         println!(
             "ratio {ratio}: {} tris in {:.2}s ({:.0}k input tris/s), rel. Hausdorff {:.4}, mean {:.5}",
-            r.mesh.triangle_count(), s, m.triangle_count() as f64 / s / 1000.0, d.relative_hausdorff, d.relative_mean
+            r.mesh.triangle_count(),
+            s,
+            m.triangle_count() as f64 / s / 1000.0,
+            d.relative_hausdorff,
+            d.relative_mean
         );
     }
 }

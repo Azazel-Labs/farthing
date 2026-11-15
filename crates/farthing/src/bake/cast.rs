@@ -1,10 +1,10 @@
 use crate::bake::correspondence::{Correspondence, Tracer};
 use crate::bake::tangents::compute_tangents;
 use crate::host::{
-    channels, ChannelEncoding, ChannelImage, ChannelImages, RenderHost, SurfaceBakeRequest,
-    SurfaceSample,
+    ChannelEncoding, ChannelImage, ChannelImages, RenderHost, SurfaceBakeRequest, SurfaceSample,
+    channels,
 };
-use crate::image::{downsample_coverage_rows, Image};
+use crate::image::{Image, downsample_coverage_rows};
 use crate::{Error, Mesh, Result, Scene};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -812,8 +812,8 @@ pub fn bake_flattened(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{BakedMaterialDesc, MaterialInfo, ViewImages, ViewRenderRequest};
     use crate::MaterialId;
+    use crate::host::{BakedMaterialDesc, MaterialInfo, ViewImages, ViewRenderRequest};
 
     /// Test host: a "procedural material" that colors by world position and returns the
     /// geometric normal — farthing never sees this function.

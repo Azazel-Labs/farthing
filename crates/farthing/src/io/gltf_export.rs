@@ -3,7 +3,7 @@ use crate::image::Texture;
 use crate::reduce::optimize::optimize_mesh;
 use crate::{Error, Mesh, Result, Scene};
 use glam::{Mat4, Vec3};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 

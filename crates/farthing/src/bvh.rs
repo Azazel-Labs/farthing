@@ -140,11 +140,11 @@ impl Bvh {
             if node.count > 0 {
                 for &ti in &self.order[node.first as usize..(node.first + node.count) as usize] {
                     let tri = &self.triangles[ti as usize];
-                    if let Some((t, _, _)) = ray_triangle(origin, dir, tri) {
-                        if t > 0.0 {
-                            let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
-                            w += if n.dot(dir) > 0.0 { 1 } else { -1 };
-                        }
+                    if let Some((t, _, _)) = ray_triangle(origin, dir, tri)
+                        && t > 0.0
+                    {
+                        let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+                        w += if n.dot(dir) > 0.0 { 1 } else { -1 };
                     }
                 }
             } else {
@@ -182,18 +182,18 @@ impl Bvh {
                         continue;
                     }
                     if let Some((t, u, v)) = ray_triangle(origin, dir, &self.triangles[ti as usize])
+                        && t >= t_min
+                        && t <= t_max
                     {
-                        if t >= t_min && t <= t_max {
-                            t_max = t;
-                            best = Some(Hit {
-                                t,
-                                triangle: ti,
-                                u,
-                                v,
-                            });
-                            if any {
-                                return best;
-                            }
+                        t_max = t;
+                        best = Some(Hit {
+                            t,
+                            triangle: ti,
+                            u,
+                            v,
+                        });
+                        if any {
+                            return best;
                         }
                     }
                 }

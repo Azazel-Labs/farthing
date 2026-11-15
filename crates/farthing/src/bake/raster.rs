@@ -1,7 +1,7 @@
 //! UV-space rasterization: which destination triangle (and where in it) covers each texel.
 
-use crate::math::barycentric_2d;
 use crate::Mesh;
+use crate::math::barycentric_2d;
 use glam::{Vec2, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -59,13 +59,13 @@ pub(crate) fn rasterize_rows(
         for y in (min.y as u32).max(y0)..(max.y as u32).min(y1) {
             for x in min.x as u32..max.x as u32 {
                 let c = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-                if let Some(b) = barycentric_2d(c, p[0], p[1], p[2]) {
-                    if b.min_element() >= -1e-5 {
-                        out[((y - y0) * width + x) as usize] = Some(TexelSample {
-                            triangle: t as u32,
-                            barycentrics: b,
-                        });
-                    }
+                if let Some(b) = barycentric_2d(c, p[0], p[1], p[2])
+                    && b.min_element() >= -1e-5
+                {
+                    out[((y - y0) * width + x) as usize] = Some(TexelSample {
+                        triangle: t as u32,
+                        barycentrics: b,
+                    });
                 }
             }
         }

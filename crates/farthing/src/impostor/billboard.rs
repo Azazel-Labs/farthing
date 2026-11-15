@@ -3,8 +3,8 @@
 //! a distance tolerance.
 
 use crate::host::{
-    channels, BakedMaterialDesc, BakedMaterialKind, ChannelImage, ChannelImages, MaterialClass,
-    RenderHost, View, ViewRenderRequest,
+    BakedMaterialDesc, BakedMaterialKind, ChannelImage, ChannelImages, MaterialClass, RenderHost,
+    View, ViewRenderRequest, channels,
 };
 use crate::image::Image;
 use crate::math::{fibonacci_directions, orthonormal_basis, triangle_area};
@@ -310,15 +310,17 @@ pub fn build_billboard_cloud(
             vec![0, 1, 2, 0, 2, 3],
         );
         q.normals = Some(vec![p.normal; 4]);
-        q.uvs = vec![corners
-            .iter()
-            .map(|&(sx, sy)| {
-                Vec2::new(
-                    pl.x as f32 + (sx * 0.5 + 0.5) * pl.w as f32,
-                    pl.y as f32 + (0.5 - sy * 0.5) * pl.h as f32,
-                ) / atlas as f32
-            })
-            .collect()];
+        q.uvs = vec![
+            corners
+                .iter()
+                .map(|&(sx, sy)| {
+                    Vec2::new(
+                        pl.x as f32 + (sx * 0.5 + 0.5) * pl.w as f32,
+                        pl.y as f32 + (0.5 - sy * 0.5) * pl.h as f32,
+                    ) / atlas as f32
+                })
+                .collect(),
+        ];
         let _ = base;
         cards.append(&q, 0);
     }

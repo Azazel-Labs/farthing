@@ -97,11 +97,7 @@ impl EnvelopeCholesky {
             offset,
             data,
         };
-        if f.factorize() {
-            Some(f)
-        } else {
-            None
-        }
+        if f.factorize() { Some(f) } else { None }
     }
 
     #[inline]

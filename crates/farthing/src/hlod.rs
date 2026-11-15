@@ -21,20 +21,20 @@
 //! parent from its children's proxies, with budgets and switch distances that grow with cell
 //! size; [`HlodTree::select`] then picks what to draw for a camera (see [`tree`]).
 
-use crate::bake::{bake_with_host, compute_tangents, BakeOptions, BakeOutput};
+use crate::bake::{BakeOptions, BakeOutput, bake_with_host, compute_tangents};
 use crate::host::RenderHost;
-use crate::reduce::{repair, simplify, SeamMode, SimplifyOptions};
-use crate::uv::{parameterize, ParamOptions};
-use crate::visibility::{compute_visibility, cull_invisible, VisibilityOptions, VisibilityResult};
-use crate::voxel::{remesh, RemeshOptions};
+use crate::reduce::{SeamMode, SimplifyOptions, repair, simplify};
+use crate::uv::{ParamOptions, parameterize};
+use crate::visibility::{VisibilityOptions, VisibilityResult, compute_visibility, cull_invisible};
+use crate::voxel::{RemeshOptions, remesh};
 use crate::{Error, Mesh, Result, Scene};
 use glam::Mat4;
 use serde::{Deserialize, Serialize};
 
 pub mod tree;
 pub use tree::{
-    build_hlod_tree, build_hlod_tree_with, CellGrid, HlodCut, HlodNode, HlodTree, HlodTreeOptions,
-    ParentSource, PROXY_MATERIAL,
+    CellGrid, HlodCut, HlodNode, HlodTree, HlodTreeOptions, PROXY_MATERIAL, ParentSource,
+    build_hlod_tree, build_hlod_tree_with,
 };
 
 /// How the merged surface is brought down to its budget.

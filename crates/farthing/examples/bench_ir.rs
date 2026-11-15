@@ -1,5 +1,5 @@
 //! One pass of each case, for instruction counting under callgrind.
-use farthing::reduce::{simplify, SimplifyOptions};
+use farthing::reduce::{SimplifyOptions, simplify};
 fn main() {
     let mut meshes = Vec::new();
     for a in std::env::args().skip(1) {

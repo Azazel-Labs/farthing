@@ -12,9 +12,9 @@
 //! | Which triangle covers each pixel (visibility) | [`RenderHost::render_ids`] |
 //! | Make an engine material from baked textures | [`RenderHost::create_material`] |
 
+use crate::Result;
 use crate::image::Image;
 use crate::scene::{MaterialId, Scene, TriRef};
-use crate::Result;
 use glam::camera::rh::proj::directx as proj;
 use glam::camera::rh::view::look_at_mat4;
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -146,11 +146,7 @@ impl View {
     ) -> View {
         let dir = dir.normalize();
         let up = if dir.cross(up).length_squared() < 1e-8 {
-            if dir.y.abs() < 0.9 {
-                Vec3::Y
-            } else {
-                Vec3::Z
-            }
+            if dir.y.abs() < 0.9 { Vec3::Y } else { Vec3::Z }
         } else {
             up
         };

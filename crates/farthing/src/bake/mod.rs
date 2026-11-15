@@ -31,10 +31,10 @@ pub mod raster;
 pub mod tangents;
 
 pub use cast::{
-    bake_flattened, bake_rows_with_host, bake_with_host, finish_bake, prepare_bake, BakeOptions,
-    BakeOutput, BakedRows, FlattenedTextures, PreparedBake, DISPLACEMENT,
+    BakeOptions, BakeOutput, BakedRows, DISPLACEMENT, FlattenedTextures, PreparedBake,
+    bake_flattened, bake_rows_with_host, bake_with_host, finish_bake, prepare_bake,
 };
 pub use correspondence::{
-    build_correspondence, copy_correspondence, Correspondence, CorrespondenceEntry,
+    Correspondence, CorrespondenceEntry, build_correspondence, copy_correspondence,
 };
 pub use tangents::compute_tangents;

@@ -33,11 +33,7 @@ pub struct QuadReduceResult {
 
 #[inline]
 fn ekey(a: u32, b: u32) -> (u32, u32) {
-    if a < b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a < b { (a, b) } else { (b, a) }
 }
 
 struct Ring {

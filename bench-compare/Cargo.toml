@@ -2,7 +2,7 @@
 name = "bench-compare"
 version = "0.1.0"
 license = "MIT-0"
-edition = "2021"
+edition = "2024"
 publish = false
 
 [workspace]

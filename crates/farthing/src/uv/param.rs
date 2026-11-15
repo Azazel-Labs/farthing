@@ -6,7 +6,7 @@ use crate::{Error, Mesh, Result};
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use snugly::{pack, rotate_point, ChartMask, HoleFill, MaskPlacement, PackOptions};
+use snugly::{ChartMask, HoleFill, MaskPlacement, PackOptions, pack, rotate_point};
 use std::collections::VecDeque;
 
 /// Small-key hasher (multiply-rotate, as in rustc's FxHash): the maps here hold vertex, face and
@@ -771,11 +771,12 @@ fn split_sprawling(topo: &Topo, c: Chart, depth: u32) -> Vec<Chart> {
         while let Some(i) = stack.pop() {
             faces.push(cent[i].0);
             for g in &topo.adj[cent[i].0] {
-                if let Some(&j) = index.get(g) {
-                    if comp[j] == usize::MAX && side[j] == side[i] {
-                        comp[j] = id;
-                        stack.push(j);
-                    }
+                if let Some(&j) = index.get(g)
+                    && comp[j] == usize::MAX
+                    && side[j] == side[i]
+                {
+                    comp[j] = id;
+                    stack.push(j);
                 }
             }
         }
@@ -873,11 +874,7 @@ fn uf_union(parent: &mut [usize], a: usize, b: usize) {
 
 /// Bits of a coordinate for exact matching, with -0 and +0 the same.
 fn key_bits(x: f32) -> u32 {
-    if x == 0.0 {
-        0
-    } else {
-        x.to_bits()
-    }
+    if x == 0.0 { 0 } else { x.to_bits() }
 }
 
 /// Overlap grids hold at most this many cells; larger textures are looked at in coarser
@@ -1321,7 +1318,7 @@ pub fn parameterize(mesh: &Mesh, opts: &ParamOptions) -> Result<ParamResult> {
             _ => {
                 return Err(Error::InvalidInput(format!(
                     "charts do not fit a {atlas}px atlas at {d} texels/unit"
-                )))
+                )));
             }
         }
     } else {
@@ -1457,9 +1454,10 @@ mod tests {
     fn assert_valid_atlas(r: &ParamResult) {
         r.mesh.validate().unwrap();
         let uv = &r.mesh.uvs[0];
-        assert!(uv
-            .iter()
-            .all(|t| (0.0..=1.0).contains(&t.x) && (0.0..=1.0).contains(&t.y)));
+        assert!(
+            uv.iter()
+                .all(|t| (0.0..=1.0).contains(&t.x) && (0.0..=1.0).contains(&t.y))
+        );
         let tris: Vec<[u32; 3]> = (0..r.mesh.triangle_count())
             .map(|t| r.mesh.triangle(t))
             .collect();
@@ -1697,14 +1695,16 @@ mod tests {
             let ratio = g / (d * r.density_scale);
             assert!((ratio - 1.0).abs() < 0.01, "triangle {t}: ratio {ratio}");
         }
-        assert!(parameterize(
-            &m,
-            &ParamOptions {
-                texel_density: Some(vec![1.0; 3]),
-                ..opts
-            }
-        )
-        .is_err());
+        assert!(
+            parameterize(
+                &m,
+                &ParamOptions {
+                    texel_density: Some(vec![1.0; 3]),
+                    ..opts
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1866,9 +1866,11 @@ mod tests {
         assert!(apart.width * apart.height > shared.width * shared.height);
         // (Not `assert_valid_atlas`: the mirrored copy's UVs turn the other way, by design.)
         apart.mesh.validate().unwrap();
-        assert!(apart.mesh.uvs[0]
-            .iter()
-            .all(|t| (0.0..=1.0).contains(&t.x) && (0.0..=1.0).contains(&t.y)));
+        assert!(
+            apart.mesh.uvs[0]
+                .iter()
+                .all(|t| (0.0..=1.0).contains(&t.x) && (0.0..=1.0).contains(&t.y))
+        );
 
         // Touching at the mirror line, the halves are one island either way.
         let (m, opts) = mirrored_quads(0.0, false);

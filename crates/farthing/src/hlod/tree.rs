@@ -42,7 +42,7 @@
 //! built, or at once when parents are built from source), so a caller can write proxies out
 //! and drop them instead of holding the whole tree's meshes and textures.
 
-use super::{bake_stage, cull_stage, shape_stage, Culled, HlodOptions, HlodResult};
+use super::{Culled, HlodOptions, HlodResult, bake_stage, cull_stage, shape_stage};
 use crate::cluster::{LodView, Sphere};
 use crate::host::{BakedMaterialDesc, BakedMaterialKind, MaterialClass, RenderHost};
 use crate::{Aabb, Error, Instance, MaterialId, MaterialSlot, Mesh, Result, Scene};
@@ -848,10 +848,11 @@ mod tests {
         .unwrap();
         order.sort_unstable();
         assert_eq!(order, (0..tree.nodes.len() as u32).collect::<Vec<_>>());
-        assert!(tree
-            .nodes
-            .iter()
-            .all(|n| n.proxy.is_none() && n.triangles > 0));
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|n| n.proxy.is_none() && n.triangles > 0)
+        );
     }
 
     #[test]

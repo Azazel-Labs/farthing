@@ -27,7 +27,7 @@ use glam::{Vec2, Vec3};
 /// Reference WGSL for drawing a [`SurfelCloud`] as oriented splats with the dithered fade of
 /// [`SurfelCloud::lod`], writing a G-buffer (albedo, normal). Engines adapt it.
 pub const SURFEL_SHADER: &str = include_str!("../../shaders/surfel_splat.wgsl");
-use super::footprint::{surfel_footprints, tangent_basis, FootprintOptions, SurfelFootprint};
+use super::footprint::{FootprintOptions, SurfelFootprint, surfel_footprints, tangent_basis};
 use crate::{Error, Mesh, Result};
 use serde::{Deserialize, Serialize};
 
@@ -194,11 +194,7 @@ fn cloud_and_area(mesh: &Mesh, opts: &SurfelOptions) -> Result<(Vec<Surfel>, f64
                         + n[tri[1] as usize] * bary.y
                         + n[tri[2] as usize] * bary.z;
                     let s = s.normalize_or_zero();
-                    if s == Vec3::ZERO {
-                        face
-                    } else {
-                        s
-                    }
+                    if s == Vec3::ZERO { face } else { s }
                 }
                 None => face,
             };
