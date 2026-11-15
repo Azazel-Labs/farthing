@@ -135,6 +135,11 @@ pub struct LodOptions {
     /// halves, repeated parts) once. Off, or when a viewing budget caps the atlas below the
     /// artist's resolution: unwrap the scene afresh.
     pub shared_keep_layout: bool,
+    /// Recut: the deviation LOD0 may have, as a fraction of the scene's bounding-box diagonal;
+    /// 0 = every triangle. LOD0 is reduced until it measures about that, and the atlas is
+    /// capped at a texel per that distance, since texels finer than the geometry keeps are
+    /// wasted. With a viewing budget too, the larger of the two deviations applies.
+    pub lod0_error: f32,
 
     pub mode: DemoMode,
     /// Option examples: triangle fraction every configuration reduces to.
@@ -178,6 +183,7 @@ impl Default for LodOptions {
             view_fov: 60.0,
             view_height: 1080,
             shared_keep_layout: true,
+            lod0_error: 0.0,
             mode: DemoMode::Chain,
             preset_ratio: 0.25,
             cluster_layout: "nanite".into(),
@@ -206,6 +212,18 @@ impl LodOptions {
     pub(crate) fn visible_error(&self) -> Option<f32> {
         (self.view_distance > 0.0 && self.view_distance.is_finite())
             .then(|| self.view_distance / self.ppr())
+    }
+
+    /// The deviation (world units) the first level may have, and its inverse caps the atlas
+    /// density: the viewing budget's [`visible_error`](Self::visible_error), or for a `recut`
+    /// [`lod0_error`](Self::lod0_error) of `diagonal`, whichever is larger.
+    pub(crate) fn allowed_error(&self, recut: bool, diagonal: f32) -> Option<f32> {
+        let own = (recut && self.lod0_error > 0.0 && self.lod0_error.is_finite())
+            .then(|| self.lod0_error.min(0.5) * diagonal);
+        match (self.visible_error(), own) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn simplify_options(&self) -> SimplifyOptions {
@@ -307,6 +325,7 @@ pub struct LevelInfo {
     pub texture_error_p99: Option<f32>,
     /// With a viewing budget: the most texels per world unit the closest view can show (the
     /// shared atlas is capped there), and the fraction of the artist's texels under that cap.
+    /// Recut levels with a LOD0 error: a texel per that deviation instead, when it is larger.
     pub view_texel_density: Option<f32>,
     pub view_texels: Option<f32>,
 }
@@ -780,8 +799,11 @@ impl Demo {
         emit(Event::Stage(&format!("{what}: merging the scene")));
         let (flat, refs) = self.scene.flatten();
         let mut dens = self.artist_density(&flat);
-        // A viewing budget caps it at a texel per pixel of the closest view.
-        let cap = opts.visible_error().map(|v| 1.0 / v);
+        let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
+        // The deviation level 1 may have: a viewing budget's pixel at the closest view, or a
+        // recut's LOD0 error. Texels finer than it are wasted, so it caps the density too.
+        let allowed = opts.allowed_error(recut, diag);
+        let cap = allowed.map(|v| 1.0 / v);
         let view_texels = cap.and_then(|c| texels_under(&flat, &dens, c));
         if let Some(c) = cap {
             dens.iter_mut().for_each(|d| *d = d.min(c));
@@ -896,12 +918,22 @@ impl Demo {
             .then(|| self.texture_error(&source, &mesh, tex.base_color.get(&0)?))
             .flatten();
 
-        let diag = self.scene.bounds().diagonal().max(f32::MIN_POSITIVE);
         let input_tris = self.scene.triangle_count();
         let base = opts.simplify_options();
         let step = opts.step.clamp(0.05, 0.95);
         let ppr = opts.ppr();
         let visible = opts.visible_error();
+        let note = |level: usize, error: f32| {
+            match (visible, allowed) {
+            (_, Some(a)) if level == 1 && Some(a) != visible => Some(format!(
+                "LOD0 error: reduced until it deviates about {:.3}% of the diagonal; measured {:.3}%",
+                100.0 * a / diag,
+                100.0 * error / diag
+            )),
+            (Some(v), _) => Some(view_note(level, error, v, opts.view_distance)),
+            _ => None,
+        }
+        };
         let mut error_bound = 0.0;
         // Steps compound from the original (a recut's LOD0 is a step of none), or with a
         // budget from the first level.
@@ -910,7 +942,7 @@ impl Demo {
             emit(Event::Stage(&format!("{}: reducing", name(level))));
             let ratio = step.powi((level - from.1) as i32);
             let target = ((from.0 as f32 * ratio) as usize).max(4);
-            let limit = visible.filter(|_| level == 1);
+            let limit = allowed.filter(|_| level == 1);
             let ((m, e, s, d), error) = fit_visible(limit, |k| {
                 let (m, e, x) = if limit.is_none() && target >= mesh.triangle_count() {
                     (mesh.clone(), 0.0, false)
@@ -942,7 +974,7 @@ impl Demo {
                 error_bound,
                 ppr,
                 ms,
-                note: visible.map(|v| view_note(level, error, v, opts.view_distance)),
+                note: note(level, error),
                 view_texel_density: cap,
                 view_texels,
                 coverage: Some(coverage),

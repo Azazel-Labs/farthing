@@ -18,6 +18,10 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
   since a fresh layout puts texels at new places. A fresh layout also can't share texels
   between mirrored or repeated parts the way the artist's could, and every chart border is a
   seam the reduction keeps, so many charts put a floor under how coarse the levels go.
+  *LOD0 error* (a percentage of the bounding-box diagonal; 0 keeps everything) throws out the
+  waste: LOD0 is reduced until it measures about that deviation, and the atlas keeps at most a
+  texel per that distance, since texels finer than the geometry keeps don't show. LOD0 then has
+  a switch distance of its own, and Auto LOD shows the *Original* closer than that.
 - **Textures: Original materials** reduces the near levels (LOD1 up to *Bake proxy from*) mesh
   by mesh. Each level is built from the previous one and keeps the original's UVs and
   materials.

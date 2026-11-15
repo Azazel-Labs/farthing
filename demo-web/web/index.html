@@ -138,6 +138,11 @@
             <option value="shared">Shared atlas</option>
           </select>
         </label>
+        <label class="select" id="lod0-error" title="How far LOD0 may deviate from the original, as a percentage of the model's bounding-box diagonal. LOD0 is reduced until it measures about that, and the atlas keeps at most a texel per that distance: texels finer than the geometry keeps are wasted. 0 keeps every triangle and the artist's texel density.">
+          LOD0 error
+          <span><input type="number" name="lod0_error" min="0" max="5" step="0.01" value="0" style="width: 5em"> %</span>
+        </label>
+        <p class="hint" id="lod0-hint"></p>
         <label class="select baked-only" title="From this level on, the scene is merged into one mesh, unwrapped and its materials baked into an atlas">
           Bake proxy from <select name="bake_from"></select>
         </label>

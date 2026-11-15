@@ -1588,7 +1588,7 @@ function drawTextures(level) {
     );
   if (shared && i.view_texel_density)
     parts.push(
-      `capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit for the closest view` +
+      `capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit, a texel per the error LOD${i.label ? 0 : 1} may have` +
         (i.view_texels != null ? ` (${(i.view_texels * 100).toPrecision(2)}% of the artist's texels)` : ""),
     );
   if (i?.texture_error != null) parts.push(texErrorText(i));
@@ -1661,6 +1661,7 @@ function readOptions() {
     supersample: +f.supersample.value,
     planar_uv: f.planar_uv.checked,
     textures: f.textures.value,
+    lod0_error: Math.max(0, +f.lod0_error.value || 0) / 100,
     shared_size: +f.shared_size.value,
     view_distance: Math.max(0, +f.view_distance.value || 0),
     view_fov: +f.view_fov.value,
@@ -1691,14 +1692,26 @@ function syncModeUi() {
   const tex = form.elements.textures.value;
   $("#shared-size").hidden = tex === "original";
   $("#shared-layout").hidden = tex !== "shared";
+  $("#lod0-error").hidden = $("#lod0-hint").hidden = tex !== "recut";
   // A recut bakes nothing per level.
   for (const el of form.querySelectorAll(".baked-only")) el.hidden = tex === "recut";
   $("#mode-hint").textContent = MODE_HINTS[m] ?? "";
   syncViewHint();
 }
 
+/** What the LOD0 error is for this model, in its own units. */
+function syncLod0Hint() {
+  const e = Math.max(0, +form.elements.lod0_error.value || 0) / 100;
+  $("#lod0-hint").textContent = !e
+    ? "LOD0 keeps every triangle and the artist's texel density."
+    : assetInfo
+      ? `LOD0 may deviate ${fmtLen(e * assetInfo.diagonal)}, and keeps at most ${fmtInt(Math.round(1 / (e * assetInfo.diagonal)))} texels per unit.`
+      : `LOD0 may deviate ${(e * 100).toPrecision(2)}% of the model's size, with a texel per that distance at most.`;
+}
+
 /** What the viewing budget means for this model: its size, and what a pixel is at the closest view. */
 function syncViewHint() {
+  syncLod0Hint();
   const { view_distance: d, view_fov: fov, view_height: h } = readOptions();
   const size = assetInfo ? `The model is ${fmtLen(assetInfo.diagonal)} across (bounding-box diagonal). ` : "";
   if (!d) {

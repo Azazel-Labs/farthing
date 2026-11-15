@@ -318,6 +318,32 @@ fn recut_keeps_every_triangle_then_reduces() {
     assert!(levels[2..].iter().all(|l| l.0.texture_error.is_none()));
     assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
     assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
+
+    // A LOD0 error of 2% of the diagonal: LOD0 drops triangles until it deviates about that,
+    // and texels finer than it (the checker's 18 a unit, against 14 at 2%) are dropped too.
+    let diag = demo.info().diagonal;
+    let (coarse, _) = chain_levels(
+        &mut demo,
+        &LodOptions {
+            lod0_error: 0.02,
+            ..opts.clone()
+        },
+    );
+    let (full, lod0) = (&levels[1].0, &coarse[1]);
+    assert!(lod0.triangles < full.triangles, "{lod0:?}");
+    assert!(
+        lod0.relative_error > 0.002 && lod0.relative_error < 0.025,
+        "{lod0:?}"
+    );
+    assert!(
+        lod0.note.as_deref().unwrap().starts_with("LOD0 error"),
+        "{lod0:?}"
+    );
+    assert!((lod0.view_texel_density.unwrap() * 0.02 * diag - 1.0).abs() < 1e-4);
+    let area = |l: &LevelInfo| l.atlas_width.unwrap() * l.atlas_height.unwrap();
+    assert!(area(lod0) < area(full), "{lod0:?} vs {full:?}");
+    let ratio = coarse[2].triangles as f32 / lod0.triangles as f32;
+    assert!(ratio > 0.4 && ratio < 0.6, "{:?}", coarse[2]);
 }
 
 /// Runs the chain and returns each level's info and the size of each texture it emitted.
