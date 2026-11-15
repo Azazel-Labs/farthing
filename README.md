@@ -172,9 +172,10 @@ mesh.validate()?;
 
 A `Scene` holds meshes, instances with world transforms, skeletons and material *slots*. A
 slot is just a name and an id. farthing never knows what a material looks like. The `io`
-feature reads and writes glTF, GLB and OBJ. It also reads quantized and meshopt-compressed
-glTF, such as gltfpack's output. It bakes texture transforms (offset and scale) into the UVs;
-rotated transforms are ignored:
+feature reads and writes glTF, GLB and OBJ. It also reads quantized, meshopt-compressed and
+Draco-compressed glTF, such as gltfpack's output, decoded by
+[polysmelt](https://crates.io/crates/polysmelt). It bakes texture transforms (offset and scale)
+into the UVs; rotated transforms are ignored:
 
 ```rust
 let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf or .obj

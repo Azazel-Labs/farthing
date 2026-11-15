@@ -1,8 +1,8 @@
-use super::meshopt::{encode_index_buffer, encode_oct8, encode_vertex_buffer};
 use crate::image::Texture;
 use crate::reduce::optimize::optimize_mesh;
 use crate::{Error, Mesh, Result, Scene};
 use glam::{Mat4, Vec3};
+use polysmelt::meshopt::{encode_index_buffer, encode_oct8, encode_vertex_buffer};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;

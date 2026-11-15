@@ -5,6 +5,8 @@ use crate::{
     Skin,
 };
 use glam::{Mat4, Vec2, Vec3, Vec4};
+use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -61,34 +63,30 @@ pub fn load_gltf_with(
         let name = percent_decode(uri);
         resolve(&name).ok_or_else(|| Error::InvalidInput(format!("glTF: missing file `{name}`")))
     };
-    // Quantized or meshopt-compressed documents are rewritten into plain glTF first.
-    let (document, buffers) = match super::gltf_normalize::normalize(bytes, &mut fetch)? {
-        Some((document, data)) => (document, vec![gltf::buffer::Data(data)]),
-        None => {
-            let gltf::Gltf { document, blob } = gltf::Gltf::from_slice(bytes)
-                .map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
-            let mut buffers = Vec::new();
-            for b in document.buffers() {
-                let mut data = match b.source() {
-                    gltf::buffer::Source::Bin => blob.clone().ok_or_else(|| {
-                        Error::InvalidInput("glTF: missing GLB binary chunk".into())
-                    })?,
-                    gltf::buffer::Source::Uri(uri) => fetch(uri)?,
-                };
-                if data.len() < b.length() {
-                    return Err(Error::InvalidInput(format!(
-                        "glTF: buffer {} is shorter than declared",
-                        b.index()
-                    )));
-                }
-                while data.len() % 4 != 0 {
-                    data.push(0);
-                }
-                buffers.push(gltf::buffer::Data(data));
-            }
-            (document, buffers)
+    // Compressed or quantized documents are rewritten into plain glTF (a GLB) first.
+    let plain = decode_encodings(bytes, &mut fetch)?;
+    let (json, blob) = split_glb(plain.as_deref().unwrap_or(bytes))?;
+    let (document, uv_transforms) = parse_baking_transforms(&json)?;
+    let mut buffers = Vec::new();
+    for b in document.buffers() {
+        let mut data = match b.source() {
+            gltf::buffer::Source::Bin => blob
+                .as_deref()
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| Error::InvalidInput("glTF: missing GLB binary chunk".into()))?,
+            gltf::buffer::Source::Uri(uri) => fetch(uri)?,
+        };
+        if data.len() < b.length() {
+            return Err(Error::InvalidInput(format!(
+                "glTF: buffer {} is shorter than declared",
+                b.index()
+            )));
         }
-    };
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+        buffers.push(gltf::buffer::Data(data));
+    }
     // Images are decoded on demand (only the material textures farthing reads). Embedded
     // ones are borrowed from their buffer, not copied.
     let mut external: Vec<Option<Vec<u8>>> = Vec::new();
@@ -106,10 +104,192 @@ pub fn load_gltf_with(
             gltf::image::Source::Uri { .. } => external.get(i)?.as_deref(),
         }
     };
-    build(&document, &buffers, &|i, srgb| {
+    build(&document, &buffers, &uv_transforms, &|i, srgb| {
         let rgba = image::load_from_memory(encoded(i)?).ok()?.into_rgba8();
         Texture::from_rgba8(rgba.width(), rgba.height(), rgba.as_raw(), srgb).ok()
     })
+}
+
+fn invalid(what: impl std::fmt::Display) -> Error {
+    Error::InvalidInput(format!("glTF: {what}"))
+}
+
+/// The extensions the `gltf` crate rejects (compression, and attributes stored as integers),
+/// which polysmelt decodes into plain glTF.
+const ENCODINGS: [&str; 4] = [
+    "EXT_meshopt_compression",
+    "KHR_meshopt_compression",
+    "KHR_draco_mesh_compression",
+    "KHR_mesh_quantization",
+];
+const TRANSFORM: &str = "KHR_texture_transform";
+
+/// A texture transform without rotation: offset x, y, then scale x, y.
+type UvTransform = [f32; 4];
+
+/// A GLB's JSON and binary chunks, or a `.gltf`'s JSON.
+fn split_glb(bytes: &[u8]) -> Result<(Cow<'_, [u8]>, Option<Cow<'_, [u8]>>)> {
+    if bytes.starts_with(b"glTF") {
+        let glb = gltf::Glb::from_slice(bytes).map_err(invalid)?;
+        Ok((glb.json, glb.bin))
+    } else {
+        Ok((Cow::Borrowed(bytes), None))
+    }
+}
+
+fn extensions_used(root: &Value) -> impl Iterator<Item = &str> {
+    root.get("extensionsUsed")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+/// For a document using meshopt, Draco or quantization: the document rewritten by polysmelt as
+/// a plain GLB, its buffers and images taken in. `None` for any other document.
+fn decode_encodings(
+    bytes: &[u8],
+    fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let (json, _) = split_glb(bytes)?;
+    let mentions = |ext: &str| json.windows(ext.len()).any(|w| w == ext.as_bytes());
+    if !ENCODINGS.iter().any(|e| mentions(e)) {
+        return Ok(None);
+    }
+    let root: Value = serde_json::from_slice(&json).map_err(invalid)?;
+    if !extensions_used(&root).any(|e| ENCODINGS.contains(&e)) {
+        return Ok(None);
+    }
+    // polysmelt reads the files the document names from memory, by percent-decoded name.
+    let mut files = polysmelt::assets::Memory::new();
+    for key in ["buffers", "images"] {
+        for item in root
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(uri) = item.get("uri").and_then(Value::as_str)
+                && !uri.starts_with("data:")
+                && let Ok(file) = fetch(uri)
+            {
+                files.insert(&percent_decode(uri), file);
+            }
+        }
+    }
+    let (name, ext) = if bytes.starts_with(b"glTF") {
+        ("model.glb", "glb")
+    } else {
+        ("model.gltf", "gltf")
+    };
+    let mut doc =
+        polysmelt::formats::load_bytes(bytes, name, ext, &files, polysmelt::document::Keep::MESHES)
+            .map_err(invalid)?;
+    doc.decode().map_err(invalid)?;
+    Ok(Some(doc.to_glb().map_err(invalid)?))
+}
+
+/// The document, and per material the texture transforms baked into its UV sets (see
+/// [`take_transforms`]). The `gltf` crate ignores texture transforms, which gltfpack writes
+/// for quantized texture coordinates.
+fn parse_baking_transforms(
+    json: &[u8],
+) -> Result<(gltf::Document, Vec<HashMap<u32, UvTransform>>)> {
+    if !json
+        .windows(TRANSFORM.len())
+        .any(|w| w == TRANSFORM.as_bytes())
+    {
+        let root = gltf::json::Root::from_slice(json).map_err(invalid)?;
+        return Ok((
+            gltf::Document::from_json(root).map_err(invalid)?,
+            Vec::new(),
+        ));
+    }
+    let mut root: Value = serde_json::from_slice(json).map_err(invalid)?;
+    let bake = root
+        .get_mut("materials")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+        .map(take_transforms)
+        .collect();
+    // Transforms that could not be baked are ignored, as the crate ignores them elsewhere.
+    let left = root
+        .get("materials")
+        .is_some_and(|m| m.to_string().contains(TRANSFORM));
+    for key in ["extensionsUsed", "extensionsRequired"] {
+        let keep = key == "extensionsUsed" && left;
+        if let Some(a) = root.get_mut(key).and_then(Value::as_array_mut) {
+            a.retain(|e| keep || e != TRANSFORM);
+        }
+    }
+    let root = serde_json::from_value(root).map_err(invalid)?;
+    Ok((gltf::Document::from_json(root).map_err(invalid)?, bake))
+}
+
+/// The texture transforms of `material` that can be baked into its UV sets, removed from its
+/// textures. A UV set qualifies when every texture reading it has the same transform, without
+/// rotation (gltfpack writes only offset and scale).
+fn take_transforms(material: &mut Value) -> HashMap<u32, UvTransform> {
+    const SLOTS: [&str; 5] = [
+        "/pbrMetallicRoughness/baseColorTexture",
+        "/pbrMetallicRoughness/metallicRoughnessTexture",
+        "/normalTexture",
+        "/occlusionTexture",
+        "/emissiveTexture",
+    ];
+    let set_of = |info: &Value| {
+        info.pointer("/extensions/KHR_texture_transform/texCoord")
+            .or_else(|| info.get("texCoord"))
+            .and_then(Value::as_u64)
+            .map_or(0, |s| s as u32)
+    };
+    // Per UV set: its transform, or `None` once textures disagree or one rotates.
+    let mut by_set: HashMap<u32, Option<UvTransform>> = HashMap::new();
+    for slot in SLOTS {
+        let Some(info) = material.pointer(slot) else {
+            continue;
+        };
+        let ext = info.pointer("/extensions/KHR_texture_transform");
+        let pair = |k: &str, default: f32| -> [f32; 2] {
+            let v = ext.and_then(|e| e.get(k));
+            let c = |i: usize| {
+                v.and_then(|v| v.get(i)?.as_f64())
+                    .map_or(default, |x| x as f32)
+            };
+            [c(0), c(1)]
+        };
+        let rotation = ext.and_then(|e| e.get("rotation")?.as_f64()).unwrap_or(0.0);
+        let [ox, oy] = pair("offset", 0.0);
+        let [sx, sy] = pair("scale", 1.0);
+        let t = (rotation == 0.0).then_some([ox, oy, sx, sy]);
+        by_set
+            .entry(set_of(info))
+            .and_modify(|e| {
+                if *e != t {
+                    *e = None;
+                }
+            })
+            .or_insert(t);
+    }
+    let bake: HashMap<u32, UvTransform> = by_set
+        .into_iter()
+        .filter_map(|(set, t)| Some((set, t?)))
+        .filter(|(_, t)| *t != [0.0, 0.0, 1.0, 1.0])
+        .collect();
+    for slot in SLOTS {
+        let Some(info) = material.pointer_mut(slot) else {
+            continue;
+        };
+        let set = set_of(info);
+        if info.pointer("/extensions/KHR_texture_transform").is_some() && bake.contains_key(&set) {
+            info["texCoord"] = json!(set);
+            if let Some(e) = info.get_mut("extensions").and_then(Value::as_object_mut) {
+                e.remove(TRANSFORM);
+            }
+        }
+    }
+    bake
 }
 
 fn percent_decode(s: &str) -> String {
@@ -167,6 +347,8 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 fn build(
     doc: &gltf::Document,
     buffers: &[gltf::buffer::Data],
+    // Per material, the texture transforms to bake into its UV sets.
+    uv_transforms: &[HashMap<u32, UvTransform>],
     // Image index, sRGB → decoded texture.
     decode: &dyn Fn(usize, bool) -> Option<Texture>,
 ) -> Result<(Scene, Vec<GltfMaterial>)> {
@@ -268,10 +450,19 @@ fn build(
                 .read_tangents()
                 .map(|it| it.map(Vec4::from_array).collect());
             for set in 0..2 {
-                match reader.read_tex_coords(set) {
-                    Some(tc) => part.uvs.push(tc.into_f32().map(Vec2::from_array).collect()),
-                    None => break,
+                let Some(tc) = reader.read_tex_coords(set) else {
+                    break;
+                };
+                let mut uvs: Vec<Vec2> = tc.into_f32().map(Vec2::from_array).collect();
+                let transform = prim
+                    .material()
+                    .index()
+                    .and_then(|m| uv_transforms.get(m)?.get(&set));
+                if let Some(&[ox, oy, sx, sy]) = transform {
+                    uvs.iter_mut()
+                        .for_each(|uv| *uv = *uv * Vec2::new(sx, sy) + Vec2::new(ox, oy));
                 }
+                part.uvs.push(uvs);
             }
             part.colors = reader
                 .read_colors(0)

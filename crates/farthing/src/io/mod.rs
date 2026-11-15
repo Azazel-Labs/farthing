@@ -15,8 +15,6 @@
 
 mod gltf_export;
 mod gltf_import;
-mod gltf_normalize;
-mod meshopt;
 mod obj;
 mod obj_quads;
 
@@ -320,6 +318,114 @@ mod tests {
         doc["buffers"][0]["uri"] = format!("data:application/octet-stream;base64,{b64}").into();
         let (back, _) = load_gltf_slice(&serde_json::to_vec(&doc).unwrap()).unwrap();
         assert_eq!(back.triangle_count(), 2);
+    }
+
+    /// A quad drawn twice, with u16 normalized UVs on set 0 (`KHR_mesh_quantization`, decoded
+    /// by polysmelt) and float UVs on set 1: with a material whose texture transforms bake into
+    /// both sets, and with one whose rotated transform cannot (it is ignored).
+    #[test]
+    fn texture_transforms_bake_into_uvs() {
+        use serde_json::json;
+        const TRANSFORM: &str = "KHR_texture_transform";
+        const QUANTIZATION: &str = "KHR_mesh_quantization";
+        let uv = [[0.0f32, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mut bin = Vec::new();
+        for [u, v] in uv {
+            bin.extend([u, v, 0.0f32].iter().flat_map(|f| f.to_le_bytes()));
+        }
+        for [u, v] in uv {
+            bin.extend(
+                [u, v]
+                    .map(|f| (f * 65535.0) as u16)
+                    .iter()
+                    .flat_map(|q| q.to_le_bytes()),
+            );
+        }
+        for [u, v] in uv {
+            bin.extend([u, v].iter().flat_map(|f| f.to_le_bytes()));
+        }
+        let prim = |material: u32| json!({ "attributes": { "POSITION": 0, "TEXCOORD_0": 1, "TEXCOORD_1": 2 }, "indices": 3, "material": material });
+        bin.extend([0u16, 1, 2, 0, 2, 3].iter().flat_map(|i| i.to_le_bytes()));
+        let transform = json!({ "offset": [0.5, 0.25], "scale": [2.0, 4.0] });
+        let doc = json!({
+            "asset": { "version": "2.0" },
+            "extensionsUsed": [TRANSFORM, QUANTIZATION],
+            "extensionsRequired": [TRANSFORM, QUANTIZATION],
+            "buffers": [{ "uri": "b.bin", "byteLength": bin.len() }],
+            "bufferViews": [
+                { "buffer": 0, "byteOffset": 0, "byteLength": 48 },
+                { "buffer": 0, "byteOffset": 48, "byteLength": 16 },
+                { "buffer": 0, "byteOffset": 64, "byteLength": 32 },
+                { "buffer": 0, "byteOffset": 96, "byteLength": 12 }
+            ],
+            "accessors": [
+                { "bufferView": 0, "componentType": 5126, "count": 4, "type": "VEC3",
+                  "min": [0, 0, 0], "max": [1, 1, 0] },
+                { "bufferView": 1, "componentType": 5123, "normalized": true, "count": 4, "type": "VEC2" },
+                { "bufferView": 2, "componentType": 5126, "count": 4, "type": "VEC2" },
+                { "bufferView": 3, "componentType": 5123, "count": 6, "type": "SCALAR" }
+            ],
+            "materials": [
+                {
+                    "pbrMetallicRoughness": {
+                        "baseColorTexture": { "index": 0, "extensions": { TRANSFORM: transform } }
+                    },
+                    "normalTexture": { "index": 0, "extensions": { TRANSFORM: transform } },
+                    "emissiveTexture": {
+                        "index": 0,
+                        "extensions": { TRANSFORM: { "offset": [1.0, 0.0], "texCoord": 1 } }
+                    }
+                },
+                {
+                    "pbrMetallicRoughness": {
+                        "baseColorTexture": {
+                            "index": 0,
+                            "extensions": { TRANSFORM: { "offset": [0.5, 0.0], "rotation": 0.3 } }
+                        }
+                    }
+                }
+            ],
+            "textures": [{ "source": 0 }],
+            "images": [{ "uri": "t.png" }],
+            "meshes": [{ "primitives": [prim(0), prim(1)] }],
+            "nodes": [{ "mesh": 0 }],
+            "scenes": [{ "nodes": [0] }]
+        });
+        let text = serde_json::to_vec(&doc).unwrap();
+        let (scene, _) =
+            load_gltf_with(&text, |name| (name == "b.bin").then(|| bin.clone())).unwrap();
+        let m = &scene.meshes[0];
+        m.validate().unwrap();
+        assert_eq!(m.uvs.len(), 2);
+        // Each primitive's corners, by material.
+        let corners = |set: usize, material: u32| -> Vec<Vec2> {
+            let mut c: Vec<Vec2> = m
+                .indices
+                .chunks_exact(3)
+                .zip(&m.material_ids)
+                .filter(|(_, id)| **id == material)
+                .flat_map(|(t, _)| t.iter().map(|&i| m.uvs[set][i as usize]))
+                .collect();
+            c.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+            c.dedup_by(|a, b| a.distance(*b) < 1e-4);
+            c
+        };
+        let want = |f: fn(Vec2) -> Vec2| -> Vec<Vec2> {
+            let mut w: Vec<Vec2> = uv.iter().map(|&p| f(Vec2::from_array(p))).collect();
+            w.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+            w
+        };
+        let near = |a: Vec<Vec2>, b: Vec<Vec2>| {
+            let ok = a.len() == b.len() && a.iter().zip(&b).all(|(p, q)| p.distance(*q) < 1e-4);
+            assert!(ok, "{a:?} vs {b:?}");
+        };
+        near(
+            corners(0, 0),
+            want(|p| p * Vec2::new(2.0, 4.0) + Vec2::new(0.5, 0.25)),
+        );
+        near(corners(1, 0), want(|p| p + Vec2::X));
+        near(corners(0, 1), want(|p| p));
+        near(corners(1, 1), want(|p| p));
     }
 
     #[test]
