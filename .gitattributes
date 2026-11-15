@@ -1,0 +1,5 @@
+# Store text with LF line endings and check it out as LF, whatever core.autocrlf says;
+# Windows batch files keep CRLF, which cmd.exe needs.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
