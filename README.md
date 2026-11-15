@@ -171,7 +171,8 @@ mesh.validate()?;
 
 A `Scene` holds meshes, instances with world transforms, skeletons and material *slots*. A
 slot is just a name and an id. farthing never knows what a material looks like. The `io`
-feature reads and writes glTF, GLB and OBJ:
+feature reads and writes glTF, GLB and OBJ. It also reads quantized and meshopt-compressed
+glTF, such as gltfpack's output:
 
 ```rust
 let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf or .obj
@@ -562,15 +563,25 @@ motion, not just from the bind pose.
 ### Writing results
 
 ```rust
-use farthing::io::{save_glb, ExportTextures};
+use farthing::io::{save_glb, save_glb_with, ExportTextures, GlbOptions};
 use farthing::reduce::optimize::optimize_mesh;
 
-optimize_mesh(&mut far);                       // vertex cache and vertex fetch order
+optimize_mesh(&mut far);                       // vertex cache, overdraw and vertex fetch order
 let out = farthing::Scene::from_mesh(far);
 let mut tex = ExportTextures::default();
 tex.base_color.insert(0, baked.textures[channels::BASE_COLOR].image.clone());
 tex.normal.insert(0, baked.textures[channels::NORMAL].image.clone());
 save_glb(&out, "far.glb", &tex)?;              // glb_bytes(&out, &tex) for memory
+```
+
+`GlbOptions::compact()` writes the smallest GLB: `KHR_mesh_quantization` (16-bit positions
+and UVs, 8-bit octahedral normals and tangents), `EXT_meshopt_compression`, and the
+`optimize_mesh` ordering. three.js reads it with `GLTFLoader.setMeshoptDecoder`. Skinned
+and morphed meshes keep float positions. Every export uses 16-bit indices when a mesh has
+fewer than 65,536 vertices.
+
+```rust
+save_glb_with(&out, "far.glb", &tex, &GlbOptions::compact())?;
 ```
 
 The option structs implement `serde`, so pipeline settings can live in your asset database.

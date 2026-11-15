@@ -4,6 +4,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { Wireframe } from "three/addons/lines/Wireframe.js";
@@ -65,7 +66,8 @@ const setWireColor = () => {
 setWireColor();
 dark.addEventListener("change", setWireColor);
 
-const loader = new GLTFLoader();
+// farthing's GLBs are quantized (KHR_mesh_quantization) and meshopt-compressed.
+const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
 
 /** The camera distance that fits a sphere of `radius` in view. */
 const homeDistance = (radius) => (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.05;

@@ -1,6 +1,8 @@
+use super::meshopt::{encode_index_buffer, encode_oct8, encode_vertex_buffer};
 use crate::image::Texture;
-use crate::{Error, Result, Scene};
-use glam::Mat4;
+use crate::reduce::optimize::optimize_mesh;
+use crate::{Error, Mesh, Result, Scene};
+use glam::{Mat4, Vec3};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,17 +29,62 @@ pub struct ExportTextures {
     pub metallic_roughness_factor: BTreeMap<u32, glam::Vec2>,
 }
 
+/// How [`glb_bytes_with`] encodes geometry. The default writes plain float attributes that
+/// any glTF reader opens; [`GlbOptions::compact`] turns everything on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlbOptions {
+    /// `KHR_mesh_quantization`: positions as 16-bit integers (the dequantizing scale and offset
+    /// folded into each instance's node matrix), normals and tangents as 8-bit, and texture
+    /// coordinates and colors within [0, 1] as 16-bit normalized. Skinned and morphed meshes
+    /// keep float positions, since their node matrices can't carry the dequantization.
+    pub quantize: bool,
+    /// `EXT_meshopt_compression`: vertex and index buffers through meshoptimizer's codecs, with
+    /// normals and tangents in its octahedral filter (with `quantize`). The file then
+    /// requires the extension (three.js: `GLTFLoader.setMeshoptDecoder`).
+    pub compress: bool,
+    /// Reorders each mesh's triangles for the vertex cache and for overdraw, and its vertices
+    /// by first use ([`optimize_mesh`]); compression works best on that order.
+    pub optimize: bool,
+}
+
+impl GlbOptions {
+    /// Quantized, compressed and optimized: the smallest files, for viewers that support
+    /// both extensions (three.js, Babylon.js and others that read gltfpack's output).
+    pub fn compact() -> Self {
+        GlbOptions {
+            quantize: true,
+            compress: true,
+            optimize: true,
+        }
+    }
+}
+
+const ARRAY_BUFFER: u32 = 34962;
+const ELEMENT_ARRAY_BUFFER: u32 = 34963;
+const I8: u32 = 5120;
+const U16: u32 = 5123;
+const U32: u32 = 5125;
+const F32: u32 = 5126;
+
 struct Bin {
     data: Vec<u8>,
     views: Vec<Value>,
     accessors: Vec<Value>,
+    /// Encode vertex and index views with `EXT_meshopt_compression`.
+    compress: bool,
+    /// Size of the fallback buffer the compressed views decode into.
+    fallback: usize,
+    /// An accessor uses a type only `KHR_mesh_quantization` allows.
+    quantized: bool,
+}
+
+fn align4(n: usize) -> usize {
+    n.div_ceil(4) * 4
 }
 
 impl Bin {
     fn view(&mut self, bytes: &[u8], target: Option<u32>) -> usize {
-        while !self.data.len().is_multiple_of(4) {
-            self.data.push(0);
-        }
+        self.data.resize(align4(self.data.len()), 0);
         let offset = self.data.len();
         self.data.extend_from_slice(bytes);
         let mut v = json!({ "buffer": 0, "byteOffset": offset, "byteLength": bytes.len() });
@@ -47,12 +94,68 @@ impl Bin {
         self.views.push(v);
         self.views.len() - 1
     }
+    /// A view whose `raw_len` bytes decode from `encoded` (in the binary chunk) into the
+    /// fallback buffer; `ext` holds the codec's mode and layout.
+    fn compressed_view(
+        &mut self,
+        raw_len: usize,
+        encoded: &[u8],
+        mut ext: Value,
+        target: u32,
+    ) -> usize {
+        self.data.resize(align4(self.data.len()), 0);
+        ext["buffer"] = json!(0);
+        ext["byteOffset"] = json!(self.data.len());
+        ext["byteLength"] = json!(encoded.len());
+        self.data.extend_from_slice(encoded);
+        self.fallback = align4(self.fallback);
+        self.views.push(json!({
+            "buffer": 1, "byteOffset": self.fallback, "byteLength": raw_len, "target": target,
+            "extensions": { "EXT_meshopt_compression": ext }
+        }));
+        self.fallback += raw_len;
+        self.views.len() - 1
+    }
+    /// A vertex attribute view of `stride`-byte elements.
+    fn attribute_view(&mut self, bytes: &[u8], stride: usize, filter: Option<&str>) -> usize {
+        let view = if self.compress {
+            let mut ext = json!({ "byteStride": stride, "count": bytes.len() / stride, "mode": "ATTRIBUTES" });
+            if let Some(f) = filter {
+                ext["filter"] = json!(f);
+            }
+            self.compressed_view(
+                bytes.len(),
+                &encode_vertex_buffer(bytes, stride),
+                ext,
+                ARRAY_BUFFER,
+            )
+        } else {
+            self.view(bytes, Some(ARRAY_BUFFER))
+        };
+        self.views[view]["byteStride"] = json!(stride);
+        view
+    }
+    fn accessor(
+        &mut self,
+        view: usize,
+        component: u32,
+        normalized: bool,
+        count: usize,
+        kind: &str,
+    ) -> usize {
+        let mut a =
+            json!({ "bufferView": view, "componentType": component, "count": count, "type": kind });
+        if normalized {
+            a["normalized"] = json!(true);
+        }
+        self.accessors.push(a);
+        self.accessors.len() - 1
+    }
     fn accessor_f32(&mut self, data: &[f32], comps: usize, kind: &str, minmax: bool) -> usize {
         let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let view = self.view(&bytes, Some(34962));
+        let view = self.attribute_view(&bytes, 4 * comps, None);
         let count = data.len() / comps;
-        let mut a =
-            json!({ "bufferView": view, "componentType": 5126, "count": count, "type": kind });
+        let a = self.accessor(view, F32, false, count, kind);
         if minmax && count > 0 {
             let mut min = vec![f32::INFINITY; comps];
             let mut max = vec![f32::NEG_INFINITY; comps];
@@ -62,26 +165,73 @@ impl Bin {
                     max[i] = max[i].max(c[i]);
                 }
             }
-            a["min"] = json!(min);
-            a["max"] = json!(max);
+            self.accessors[a]["min"] = json!(min);
+            self.accessors[a]["max"] = json!(max);
         }
-        self.accessors.push(a);
-        self.accessors.len() - 1
+        a
     }
-    fn accessor_u16x4(&mut self, data: &[[u16; 4]]) -> usize {
+    /// 16-bit components, `comps` used of each element's `padded` (padding is zero).
+    fn accessor_u16(
+        &mut self,
+        data: &[u16],
+        comps: usize,
+        padded: usize,
+        kind: &str,
+        normalized: bool,
+    ) -> usize {
         let bytes: Vec<u8> = data
-            .iter()
-            .flat_map(|j| j.iter().flat_map(|v| v.to_le_bytes()))
+            .chunks_exact(comps)
+            .flat_map(|c| (0..padded).flat_map(|i| c.get(i).copied().unwrap_or(0).to_le_bytes()))
             .collect();
-        let view = self.view(&bytes, Some(34962));
-        self.accessors.push(json!({ "bufferView": view, "componentType": 5123, "count": data.len(), "type": "VEC4" }));
-        self.accessors.len() - 1
+        let view = self.attribute_view(&bytes, 2 * padded, None);
+        self.accessor(view, U16, normalized, data.len() / comps, kind)
     }
-    fn accessor_indices(&mut self, data: &[u32]) -> usize {
-        let bytes: Vec<u8> = data.iter().flat_map(|i| i.to_le_bytes()).collect();
-        let view = self.view(&bytes, Some(34963));
-        self.accessors.push(json!({ "bufferView": view, "componentType": 5125, "count": data.len(), "type": "SCALAR" }));
-        self.accessors.len() - 1
+    /// Unit vectors (with a fourth component for tangents) as normalized bytes, through the
+    /// octahedral filter when compressing.
+    fn accessor_unit8(&mut self, v: &[[f32; 4]], kind: &str) -> usize {
+        let filter = self.compress.then_some("OCTAHEDRAL");
+        let bytes: Vec<u8> = v
+            .iter()
+            .flat_map(|&[x, y, z, w]| {
+                if filter.is_some() {
+                    encode_oct8([x, y, z], w)
+                } else {
+                    let n = Vec3::new(x, y, z).normalize_or_zero();
+                    [n.x, n.y, n.z, w].map(|c| (c.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8)
+                }
+            })
+            .collect();
+        let view = self.attribute_view(&bytes, 4, filter);
+        self.quantized = true;
+        self.accessor(view, I8, true, v.len(), kind)
+    }
+    /// Triangle indices, 16-bit when every vertex fits.
+    fn accessor_indices(&mut self, data: &[u32], vertex_count: usize) -> usize {
+        // WebGL 2 always treats 65535 as a primitive restart in 16-bit indices.
+        let (component, stride) = if vertex_count <= 0xffff {
+            (U16, 2)
+        } else {
+            (U32, 4)
+        };
+        let bytes: Vec<u8> = if stride == 2 {
+            data.iter()
+                .flat_map(|&i| (i as u16).to_le_bytes())
+                .collect()
+        } else {
+            data.iter().flat_map(|i| i.to_le_bytes()).collect()
+        };
+        let view = if self.compress {
+            let ext = json!({ "byteStride": stride, "count": data.len(), "mode": "TRIANGLES" });
+            self.compressed_view(
+                bytes.len(),
+                &encode_index_buffer(data),
+                ext,
+                ELEMENT_ARRAY_BUFFER,
+            )
+        } else {
+            self.view(&bytes, Some(ELEMENT_ARRAY_BUFFER))
+        };
+        self.accessor(view, component, false, data.len(), "SCALAR")
     }
     fn accessor_mat4(&mut self, mats: &[Mat4]) -> usize {
         let bytes: Vec<u8> = mats
@@ -89,9 +239,45 @@ impl Bin {
             .flat_map(|m| m.to_cols_array().into_iter().flat_map(f32::to_le_bytes))
             .collect();
         let view = self.view(&bytes, None);
-        self.accessors.push(json!({ "bufferView": view, "componentType": 5126, "count": mats.len(), "type": "MAT4" }));
-        self.accessors.len() - 1
+        self.accessor(view, F32, false, mats.len(), "MAT4")
     }
+}
+
+/// Positions as 16-bit integers in a cube over the mesh's bounds, and the matrix that maps
+/// them back.
+fn quantize_positions(p: &[Vec3]) -> (Vec<u16>, Mat4) {
+    let (min, max) = p
+        .iter()
+        .fold((Vec3::INFINITY, Vec3::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    let extent = (max - min).max_element();
+    let scale = if extent > 0.0 { extent / 65535.0 } else { 1.0 };
+    let q = p
+        .iter()
+        .flat_map(|&v| {
+            ((v - min) / scale)
+                .round()
+                .clamp(Vec3::ZERO, Vec3::splat(65535.0))
+                .to_array()
+        })
+        .map(|c| c as u16)
+        .collect();
+    (
+        q,
+        Mat4::from_translation(min) * Mat4::from_scale(Vec3::splat(scale)),
+    )
+}
+
+/// Components within [0, 1] as 16-bit normalized integers.
+fn unorm16(v: impl IntoIterator<Item = f32>) -> Option<Vec<u16>> {
+    v.into_iter()
+        .map(|c| {
+            (0.0..=1.0)
+                .contains(&c)
+                .then(|| (c * 65535.0).round() as u16)
+        })
+        .collect()
 }
 
 fn png_bytes(tex: &Texture, srgb: bool) -> Result<Vec<u8>> {
@@ -110,17 +296,40 @@ fn png_bytes(tex: &Texture, srgb: bool) -> Result<Vec<u8>> {
 
 /// Writes a binary glTF. Each mesh becomes one glTF mesh with one primitive per material
 /// slot used (vertex accessors shared). Instances become nodes; skeletons become joint nodes.
+/// Attributes are floats, and indices 16-bit when a mesh has at most 65,535 vertices.
 pub fn save_glb(scene: &Scene, path: impl AsRef<Path>, textures: &ExportTextures) -> Result<()> {
-    std::fs::write(path.as_ref(), glb_bytes(scene, textures)?)?;
+    save_glb_with(scene, path, textures, &GlbOptions::default())
+}
+
+/// [`save_glb`] with quantization, compression or reordering ([`GlbOptions`]).
+pub fn save_glb_with(
+    scene: &Scene,
+    path: impl AsRef<Path>,
+    textures: &ExportTextures,
+    options: &GlbOptions,
+) -> Result<()> {
+    std::fs::write(path.as_ref(), glb_bytes_with(scene, textures, options)?)?;
     Ok(())
 }
 
 /// [`save_glb`] into memory: the bytes of a binary glTF.
 pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
+    glb_bytes_with(scene, textures, &GlbOptions::default())
+}
+
+/// [`save_glb_with`] into memory.
+pub fn glb_bytes_with(
+    scene: &Scene,
+    textures: &ExportTextures,
+    options: &GlbOptions,
+) -> Result<Vec<u8>> {
     let mut bin = Bin {
         data: Vec::new(),
         views: Vec::new(),
         accessors: Vec::new(),
+        compress: options.compress,
+        fallback: 0,
+        quantized: false,
     };
     let mut images = Vec::new();
     let mut gl_textures = Vec::new();
@@ -172,44 +381,101 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
         })
         .collect::<Result<_>>()?;
 
+    let optimized: Vec<Mesh>;
+    let source = if options.optimize {
+        optimized = scene
+            .meshes
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if m.triangle_count() > 0 {
+                    optimize_mesh(&mut m);
+                }
+                m
+            })
+            .collect();
+        &optimized
+    } else {
+        &scene.meshes
+    };
     let mut meshes = Vec::new();
-    for mesh in &scene.meshes {
+    // Per mesh, the matrix that maps its quantized positions back.
+    let mut dequant: Vec<Option<Mat4>> = Vec::new();
+    for (mi, mesh) in source.iter().enumerate() {
         mesh.validate()?;
         let flat3 = |v: &[glam::Vec3]| v.iter().flat_map(|p| p.to_array()).collect::<Vec<f32>>();
+        let q = options.quantize;
+        // Skinning ignores the node matrix the dequantization rides on, and morph deltas
+        // would need it too.
+        let skinned = mesh.skin.is_some()
+            || scene
+                .instances
+                .iter()
+                .any(|i| i.mesh == mi && i.skeleton.is_some());
+        let integer_positions =
+            q && !skinned && mesh.morph_targets.is_empty() && mesh.vertex_count() > 0;
         let mut attrs = serde_json::Map::new();
-        attrs.insert(
-            "POSITION".into(),
-            json!(bin.accessor_f32(&flat3(&mesh.positions), 3, "VEC3", true)),
-        );
+        let position = if integer_positions {
+            let (qp, m) = quantize_positions(&mesh.positions);
+            dequant.push(Some(m));
+            let a = bin.accessor_u16(&qp, 3, 4, "VEC3", false);
+            let (mut min, mut max) = ([u16::MAX; 3], [0u16; 3]);
+            for c in qp.chunks_exact(3) {
+                for i in 0..3 {
+                    min[i] = min[i].min(c[i]);
+                    max[i] = max[i].max(c[i]);
+                }
+            }
+            bin.accessors[a]["min"] = json!(min);
+            bin.accessors[a]["max"] = json!(max);
+            bin.quantized = true;
+            a
+        } else {
+            dequant.push(None);
+            bin.accessor_f32(&flat3(&mesh.positions), 3, "VEC3", true)
+        };
+        attrs.insert("POSITION".into(), json!(position));
         if let Some(n) = &mesh.normals {
-            attrs.insert(
-                "NORMAL".into(),
-                json!(bin.accessor_f32(&flat3(n), 3, "VEC3", false)),
-            );
+            let a = if q {
+                let v: Vec<[f32; 4]> = n.iter().map(|v| [v.x, v.y, v.z, 0.0]).collect();
+                bin.accessor_unit8(&v, "VEC3")
+            } else {
+                bin.accessor_f32(&flat3(n), 3, "VEC3", false)
+            };
+            attrs.insert("NORMAL".into(), json!(a));
         }
         if let Some(t) = &mesh.tangents {
-            let d: Vec<f32> = t.iter().flat_map(|v| v.to_array()).collect();
-            attrs.insert(
-                "TANGENT".into(),
-                json!(bin.accessor_f32(&d, 4, "VEC4", false)),
-            );
+            let a = if q {
+                let v: Vec<[f32; 4]> = t.iter().map(|v| v.to_array()).collect();
+                bin.accessor_unit8(&v, "VEC4")
+            } else {
+                let d: Vec<f32> = t.iter().flat_map(|v| v.to_array()).collect();
+                bin.accessor_f32(&d, 4, "VEC4", false)
+            };
+            attrs.insert("TANGENT".into(), json!(a));
         }
         for (i, uv) in mesh.uvs.iter().enumerate() {
             let d: Vec<f32> = uv.iter().flat_map(|v| v.to_array()).collect();
-            attrs.insert(
-                format!("TEXCOORD_{i}"),
-                json!(bin.accessor_f32(&d, 2, "VEC2", false)),
-            );
+            let a = match unorm16(d.iter().copied()).filter(|_| q) {
+                Some(u) => bin.accessor_u16(&u, 2, 2, "VEC2", true),
+                None => bin.accessor_f32(&d, 2, "VEC2", false),
+            };
+            attrs.insert(format!("TEXCOORD_{i}"), json!(a));
         }
         if let Some(c) = &mesh.colors {
             let d: Vec<f32> = c.iter().flat_map(|v| v.to_array()).collect();
-            attrs.insert(
-                "COLOR_0".into(),
-                json!(bin.accessor_f32(&d, 4, "VEC4", false)),
-            );
+            let a = match unorm16(d.iter().copied()).filter(|_| q) {
+                Some(u) => bin.accessor_u16(&u, 4, 4, "VEC4", true),
+                None => bin.accessor_f32(&d, 4, "VEC4", false),
+            };
+            attrs.insert("COLOR_0".into(), json!(a));
         }
         if let Some(s) = &mesh.skin {
-            attrs.insert("JOINTS_0".into(), json!(bin.accessor_u16x4(&s.joints)));
+            let j: Vec<u16> = s.joints.iter().flatten().copied().collect();
+            attrs.insert(
+                "JOINTS_0".into(),
+                json!(bin.accessor_u16(&j, 4, 4, "VEC4", false)),
+            );
             let d: Vec<f32> = s.weights.iter().flatten().copied().collect();
             attrs.insert(
                 "WEIGHTS_0".into(),
@@ -232,7 +498,8 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
         let prims: Vec<Value> = by_slot
             .into_iter()
             .map(|(slot, idx)| {
-                let mut p = json!({ "attributes": attrs.clone(), "indices": bin.accessor_indices(&idx), "mode": 4 });
+                let indices = bin.accessor_indices(&idx, mesh.vertex_count());
+                let mut p = json!({ "attributes": attrs.clone(), "indices": indices, "mode": 4 });
                 if (slot as usize) < materials.len() {
                     p["material"] = json!(slot);
                 }
@@ -282,8 +549,12 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
     }
     for inst in &scene.instances {
         let mut n = json!({ "name": inst.name, "mesh": inst.mesh });
-        if inst.transform != Mat4::IDENTITY {
-            n["matrix"] = json!(inst.transform.to_cols_array());
+        let transform = match dequant.get(inst.mesh).copied().flatten() {
+            Some(d) => inst.transform * d,
+            None => inst.transform,
+        };
+        if transform != Mat4::IDENTITY {
+            n["matrix"] = json!(transform.to_cols_array());
         }
         if let Some(s) = inst.skeleton {
             n["skin"] = json!(s);
@@ -292,8 +563,18 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
         scene_roots.push(nodes.len() - 1);
     }
 
-    while !bin.data.len().is_multiple_of(4) {
-        bin.data.push(0);
+    bin.data.resize(align4(bin.data.len()), 0);
+    let mut buffers = vec![json!({ "byteLength": bin.data.len() })];
+    let mut extensions = Vec::new();
+    if bin.quantized {
+        extensions.push("KHR_mesh_quantization");
+    }
+    if bin.fallback > 0 {
+        extensions.push("EXT_meshopt_compression");
+        buffers.push(json!({
+            "byteLength": align4(bin.fallback),
+            "extensions": { "EXT_meshopt_compression": { "fallback": true } }
+        }));
     }
     let mut doc = json!({
         "asset": { "version": "2.0", "generator": "farthing" },
@@ -304,8 +585,12 @@ pub fn glb_bytes(scene: &Scene, textures: &ExportTextures) -> Result<Vec<u8>> {
         "materials": materials,
         "accessors": bin.accessors,
         "bufferViews": bin.views,
-        "buffers": [{ "byteLength": bin.data.len() }],
+        "buffers": buffers,
     });
+    if !extensions.is_empty() {
+        doc["extensionsUsed"] = json!(extensions);
+        doc["extensionsRequired"] = json!(extensions);
+    }
     if !skins.is_empty() {
         doc["skins"] = json!(skins);
     }

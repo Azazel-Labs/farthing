@@ -15,10 +15,14 @@
 
 mod gltf_export;
 mod gltf_import;
+mod gltf_normalize;
+mod meshopt;
 mod obj;
 mod obj_quads;
 
-pub use gltf_export::{glb_bytes, save_glb, ExportTextures};
+pub use gltf_export::{
+    glb_bytes, glb_bytes_with, save_glb, save_glb_with, ExportTextures, GlbOptions,
+};
 pub use gltf_import::{load_gltf, load_gltf_slice, load_gltf_with, GltfMaterial};
 pub use obj::{load_obj, save_obj};
 pub use obj_quads::{load_obj_quads, save_obj_quads};
@@ -137,6 +141,141 @@ mod tests {
         assert_eq!(back.triangle_count(), 2);
         assert_eq!(mats.len(), 2);
         assert_eq!(back.skeletons[0].joints.len(), 2);
+    }
+
+    fn glb_json(glb: &[u8]) -> serde_json::Value {
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        serde_json::from_slice(&glb[20..20 + json_len]).unwrap()
+    }
+
+    /// Skinned and morphed: positions stay float, everything else quantizes and compresses.
+    #[test]
+    fn compact_glb_roundtrip_skinned() {
+        let s = sample_scene();
+        for opts in [
+            GlbOptions::compact(),
+            GlbOptions {
+                quantize: true,
+                ..Default::default()
+            },
+            GlbOptions {
+                compress: true,
+                ..Default::default()
+            },
+            GlbOptions {
+                optimize: true,
+                ..Default::default()
+            },
+        ] {
+            let bytes = glb_bytes_with(&s, &ExportTextures::default(), &opts).unwrap();
+            let (back, mats) = load_gltf_slice(&bytes).unwrap();
+            assert_eq!(back.triangle_count(), 2);
+            assert_eq!(mats.len(), 2);
+            let m = &back.meshes[back.instances[0].mesh];
+            m.validate().unwrap();
+            assert!(m.skin.is_some() && m.colors.is_some() && m.uvs.len() == 1);
+            assert_eq!(m.morph_targets.len(), 1);
+            assert!(m
+                .normals
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|n| n.dot(Vec3::Z) > 0.999));
+            assert!((back.bounds().min.x - 1.0).abs() < 1e-5);
+            let mut uvs = m.uvs[0]
+                .iter()
+                .map(|u| (u * 2.0).round())
+                .collect::<Vec<_>>();
+            uvs.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+            uvs.dedup();
+            assert_eq!(
+                uvs,
+                [Vec2::ZERO, Vec2::Y * 2.0, Vec2::X * 2.0, Vec2::ONE * 2.0]
+            );
+        }
+    }
+
+    /// A static terrain-like grid: u16 positions and indices, octahedral normals, meshopt
+    /// compression; every vertex comes back within quantization error.
+    #[test]
+    fn compact_glb_roundtrip_grid() {
+        let n = 24;
+        let mut p = Vec::new();
+        let mut uv = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let (fx, fy) = (x as f32 / (n - 1) as f32, y as f32 / (n - 1) as f32);
+                p.push(Vec3::new(
+                    fx * 10.0 - 3.0,
+                    (fx * 7.0).sin() * (fy * 5.0).cos(),
+                    fy * 6.0,
+                ));
+                uv.push(Vec2::new(fx, fy));
+            }
+        }
+        let mut idx = Vec::new();
+        for y in 0..n - 1 {
+            for x in 0..n - 1 {
+                let i = (y * n + x) as u32;
+                let n = n as u32;
+                idx.extend([i, i + n, i + 1, i + 1, i + n, i + n + 1]);
+            }
+        }
+        let mut m = Mesh::new(p.clone(), idx);
+        assert_eq!(m.compute_normals(180.0), 0);
+        m.uvs = vec![uv];
+        let normals = m.normals.clone().unwrap();
+        let mut s = Scene::from_mesh(m);
+        s.instances[0].transform = Mat4::from_translation(Vec3::new(5.0, 0.0, -2.0));
+
+        let plain = glb_bytes(&s, &ExportTextures::default()).unwrap();
+        let compact =
+            glb_bytes_with(&s, &ExportTextures::default(), &GlbOptions::compact()).unwrap();
+        assert!(
+            compact.len() * 2 < plain.len(),
+            "{} vs {}",
+            compact.len(),
+            plain.len()
+        );
+
+        let doc = glb_json(&compact);
+        for ext in ["KHR_mesh_quantization", "EXT_meshopt_compression"] {
+            assert!(doc["extensionsRequired"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == ext));
+        }
+        let prim = &doc["meshes"][0]["primitives"][0];
+        let component = |a: &serde_json::Value| {
+            doc["accessors"][a.as_u64().unwrap() as usize]["componentType"].clone()
+        };
+        assert_eq!(component(&prim["indices"]), 5123);
+        assert_eq!(component(&prim["attributes"]["POSITION"]), 5123);
+        assert_eq!(component(&prim["attributes"]["NORMAL"]), 5120);
+
+        let (back, _) = load_gltf_slice(&compact).unwrap();
+        assert_eq!(back.triangle_count(), s.triangle_count());
+        let inst = &back.instances[0];
+        let bm = &back.meshes[inst.mesh];
+        bm.validate().unwrap();
+        assert_eq!(bm.vertex_count(), p.len());
+        let tolerance = 10.0 / 65535.0;
+        for (i, &q) in bm.positions.iter().enumerate() {
+            let w = inst.transform.transform_point3(q) - Vec3::new(5.0, 0.0, -2.0);
+            let (j, d) = p
+                .iter()
+                .enumerate()
+                .map(|(j, o)| (j, o.distance(w)))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            assert!(d < tolerance, "vertex {i} is {d} away");
+            let nb = inst
+                .transform
+                .transform_vector3(bm.normals.as_ref().unwrap()[i])
+                .normalize();
+            assert!(nb.dot(normals[j]) > 0.99);
+        }
     }
 
     /// A `.gltf` whose buffer is a separate file, resolved by name (as from a zip archive),

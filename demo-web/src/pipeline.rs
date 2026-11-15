@@ -21,7 +21,7 @@ use farthing::host::{
     ViewRenderRequest,
 };
 use farthing::image::{linear_to_srgb, Image, Texture};
-use farthing::io::{glb_bytes, load_gltf_with, ExportTextures, GltfMaterial};
+use farthing::io::{glb_bytes_with, load_gltf_with, ExportTextures, GlbOptions, GltfMaterial};
 use farthing::metrics::{surface_distance, SurfaceDistance};
 use farthing::reduce::{repair, simplify, Quality, SeamMode, SimplifyOptions, Symmetry};
 use farthing::uv::{parameterize, texel_density, ParamOptions, SourceTexels};
@@ -530,7 +530,7 @@ impl Demo {
             .levels
             .get(level)
             .ok_or_else(|| format!("no level {level}; run first"))?;
-        glb_bytes(s, t).map_err(|e| e.to_string())
+        compact_glb(s, t).map_err(|e| e.to_string())
     }
 
     /// Runs `opts.mode`, reporting each result as it finishes. `now` returns milliseconds.
@@ -661,7 +661,7 @@ impl Demo {
                 .enumerate()
                 .map(|(mi, p)| p.1 * mesh_scale[mi])
                 .fold(0.0, f32::max);
-            let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
+            let glb = compact_glb(&s, &ExportTextures::default()).map_err(err)?;
             let ms = now() - t0;
             let mut info = level_info(level, LevelKind::Reduced, &s, Some(&d), bound, ms);
             info.bytes = Some(glb.len());
@@ -759,7 +759,7 @@ impl Demo {
             .map_err(err)?;
             let mut s = Scene::from_mesh(mesh);
             s.materials[0].name = "baked".into();
-            let glb = glb_bytes(&s, &tex).map_err(err)?;
+            let glb = compact_glb(&s, &tex).map_err(err)?;
             let ms = now() - t0;
             let mut info = level_info(level, LevelKind::Baked, &s, Some(&d), geo_error, ms);
             info.coverage = Some(coverage);
@@ -962,9 +962,9 @@ impl Demo {
                 from = (mesh.triangle_count(), 1);
             }
             let glb = if level == 1 {
-                glb_bytes(&s, &tex)
+                compact_glb(&s, &tex)
             } else {
-                glb_bytes(&s, &ExportTextures::default())
+                compact_glb(&s, &ExportTextures::default())
             }
             .map_err(err)?;
             let ms = now() - t0;
@@ -1323,6 +1323,12 @@ fn encoder(channel: &str, encoding: ChannelEncoding) -> fn(Vec4) -> [u8; 4] {
         }
         _ => |p| Texture::encode(p, false),
     }
+}
+
+/// Every GLB the demo produces: quantized, meshopt-compressed and reordered for the GPU's
+/// caches (three.js reads it with `MeshoptDecoder`).
+pub(crate) fn compact_glb(s: &Scene, t: &ExportTextures) -> farthing::Result<Vec<u8>> {
+    glb_bytes_with(s, t, &GlbOptions::compact())
 }
 
 /// GPU memory of export textures: RGBA8 with a full mip chain (4/3), each texture counted

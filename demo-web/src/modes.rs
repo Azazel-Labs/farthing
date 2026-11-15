@@ -14,8 +14,8 @@
 //! only what selection and downloads need in [`Extra`].
 
 use crate::pipeline::{
-    original_textures, reference_ppr, switch_distance, Buffer, Demo, Event, LevelInfo, LevelKind,
-    LodOptions, MaterialHost,
+    compact_glb, original_textures, reference_ppr, switch_distance, Buffer, Demo, Event, LevelInfo,
+    LevelKind, LodOptions, MaterialHost,
 };
 use farthing::bake::BakeOptions;
 use farthing::cluster::{
@@ -27,7 +27,7 @@ use farthing::image::Texture;
 use farthing::impostor::footprint::{average_surfel_channel, ChannelSpec, FootprintOptions};
 use farthing::impostor::splats::{surfels_to_splats, write_splat_ply, Splat, SplatOptions};
 use farthing::impostor::surfels::{progressive_surfel_cloud, SurfelOptions};
-use farthing::io::{glb_bytes, ExportTextures, GltfMaterial};
+use farthing::io::{ExportTextures, GltfMaterial};
 use farthing::reduce::{
     repair, screen_size_to_max_error, simplify, Quality, SeamMode, SimplifyOptions, Symmetry,
 };
@@ -376,7 +376,7 @@ pub(crate) fn run_presets(
         };
         // Like the chain: the page gets geometry (it reuses the original's materials), the
         // download gets the original's textures.
-        let glb = glb_bytes(&s, &ExportTextures::default()).map_err(err)?;
+        let glb = compact_glb(&s, &ExportTextures::default()).map_err(err)?;
         let ms = now() - t0;
         let mut info = LevelInfo {
             triangles: s.triangle_count(),
@@ -654,7 +654,7 @@ pub(crate) fn run_hlod(
         drop(p.bake);
         let mut s = Scene::from_mesh(p.mesh);
         s.materials[0].name = format!("hlod_{idx}");
-        let glb = glb_bytes(&s, &tex)?;
+        let glb = compact_glb(&s, &tex)?;
         built += 1;
         emit(Event::Stage(&format!("HLOD: {built} proxies")));
         emit(Event::Data {

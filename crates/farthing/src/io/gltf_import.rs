@@ -30,11 +30,10 @@ pub struct GltfMaterial {
 /// Loads a glTF / GLB file. Each glTF mesh becomes one [`Mesh`] (primitives merged, material
 /// ids = slot index); each node with a mesh becomes an [`Instance`] with its world transform.
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<(Scene, Vec<GltfMaterial>)> {
-    let (doc, buffers, images) =
-        gltf::import(path.as_ref()).map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
-    build(&doc, &buffers, &|i, srgb| {
-        images.get(i).and_then(|d| decode_image(d, srgb))
-    })
+    let path = path.as_ref();
+    let bytes = std::fs::read(path)?;
+    let dir = path.parent().unwrap_or(Path::new(""));
+    load_gltf_with(&bytes, |uri| std::fs::read(dir.join(uri)).ok())
 }
 
 /// Loads a GLB, or a `.gltf` whose buffers and images are embedded (`data:` URIs), from memory.
@@ -51,8 +50,6 @@ pub fn load_gltf_with(
     bytes: &[u8],
     mut resolve: impl FnMut(&str) -> Option<Vec<u8>>,
 ) -> Result<(Scene, Vec<GltfMaterial>)> {
-    let gltf::Gltf { document, blob } =
-        gltf::Gltf::from_slice(bytes).map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
     let mut fetch = |uri: &str| -> Result<Vec<u8>> {
         if let Some(rest) = uri.strip_prefix("data:") {
             let (_, b64) = rest.split_once(";base64,").ok_or_else(|| {
@@ -64,25 +61,34 @@ pub fn load_gltf_with(
         let name = percent_decode(uri);
         resolve(&name).ok_or_else(|| Error::InvalidInput(format!("glTF: missing file `{name}`")))
     };
-    let mut buffers = Vec::new();
-    for b in document.buffers() {
-        let mut data = match b.source() {
-            gltf::buffer::Source::Bin => blob
-                .clone()
-                .ok_or_else(|| Error::InvalidInput("glTF: missing GLB binary chunk".into()))?,
-            gltf::buffer::Source::Uri(uri) => fetch(uri)?,
-        };
-        if data.len() < b.length() {
-            return Err(Error::InvalidInput(format!(
-                "glTF: buffer {} is shorter than declared",
-                b.index()
-            )));
+    // Quantized or meshopt-compressed documents are rewritten into plain glTF first.
+    let (document, buffers) = match super::gltf_normalize::normalize(bytes, &mut fetch)? {
+        Some((document, data)) => (document, vec![gltf::buffer::Data(data)]),
+        None => {
+            let gltf::Gltf { document, blob } = gltf::Gltf::from_slice(bytes)
+                .map_err(|e| Error::InvalidInput(format!("glTF: {e}")))?;
+            let mut buffers = Vec::new();
+            for b in document.buffers() {
+                let mut data = match b.source() {
+                    gltf::buffer::Source::Bin => blob.clone().ok_or_else(|| {
+                        Error::InvalidInput("glTF: missing GLB binary chunk".into())
+                    })?,
+                    gltf::buffer::Source::Uri(uri) => fetch(uri)?,
+                };
+                if data.len() < b.length() {
+                    return Err(Error::InvalidInput(format!(
+                        "glTF: buffer {} is shorter than declared",
+                        b.index()
+                    )));
+                }
+                while data.len() % 4 != 0 {
+                    data.push(0);
+                }
+                buffers.push(gltf::buffer::Data(data));
+            }
+            (document, buffers)
         }
-        while data.len() % 4 != 0 {
-            data.push(0);
-        }
-        buffers.push(gltf::buffer::Data(data));
-    }
+    };
     // Images are decoded on demand (only the material textures farthing reads). Embedded
     // ones are borrowed from their buffer, not copied.
     let mut external: Vec<Option<Vec<u8>>> = Vec::new();
@@ -418,32 +424,4 @@ fn build(
         },
         gltf_materials,
     ))
-}
-
-fn decode_image(img: &gltf::image::Data, srgb: bool) -> Option<Texture> {
-    use gltf::image::Format;
-    let px = &img.pixels;
-    let rgba: Vec<u8> = match img.format {
-        Format::R8G8B8A8 => px.clone(),
-        Format::R8G8B8 => px
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 255])
-            .collect(),
-        Format::R8G8 => px
-            .chunks_exact(2)
-            .flat_map(|c| [c[0], c[1], 0, 255])
-            .collect(),
-        Format::R8 => px.iter().flat_map(|&c| [c, c, c, 255]).collect(),
-        // 16-bit and float formats: keep the high byte, good enough for previews.
-        Format::R16G16B16A16 => px
-            .chunks_exact(8)
-            .flat_map(|c| [c[1], c[3], c[5], c[7]])
-            .collect(),
-        Format::R16G16B16 => px
-            .chunks_exact(6)
-            .flat_map(|c| [c[1], c[3], c[5], 255])
-            .collect(),
-        _ => vec![255; (img.width * img.height * 4) as usize],
-    };
-    Texture::from_rgba8(img.width, img.height, &rgba, srgb).ok()
 }
