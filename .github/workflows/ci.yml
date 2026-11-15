@@ -183,7 +183,7 @@ jobs:
         run: |
           name=farthing-${{ needs.release-check.outputs.version }}-${{ matrix.target }}
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/farthing${{ matrix.ext }}" README.md LICENSE-MIT0 "$name/"
+          cp "target/${{ matrix.target }}/release/farthing${{ matrix.ext }}" README.md LICENSE "$name/"
           if [ "${{ runner.os }}" = Windows ]; then 7z a -bd "$name.zip" "$name" >/dev/null; else tar czf "$name.tar.gz" "$name"; fi
       - uses: actions/upload-artifact@v7
         with:

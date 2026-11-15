@@ -7,7 +7,7 @@
 [![crates.io](https://img.shields.io/crates/v/farthing.svg)](https://crates.io/crates/farthing)
 [![docs.rs](https://img.shields.io/docsrs/farthing)](https://docs.rs/farthing)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org)
-[![License: MIT-0](https://img.shields.io/badge/license-MIT--0-blue)](LICENSE-MIT0)
+[![License: MIT-0](https://img.shields.io/badge/license-MIT--0-blue)](LICENSE)
 [![Live demo](https://img.shields.io/badge/demo-try_it_in_your_browser-8a2be2)](https://azazel-labs.github.io/farthing/)
 
 **farthing makes far things small.** It builds the LODs, proxies and impostors that stand in
@@ -647,4 +647,4 @@ bench-compare/         head-to-head vs meshoptimizer, xatlas, baby_shark (separa
 docs/                  BENCHMARKS.md, raw benchmark data, figures
 ```
 
-License: [MIT-0](LICENSE-MIT0) (MIT No Attribution).
+License: [MIT-0](LICENSE) (MIT No Attribution).
