@@ -118,6 +118,7 @@ uploaded.
 cargo install farthing-cli
 
 farthing lods model.glb -o lods/ --levels 4 --far-from 3   # LOD chain, far levels baked
+farthing lods model.glb -o lods/ --levels 4 --compact      # quantized, meshopt-compressed GLBs
 farthing reduce model.glb -o lod.glb --ratio 0.25           # one level
 farthing reduce model.glb -o lod.glb --ratio 0.25 --strict-seams --symmetry
 farthing remesh scene.glb -o proxy.glb --resolution 128 --triangles 3000
@@ -172,7 +173,8 @@ mesh.validate()?;
 A `Scene` holds meshes, instances with world transforms, skeletons and material *slots*. A
 slot is just a name and an id. farthing never knows what a material looks like. The `io`
 feature reads and writes glTF, GLB and OBJ. It also reads quantized and meshopt-compressed
-glTF, such as gltfpack's output:
+glTF, such as gltfpack's output. It bakes texture transforms (offset and scale) into the UVs;
+rotated transforms are ignored:
 
 ```rust
 let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf or .obj
@@ -576,7 +578,9 @@ save_glb(&out, "far.glb", &tex)?;              // glb_bytes(&out, &tex) for memo
 
 `GlbOptions::compact()` writes the smallest GLB: `KHR_mesh_quantization` (16-bit positions
 and UVs, 8-bit octahedral normals and tangents), `EXT_meshopt_compression`, and the
-`optimize_mesh` ordering. three.js reads it with `GLTFLoader.setMeshoptDecoder`. Skinned
+`optimize_mesh` ordering. three.js reads it with `GLTFLoader.setMeshoptDecoder`, and the CLI
+writes it with `--compact`. Some tools (Blender among them) can't open it, so keep plain GLB
+for authoring round trips. Skinned
 and morphed meshes keep float positions. Every export uses 16-bit indices when a mesh has
 fewer than 65,536 vertices.
 

@@ -41,11 +41,8 @@ self.onmessage = async ({ data }) => {
       post({ type: "select", seq: data.seq, info: JSON.parse(json), buffers }, buffers.map((b) => b.buffer));
     } else if (data.type === "download") {
       const ply = data.format === "ply";
-      const bytes = ply
-        ? session.levelPly(data.level)
-        : data.level === 0
-          ? session.originalGlb()
-          : session.levelGlb(data.level);
+      // Plain glTF, so the download opens in any tool (the viewer loads compact GLBs).
+      const bytes = ply ? session.levelPly(data.level) : session.levelGlb(data.level, false);
       post({ type: "download", level: data.level, format: ply ? "ply" : "glb", glb: bytes.buffer }, [bytes.buffer]);
     }
   } catch (e) {

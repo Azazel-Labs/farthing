@@ -61,10 +61,11 @@ mod web {
             self.0.original_glb().map_err(js_err)
         }
 
-        /// A level of the last run as a self-contained GLB.
+        /// A level of the last run as a self-contained GLB: compact (as the viewer loads it) or
+        /// plain glTF (for download).
         #[wasm_bindgen(js_name = levelGlb)]
-        pub fn level_glb(&self, level: usize) -> Result<Vec<u8>, JsError> {
-            self.0.level_glb(level).map_err(js_err)
+        pub fn level_glb(&self, level: usize, compact: bool) -> Result<Vec<u8>, JsError> {
+            self.0.level_glb(level, compact).map_err(js_err)
         }
 
         /// A splat level of the last splat run as a Gaussian splatting PLY.

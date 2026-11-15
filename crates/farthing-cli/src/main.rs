@@ -13,6 +13,7 @@ use farthing::{Mesh, Scene};
 use glam::Vec4;
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -24,7 +25,15 @@ use std::time::Instant;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+    /// Write compact GLBs: quantized (KHR_mesh_quantization) and meshopt-compressed
+    /// (EXT_meshopt_compression). three.js, Babylon.js and gltfpack read them; some
+    /// tools do not.
+    #[arg(long, global = true)]
+    compact: bool,
 }
+
+/// `--compact`, for `save`.
+static COMPACT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, ValueEnum)]
 enum ImpostorType {
@@ -338,7 +347,14 @@ fn save(s: &Scene, p: &Path) -> Result<()> {
             std::fs::create_dir_all(dir)?;
         }
     }
-    farthing::io::save(s, p).with_context(|| format!("saving {}", p.display()))
+    let glb = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("glb"));
+    if glb && COMPACT.load(Ordering::Relaxed) {
+        use farthing::io::{save_glb_with, ExportTextures, GlbOptions};
+        save_glb_with(s, p, &ExportTextures::default(), &GlbOptions::compact())
+    } else {
+        farthing::io::save(s, p)
+    }
+    .with_context(|| format!("saving {}", p.display()))
 }
 
 fn print(v: serde_json::Value) {
@@ -446,6 +462,7 @@ fn hlod_tree(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    COMPACT.store(cli.compact, Ordering::Relaxed);
     let t0 = Instant::now();
     match cli.cmd {
         Cmd::Info { input } => {

@@ -169,7 +169,7 @@ fn zipped_gltf_reduces_and_bakes() {
     assert!(red > 100 && white > 100, "red {red}, white {white}");
 
     // The downloadable baked level embeds its textures.
-    let full = demo.level_glb(3).unwrap();
+    let full = demo.level_glb(3, false).unwrap();
     assert!(full.windows(9).any(|w| w == b"image/png"));
     assert!(full.windows(24).any(|w| w == b"metallicRoughnessTexture"));
 }
@@ -253,7 +253,7 @@ fn shared_atlas_carries_the_original_materials() {
         assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
         assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
         assert!(demo
-            .level_glb(2)
+            .level_glb(2, false)
             .unwrap()
             .windows(9)
             .any(|w| w == b"image/png"));
@@ -500,7 +500,8 @@ fn samples_reduce_and_bake() {
         demo.original_glb()
             .unwrap_or_else(|e| panic!("{file}: {e}"));
         for l in 1..=opts.levels {
-            demo.level_glb(l).unwrap_or_else(|e| panic!("{file}: {e}"));
+            demo.level_glb(l, false)
+                .unwrap_or_else(|e| panic!("{file}: {e}"));
         }
         let peak = PEAK.load(Relaxed);
         eprintln!(
@@ -668,7 +669,7 @@ fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
                 assert!(info.triangles < original, "{info:?}");
                 assert_eq!(info.bytes, Some(*glb));
                 assert!(info.relative_error < 0.5, "{info:?}");
-                demo.level_glb(info.level).unwrap();
+                demo.level_glb(info.level, false).unwrap();
             }
         }
         DemoMode::Clusters => {
@@ -754,6 +755,6 @@ fn sphere_runs_every_mode() {
         check_mode(&demo, mode, &run, diag);
     }
     // A splat run keeps PLYs but no GLB levels.
-    assert!(demo.level_glb(1).is_err());
+    assert!(demo.level_glb(1, false).is_err());
     assert!(demo.level_ply(1).is_ok());
 }

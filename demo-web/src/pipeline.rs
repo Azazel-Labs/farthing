@@ -521,16 +521,22 @@ impl Demo {
     /// (what farthing reads of the materials), so every level is shown with the same material
     /// model.
     pub fn original_glb(&self) -> Result<Vec<u8>, String> {
-        self.level_glb(0)
+        self.level_glb(0, true)
     }
 
-    /// A level of the last run as a self-contained GLB (for download).
-    pub fn level_glb(&self, level: usize) -> Result<Vec<u8>, String> {
+    /// A level of the last run as a self-contained GLB: compact (quantized and
+    /// meshopt-compressed) for the viewer, or plain glTF, which every tool opens, for download.
+    pub fn level_glb(&self, level: usize, compact: bool) -> Result<Vec<u8>, String> {
         let (s, t) = self
             .levels
             .get(level)
             .ok_or_else(|| format!("no level {level}; run first"))?;
-        compact_glb(s, t).map_err(|e| e.to_string())
+        let opts = if compact {
+            GlbOptions::compact()
+        } else {
+            GlbOptions::default()
+        };
+        glb_bytes_with(s, t, &opts).map_err(|e| e.to_string())
     }
 
     /// Runs `opts.mode`, reporting each result as it finishes. `now` returns milliseconds.

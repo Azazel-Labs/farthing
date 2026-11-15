@@ -569,8 +569,8 @@ fn octahedral(c: [f32; 3], max: f32) -> [f32; 3] {
     let (mut x, mut y) = (c[0] / c[2], c[1] / c[2]);
     let z = 1.0 - x.abs() - y.abs();
     let t = z.min(0.0);
-    x -= t.copysign(x);
-    y -= t.copysign(y);
+    x += if x >= 0.0 { t } else { -t };
+    y += if y >= 0.0 { t } else { -t };
     let len = (x * x + y * y + z * z).sqrt();
     [x, y, z].map(|v| (v / len * max).round())
 }
