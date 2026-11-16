@@ -18,6 +18,26 @@ workspace = true
 default = ["io"]
 # glTF 2.0 and OBJ import/export (`farthing::io`).
 io = ["dep:gltf", "dep:polysmelt", "dep:tobj", "dep:serde_json"]
+# The other model formats polysmelt reads, all pure Rust (they build for WebAssembly): OBJ with
+# its MTL, PLY, STL, MagicaVoxel, 3DS, 3MF and FBX, through `io::load` and `io::load_model`;
+# WebP, TGA and BMP textures as well.
+formats = [
+    "io",
+    "polysmelt/fs",
+    "polysmelt/obj",
+    "polysmelt/ply",
+    "polysmelt/stl",
+    "polysmelt/vox",
+    "polysmelt/3ds",
+    "polysmelt/3mf",
+    "polysmelt/fbx",
+    "polysmelt/webp",
+    "image/webp",
+    "image/tga",
+    "image/bmp",
+]
+# USD as well (`.usd`, `.usda`, `.usdc`, `.usdz`). Its reader needs Rust 1.96.
+usd = ["formats", "polysmelt/usd"]
 
 [dependencies]
 glam.workspace = true

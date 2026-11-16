@@ -1,6 +1,8 @@
 //! glTF and OBJ import and export (feature `io`, on by default).
 //!
-//! Load and save [`Scene`]s as glTF 2.0 (`.gltf` / `.glb`) and Wavefront OBJ.
+//! Load and save [`Scene`]s as glTF 2.0 (`.gltf` / `.glb`) and Wavefront OBJ. With the
+//! `formats` feature, also load FBX, OBJ with its MTL, 3MF, 3DS, PLY, STL and MagicaVoxel, and
+//! with `usd`, USD ([`MODEL_EXTENSIONS`], [`load_model`]).
 //!
 //! Material handling follows the farthing boundary: scenes only carry named material slots.
 //! [`GltfMaterial`] exposes the glTF material description as a *host-side convenience*, so a
@@ -15,6 +17,7 @@
 
 mod gltf_export;
 mod gltf_import;
+mod model;
 mod obj;
 mod obj_quads;
 
@@ -22,18 +25,24 @@ pub use gltf_export::{
     ExportTextures, GlbOptions, glb_bytes, glb_bytes_with, save_glb, save_glb_with,
 };
 pub use gltf_import::{GltfMaterial, load_gltf, load_gltf_slice, load_gltf_with};
+pub use model::{MODEL_EXTENSIONS, load_model};
 pub use obj::{load_obj, save_obj};
 pub use obj_quads::{load_obj_quads, save_obj_quads};
 
 use crate::{Error, Result, Scene};
 use std::path::Path;
 
-/// Loads `.glb`, `.gltf` or `.obj` by extension.
+/// Loads `.glb`, `.gltf` or `.obj` by extension, and with the `formats` and `usd` features the
+/// rest of [`MODEL_EXTENSIONS`]. OBJ keeps quads' triangulation and materials as [`load_obj`]
+/// reads them.
 pub fn load(path: impl AsRef<Path>) -> Result<Scene> {
     let path = path.as_ref();
     match ext(path).as_str() {
         "glb" | "gltf" => Ok(load_gltf(path)?.0),
         "obj" => load_obj(path),
+        #[cfg(feature = "formats")]
+        other => model::load_file(path, other),
+        #[cfg(not(feature = "formats"))]
         other => Err(Error::InvalidInput(format!(
             "unsupported input format `{other}` (use .glb, .gltf or .obj)"
         ))),
@@ -53,10 +62,7 @@ pub fn save(scene: &Scene, path: impl AsRef<Path>) -> Result<()> {
 }
 
 fn ext(path: &Path) -> String {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+    model::extension(path)
 }
 
 #[cfg(test)]

@@ -95,7 +95,7 @@ and marches depth for parallax.
 | **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds, which also export as 3D Gaussian splats (`.ply`) shaped to the surface each one stands for. Reference WGSL included |
 | **Visibility & occluders** | Removes what can't be seen and builds occlusion geometry | Camera-sampled ID renders (alpha-aware through your engine), plus conservative self-tuning occluder meshes and boxes |
 | **Bones** | Fewer joints and influences for far LODs | Leaf-first removal by skinned error, influence limiting |
-| **I/O** | glTF/GLB (skins, morphs, embedded textures) and OBJ | Optional `io` feature |
+| **I/O** | glTF/GLB (skins, morphs, embedded textures) and OBJ; FBX, 3MF, 3DS, PLY, STL, MagicaVoxel and USD in | Optional `io`, `formats` and `usd` features |
 
 **farthing never decides what anything looks like.** It handles geometry, UVs,
 correspondence and packing. Anything that needs real materials goes through a small
@@ -175,12 +175,16 @@ slot is just a name and an id. farthing never knows what a material looks like. 
 feature reads and writes glTF, GLB and OBJ. It also reads quantized, meshopt-compressed and
 Draco-compressed glTF, such as gltfpack's output, decoded by
 [polysmelt](https://crates.io/crates/polysmelt). It bakes texture transforms (offset and scale)
-into the UVs; rotated transforms are ignored:
+into the UVs; rotated transforms are ignored. The `formats` feature adds FBX, OBJ with its MTL,
+3MF, 3DS, PLY, STL and MagicaVoxel, read into glTF by polysmelt, and `usd` adds USD (`.usd`,
+`.usda`, `.usdc`, `.usdz`; it needs Rust 1.96). All of them are pure Rust and build for
+WebAssembly. The `farthing` CLI reads `formats`.
 
 ```rust
-let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf or .obj
+let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf, .obj (+ `formats`)
 let (scene, materials) = farthing::io::load_gltf("model.glb")?; // plus the decoded glTF materials
 let (scene, materials) = farthing::io::load_gltf_with(&bytes, |uri| files.get(uri).cloned())?; // no file system
+let (scene, materials) = farthing::io::load_model("pack/crate.fbx", files)?; // any format, from (path, bytes) pairs
 let scene = farthing::Scene::from_mesh(mesh);                   // one mesh at the origin
 ```
 
