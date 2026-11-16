@@ -4,7 +4,7 @@ use crate::host::{
     ChannelEncoding, ChannelImage, ChannelImages, RenderHost, SurfaceBakeRequest, SurfaceSample,
     channels,
 };
-use crate::image::{Image, downsample_coverage_rows};
+use crate::image::{Dilation, Image, downsample_coverage_rows};
 use crate::{Error, Mesh, Result, Scene};
 use glam::{Mat3, Mat4, Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
@@ -159,16 +159,32 @@ fn prepare(
     Ok(Prepared { dest, corr })
 }
 
-/// Destination tangent frame (world space) at a correspondence sample.
-fn dest_frame(dest: &Mesh, m: Mat4, tri: u32, b: Vec3) -> (Vec3, Vec3, Vec3) {
+/// A transform's linear part and normal matrix, worked out once rather than per sample.
+#[derive(Clone, Copy)]
+struct Frame {
+    linear: Mat3,
+    normal: Mat3,
+}
+
+impl Frame {
+    fn new(m: Mat4) -> Frame {
+        let linear = Mat3::from_mat4(m);
+        Frame {
+            linear,
+            normal: linear.inverse().transpose(),
+        }
+    }
+}
+
+/// Destination tangent frame (world space) at a correspondence sample; `m` places the
+/// destination.
+fn dest_frame(dest: &Mesh, m: &Frame, tri: u32, b: Vec3) -> (Vec3, Vec3, Vec3) {
     let [i0, i1, i2] = dest.triangle(tri as usize).map(|v| v as usize);
-    let nmat = Mat3::from_mat4(m).inverse().transpose();
-    let m3 = Mat3::from_mat4(m);
     let ns = dest.normals.as_ref().unwrap();
     let ts = dest.tangents.as_ref().unwrap();
-    let n = (nmat * (ns[i0] * b.x + ns[i1] * b.y + ns[i2] * b.z)).normalize_or_zero();
+    let n = (m.normal * (ns[i0] * b.x + ns[i1] * b.y + ns[i2] * b.z)).normalize_or_zero();
     let t4 = ts[i0] * b.x + ts[i1] * b.y + ts[i2] * b.z;
-    let t = (m3 * t4.truncate()).normalize_or_zero();
+    let t = (m.linear * t4.truncate()).normalize_or_zero();
     let t = (t - n * n.dot(t)).normalize_or_zero(); // Gram-Schmidt
     let sign = if ts[i0].w < 0.0 { -1.0 } else { 1.0 };
     let bt = n.cross(t) * sign;
@@ -188,7 +204,7 @@ struct Strip<'a> {
 /// soon as no later band can change them (dilation reaches `gutter` rows).
 struct Finisher<'a> {
     dest: &'a Mesh,
-    dest_to_world: Mat4,
+    dest_to_world: Frame,
     supersample: u32,
     /// Output size.
     width: u32,
@@ -221,7 +237,7 @@ impl<'a> Finisher<'a> {
     ) -> Finisher<'a> {
         Finisher {
             dest,
-            dest_to_world,
+            dest_to_world: Frame::new(dest_to_world),
             supersample: supersample.max(1),
             width,
             height,
@@ -268,7 +284,7 @@ impl<'a> Finisher<'a> {
                         let nw = p.truncate().normalize_or_zero();
                         let (t, b, n) = dest_frame(
                             self.dest,
-                            self.dest_to_world,
+                            &self.dest_to_world,
                             e.dest_triangle,
                             e.dest_barycentrics,
                         );
@@ -312,18 +328,25 @@ impl<'a> Finisher<'a> {
             return;
         }
         let (w, g, from) = (self.width as usize, self.gutter, self.emitted);
+        // Every channel's coverage comes from the same correspondence, so one plan fills them
+        // all (kept per row range, should one ever differ).
+        let mut plan: Option<(u32, Dilation)> = None;
         for (name, p) in &mut self.channels {
-            let mut img = Image {
-                width: self.width,
-                height: self.resolved - p.lo,
-                pixels: if last {
-                    std::mem::take(&mut p.rows)
-                } else {
-                    p.rows.clone()
-                },
+            let mut px = if last {
+                std::mem::take(&mut p.rows)
+            } else {
+                p.rows.clone()
             };
-            img.dilate(g);
-            let mut px = img.pixels;
+            if plan.as_ref().is_none_or(|(lo, _)| *lo != p.lo) {
+                let covered: Vec<bool> = px.iter().map(|p| p.w > 0.0).collect();
+                plan = Some((
+                    p.lo,
+                    Dilation::new(&covered, self.width, self.resolved - p.lo, g),
+                ));
+            }
+            if let Some((_, d)) = &plan {
+                d.apply(&mut px);
+            }
             px.truncate((end - p.lo) as usize * w);
             px.drain(..(from - p.lo) as usize * w);
             // Covered texels get full alpha; alpha is coverage, not opacity.
@@ -406,7 +429,35 @@ fn displacement_channel(
     }
 }
 
-fn interpolate_sample(source: &Scene, e: &crate::bake::CorrespondenceEntry) -> SurfaceSample {
+/// Surface samples of a source scene at correspondence entries, with each instance's matrices
+/// worked out once.
+struct Interp<'a> {
+    source: &'a Scene,
+    frames: Vec<Frame>,
+}
+
+impl<'a> Interp<'a> {
+    fn new(source: &'a Scene) -> Interp<'a> {
+        Interp {
+            source,
+            frames: source
+                .instances
+                .iter()
+                .map(|i| Frame::new(i.transform))
+                .collect(),
+        }
+    }
+
+    fn sample(&self, e: &crate::bake::CorrespondenceEntry) -> SurfaceSample {
+        interpolate_sample(self.source, &self.frames[e.source.instance as usize], e)
+    }
+}
+
+fn interpolate_sample(
+    source: &Scene,
+    frame: &Frame,
+    e: &crate::bake::CorrespondenceEntry,
+) -> SurfaceSample {
     let inst = &source.instances[e.source.instance as usize];
     let mesh = &source.meshes[inst.mesh];
     let [i0, i1, i2] = mesh
@@ -415,7 +466,7 @@ fn interpolate_sample(source: &Scene, e: &crate::bake::CorrespondenceEntry) -> S
     let b = e.barycentrics;
     let lerp3 = |a: &[Vec3]| a[i0] * b.x + a[i1] * b.y + a[i2] * b.z;
     let m = inst.transform;
-    let nmat = Mat3::from_mat4(m).inverse().transpose();
+    let nmat = frame.normal;
     let position = m.transform_point3(lerp3(&mesh.positions));
     let normal = match &mesh.normals {
         Some(n) => (nmat * lerp3(n)).normalize_or_zero(),
@@ -429,7 +480,7 @@ fn interpolate_sample(source: &Scene, e: &crate::bake::CorrespondenceEntry) -> S
         .as_ref()
         .map_or(Vec4::new(1.0, 0.0, 0.0, 1.0), |t| {
             let v = t[i0] * b.x + t[i1] * b.y + t[i2] * b.z;
-            (Mat3::from_mat4(m) * v.truncate())
+            (frame.linear * v.truncate())
                 .normalize_or_zero()
                 .extend(if t[i0].w < 0.0 { -1.0 } else { 1.0 })
         });
@@ -499,6 +550,7 @@ pub fn prepare_bake(
     opts: &BakeOptions,
 ) -> Result<PreparedBake> {
     let prep = prepare(dest, dest_to_world, source, opts)?;
+    let interp = Interp::new(source);
     let request = SurfaceBakeRequest {
         width: prep.corr.width,
         height: prep.corr.height,
@@ -506,7 +558,7 @@ pub fn prepare_bake(
             .corr
             .entries
             .iter()
-            .map(|e| e.as_ref().map(|e| interpolate_sample(source, e)))
+            .map(|e| e.as_ref().map(|e| interp.sample(e)))
             .collect(),
         channels: host_channels(opts),
     };
@@ -682,6 +734,7 @@ fn bake_bands(
         ss,
         opts.gutter,
     );
+    let interp = Interp::new(source);
     let mut kept = Vec::new();
     if opts.keep_correspondence {
         kept.reserve_exact(w as usize * h as usize);
@@ -702,7 +755,7 @@ fn bake_bands(
                 height: rows,
                 samples: entries
                     .iter()
-                    .map(|e| e.as_ref().map(|e| interpolate_sample(source, e)))
+                    .map(|e| e.as_ref().map(|e| interp.sample(e)))
                     .collect(),
                 channels: channels.clone(),
             };
@@ -780,9 +833,10 @@ pub fn bake_flattened(
         }
         // Flattened normals are tangent-space in the *source* frame; re-express them via world space.
         let encoding = if *encoding == ChannelEncoding::NormalTangent {
+            let interp = Interp::new(source);
             for (i, e) in prep.corr.entries.iter().enumerate() {
                 let Some(e) = e else { continue };
-                let s = interpolate_sample(source, e);
+                let s = interp.sample(e);
                 let n = s.normal;
                 let t =
                     (s.tangent.truncate() - n * n.dot(s.tangent.truncate())).normalize_or_zero();
@@ -997,7 +1051,7 @@ mod tests {
                 let b = e.dest_barycentrics;
                 let p =
                     dest.positions[i0] * b.x + dest.positions[i1] * b.y + dest.positions[i2] * b.z;
-                let q = interpolate_sample(&source, e).position;
+                let q = Interp::new(&source).sample(e).position;
                 assert!((p - q).length() < 1e-3, "copy {copy}: {p} vs {q}");
                 if copy {
                     assert_eq!(e.source, refs[e.dest_triangle as usize]);

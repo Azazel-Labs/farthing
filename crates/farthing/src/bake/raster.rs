@@ -1,7 +1,6 @@
 //! UV-space rasterization: which destination triangle (and where in it) covers each texel.
 
 use crate::Mesh;
-use crate::math::barycentric_2d;
 use glam::{Vec2, Vec3};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -56,12 +55,22 @@ pub(crate) fn rasterize_rows(
     let y1 = y0 + rows;
     for t in triangles {
         let (p, min, max) = texel_bounds(mesh, uvs, t, size);
+        // Barycentrics from the edges out of corner 0: a few products per texel, and offsets
+        // the size of the triangle rather than of the atlas, which keeps their precision.
+        let (e1, e2) = (p[1] - p[0], p[2] - p[0]);
+        let area2 = e1.perp_dot(e2);
+        if (0.5 * area2).abs() < 1e-20 {
+            continue;
+        }
+        let inv = 1.0 / area2;
         for y in (min.y as u32).max(y0)..(max.y as u32).min(y1) {
+            let dy = y as f32 + 0.5 - p[0].y;
             for x in min.x as u32..max.x as u32 {
-                let c = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-                if let Some(b) = barycentric_2d(c, p[0], p[1], p[2])
-                    && b.min_element() >= -1e-5
-                {
+                let dx = x as f32 + 0.5 - p[0].x;
+                let u = (dx * e2.y - dy * e2.x) * inv;
+                let v = (e1.x * dy - e1.y * dx) * inv;
+                let b = Vec3::new(1.0 - u - v, u, v);
+                if b.min_element() >= -1e-5 {
                     out[((y - y0) * width + x) as usize] = Some(TexelSample {
                         triangle: t as u32,
                         barycentrics: b,

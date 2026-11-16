@@ -35,30 +35,11 @@ impl Image {
         let i = (y * self.width + x) as usize;
         self.pixels[i] = v;
     }
-    #[inline]
-    fn fetch(&self, x: i64, y: i64, wrap: bool) -> Vec4 {
-        let (w, h) = (self.width as i64, self.height as i64);
-        let (x, y) = if wrap {
-            (x.rem_euclid(w), y.rem_euclid(h))
-        } else {
-            (x.clamp(0, w - 1), y.clamp(0, h - 1))
-        };
-        self.pixels[(y * w + x) as usize]
-    }
-
     /// Bilinear sample at `uv` (texel centers at (i + 0.5) / size).
     pub fn sample_bilinear(&self, uv: Vec2, wrap: bool) -> Vec4 {
-        let x = uv.x * self.width as f32 - 0.5;
-        let y = uv.y * self.height as f32 - 0.5;
-        let (x0, y0) = (x.floor(), y.floor());
-        let (fx, fy) = (x - x0, y - y0);
-        let (x0, y0) = (x0 as i64, y0 as i64);
-        let a = self
-            .fetch(x0, y0, wrap)
-            .lerp(self.fetch(x0 + 1, y0, wrap), fx);
-        let b = self
-            .fetch(x0, y0 + 1, wrap)
-            .lerp(self.fetch(x0 + 1, y0 + 1, wrap), fx);
+        let (i, fx, fy) = bilinear_taps(uv, self.width, self.height, wrap);
+        let a = self.pixels[i[0]].lerp(self.pixels[i[1]], fx);
+        let b = self.pixels[i[2]].lerp(self.pixels[i[3]], fx);
         a.lerp(b, fy)
     }
 
@@ -96,50 +77,7 @@ impl Image {
     /// reported in the returned mask as `false` (not originally covered).
     pub fn dilate(&mut self, iterations: u32) -> Vec<bool> {
         let original: Vec<bool> = self.pixels.iter().map(|p| p.w > 0.0).collect();
-        let mut covered = original.clone();
-        let (w, h) = (self.width as i64, self.height as i64);
-        for _ in 0..iterations {
-            let mut changes = Vec::new();
-            for y in 0..h {
-                for x in 0..w {
-                    let i = (y * w + x) as usize;
-                    if covered[i] {
-                        continue;
-                    }
-                    let mut acc = Vec4::ZERO;
-                    let mut n = 0.0;
-                    for (dx, dy) in [
-                        (-1, 0),
-                        (1, 0),
-                        (0, -1),
-                        (0, 1),
-                        (-1, -1),
-                        (1, -1),
-                        (-1, 1),
-                        (1, 1),
-                    ] {
-                        let (nx, ny) = (x + dx, y + dy);
-                        if nx >= 0 && ny >= 0 && nx < w && ny < h {
-                            let j = (ny * w + nx) as usize;
-                            if covered[j] {
-                                acc += self.pixels[j];
-                                n += 1.0;
-                            }
-                        }
-                    }
-                    if n > 0.0 {
-                        changes.push((i, (acc / n).truncate().extend(1.0)));
-                    }
-                }
-            }
-            if changes.is_empty() {
-                break;
-            }
-            for (i, v) in changes {
-                self.pixels[i] = v;
-                covered[i] = true;
-            }
-        }
+        Dilation::new(&original, self.width, self.height, iterations).apply(&mut self.pixels);
         original
     }
 
@@ -252,6 +190,133 @@ impl std::fmt::Debug for Texture {
     }
 }
 
+/// The four texels a bilinear sample at `uv` reads from a `width × height` grid (row-major
+/// indices: top-left, top-right, bottom-left, bottom-right), wrapped or clamped at the edges,
+/// and the weights along x and y.
+#[inline]
+fn bilinear_taps(uv: Vec2, width: u32, height: u32, wrap: bool) -> ([usize; 4], f32, f32) {
+    let x = uv.x * width as f32 - 0.5;
+    let y = uv.y * height as f32 - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (xa, xb) = tap_pair(x0 as i64, width as i64, wrap);
+    let (ya, yb) = tap_pair(y0 as i64, height as i64, wrap);
+    let w = width as usize;
+    ([ya * w + xa, ya * w + xb, yb * w + xa, yb * w + xb], fx, fy)
+}
+
+/// Texels `i` and `i + 1` of a row (or column) of `n`, wrapped or clamped. Inside the row, as
+/// nearly every sample is, without a division.
+#[inline]
+fn tap_pair(i: i64, n: i64, wrap: bool) -> (usize, usize) {
+    if i >= 0 && i < n - 1 {
+        (i as usize, i as usize + 1)
+    } else if wrap {
+        let a = i.rem_euclid(n);
+        (a as usize, if a + 1 == n { 0 } else { a as usize + 1 })
+    } else {
+        (
+            i.clamp(0, n - 1) as usize,
+            i.saturating_add(1).clamp(0, n - 1) as usize,
+        )
+    }
+}
+
+/// The fill of [`Image::dilate`], worked out once from a coverage mask: ring by ring, which
+/// uncovered pixels take the average of which covered neighbors. It applies to any number of
+/// images that share the mask (the channels of a bake), and finds each ring from the last one,
+/// so it touches the pixels near the coverage, not the whole image once per ring.
+pub(crate) struct Dilation {
+    /// Filled pixels in order, each with the end of its neighbors in `from`. A pixel only reads
+    /// pixels covered before its ring, so applying them in order needs no second buffer.
+    fill: Vec<(u32, u32)>,
+    from: Vec<u32>,
+}
+
+/// Neighbors in the order the average sums them.
+const NEIGHBORS: [(i64, i64); 8] = [
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+    (1, 1),
+];
+
+impl Dilation {
+    /// `covered`: the `width × height` mask, row-major.
+    pub(crate) fn new(covered: &[bool], width: u32, height: u32, rings: u32) -> Dilation {
+        let (w, h) = (width as i64, height as i64);
+        let neighbors = move |i: u32| {
+            let (x, y) = (i as i64 % w, i as i64 / w);
+            NEIGHBORS.iter().filter_map(move |&(dx, dy)| {
+                let (nx, ny) = (x + dx, y + dy);
+                (nx >= 0 && ny >= 0 && nx < w && ny < h).then_some((ny * w + nx) as u32)
+            })
+        };
+        // 0 uncovered, 1 covered, 2 waiting in the next ring.
+        let mut state: Vec<u8> = covered.iter().map(|&c| u8::from(c)).collect();
+        let mut next: Vec<u32> = Vec::new();
+        if rings > 0 {
+            for i in 0..state.len() as u32 {
+                if state[i as usize] == 0 && neighbors(i).any(|j| state[j as usize] == 1) {
+                    next.push(i);
+                }
+            }
+            for &i in &next {
+                state[i as usize] = 2;
+            }
+        }
+        let mut d = Dilation {
+            fill: Vec::with_capacity(next.len() * rings as usize),
+            from: Vec::new(),
+        };
+        for _ in 0..rings {
+            if next.is_empty() {
+                break;
+            }
+            // In index order, like a scan of the image.
+            next.sort_unstable();
+            let start = d.fill.len();
+            for &i in &next {
+                d.from
+                    .extend(neighbors(i).filter(|&j| state[j as usize] == 1));
+                d.fill.push((i, d.from.len() as u32));
+            }
+            for &(i, _) in &d.fill[start..] {
+                state[i as usize] = 1;
+            }
+            next.clear();
+            for k in start..d.fill.len() {
+                for j in neighbors(d.fill[k].0) {
+                    if state[j as usize] == 0 {
+                        state[j as usize] = 2;
+                        next.push(j);
+                    }
+                }
+            }
+        }
+        d
+    }
+
+    /// Fills `pixels` (an image the mask describes): each filled pixel the average of its
+    /// neighbors, with alpha 1.
+    pub(crate) fn apply(&self, pixels: &mut [Vec4]) {
+        let mut s = 0;
+        for &(i, e) in &self.fill {
+            let e = e as usize;
+            let mut acc = Vec4::ZERO;
+            for &j in &self.from[s..e] {
+                acc += pixels[j as usize];
+            }
+            pixels[i as usize] = (acc / (e - s) as f32).truncate().extend(1.0);
+            s = e;
+        }
+    }
+}
+
 fn srgb_lut() -> &'static [f32; 256] {
     static LUT: OnceLock<[f32; 256]> = OnceLock::new();
     LUT.get_or_init(|| std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0)))
@@ -259,6 +324,35 @@ fn srgb_lut() -> &'static [f32; 256] {
 
 fn unorm8(c: f32) -> u8 {
     (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+/// `unorm8(linear_to_srgb(c))`, found among the linear values where the byte steps up instead
+/// of with a power per call (a bake encodes every texel).
+fn srgb8(c: f32) -> u8 {
+    srgb8_steps().partition_point(|&s| s <= c) as u8
+}
+
+/// Per byte 1..=255, the least linear value that encodes to at least it.
+fn srgb8_steps() -> &'static [f32; 255] {
+    static STEPS: OnceLock<[f32; 255]> = OnceLock::new();
+    STEPS.get_or_init(|| {
+        let byte = |bits: u32| unorm8(linear_to_srgb(f32::from_bits(bits)));
+        std::array::from_fn(|k| {
+            let k = k as u8 + 1;
+            // Bisection on the bits of non-negative floats, which order like the values:
+            // `lo` encodes below `k` (0 encodes to 0), `hi` to at least it (1 encodes to 255).
+            let (mut lo, mut hi) = (0u32, 1.0f32.to_bits());
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if byte(mid) >= k {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            f32::from_bits(hi)
+        })
+    })
 }
 
 impl Texture {
@@ -297,7 +391,7 @@ impl Texture {
     /// The texel [`Texture::from_image`] stores for the linear pixel `p`, for building a
     /// texture a few rows at a time (then [`Texture::from_rgba8`]).
     pub fn encode(p: Vec4, srgb: bool) -> [u8; 4] {
-        let enc = |c: f32| unorm8(if srgb { linear_to_srgb(c) } else { c });
+        let enc = |c: f32| if srgb { srgb8(c) } else { unorm8(c) };
         [enc(p.x), enc(p.y), enc(p.z), unorm8(p.w)]
     }
 
@@ -350,34 +444,16 @@ impl Texture {
         self.decode(self.texels[(y * self.width + x) as usize])
     }
 
-    #[inline]
-    fn fetch(&self, x: i64, y: i64, wrap: bool) -> Vec4 {
-        let (w, h) = (self.width as i64, self.height as i64);
-        let (x, y) = if wrap {
-            (x.rem_euclid(w), y.rem_euclid(h))
-        } else {
-            (x.clamp(0, w - 1), y.clamp(0, h - 1))
-        };
-        self.decode(self.texels[(y * w + x) as usize])
-    }
-
     /// Bilinear sample at `uv` (texel centers at (i + 0.5) / size), decoded to linear.
     /// Transparent black for an empty texture.
     pub fn sample_bilinear(&self, uv: Vec2, wrap: bool) -> Vec4 {
         if self.texels.is_empty() {
             return Vec4::ZERO;
         }
-        let x = uv.x * self.width as f32 - 0.5;
-        let y = uv.y * self.height as f32 - 0.5;
-        let (x0, y0) = (x.floor(), y.floor());
-        let (fx, fy) = (x - x0, y - y0);
-        let (x0, y0) = (x0 as i64, y0 as i64);
-        let a = self
-            .fetch(x0, y0, wrap)
-            .lerp(self.fetch(x0 + 1, y0, wrap), fx);
-        let b = self
-            .fetch(x0, y0 + 1, wrap)
-            .lerp(self.fetch(x0 + 1, y0 + 1, wrap), fx);
+        let (i, fx, fy) = bilinear_taps(uv, self.width, self.height, wrap);
+        let t = |k: usize| self.decode(self.texels[i[k]]);
+        let a = t(0).lerp(t(1), fx);
+        let b = t(2).lerp(t(3), fx);
         a.lerp(b, fy)
     }
 
@@ -390,7 +466,7 @@ impl Texture {
         let lut = srgb_lut();
         let conv = |v: u8| {
             if srgb {
-                unorm8(linear_to_srgb(v as f32 / 255.0))
+                srgb8(v as f32 / 255.0)
             } else {
                 unorm8(lut[v as usize])
             }
@@ -431,6 +507,26 @@ pub fn srgb_to_linear(c: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srgb8_matches_the_formula() {
+        let steps = 1 << 20;
+        for i in -steps / 8..=steps + steps / 8 {
+            let c = i as f32 / steps as f32;
+            assert_eq!(srgb8(c), unorm8(linear_to_srgb(c)), "{c}");
+        }
+        for k in 0..=255u8 {
+            // The steps themselves, and the floats just below them.
+            if k > 0 {
+                let s = srgb8_steps()[k as usize - 1];
+                for c in [s, f32::from_bits(s.to_bits() - 1)] {
+                    assert_eq!(srgb8(c), unorm8(linear_to_srgb(c)), "{c}");
+                }
+            }
+        }
+        assert_eq!(srgb8(f32::NAN), unorm8(linear_to_srgb(f32::NAN)));
+        assert_eq!(srgb8(f32::INFINITY), 255);
+    }
 
     #[test]
     fn srgb_roundtrip() {
