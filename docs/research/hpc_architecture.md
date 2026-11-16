@@ -90,7 +90,7 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
     *more instructions than the factorization itself* (1.51 G vs 0.82 G on DamagedHelmet).
   - Replacement: build the vertex graph once from the chart triangles (each triangle adds 3
     edges). Run RCM on the n/2 vertex nodes. Expand the order to interleaved (u, v) 2×2 blocks.
-  - Build CSR by counting sort on the row index. Sort each row's few neighbours with an insertion
+  - Build CSR by counting sort on the row index. Sort each row's few neighbors with an insertion
     sort, or keep them in triangle order, which is deterministic.
   - Accumulate numeric entries straight into the envelope rows. The `entries` vector then
     disappears.
@@ -136,7 +136,7 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
     - `validity`, `map_wedges` and `cost` read only N[p] ∪ N[q] and those triangles.
     - `collapse` writes the adjacency of p, q and the third vertices of the dying triangles
       (all in N(p)), `tris/tpos` of triangles around p, `quadric[q]`, the wedges of p and q,
-      and `bnbr` of border neighbours of p.
+      and `bnbr` of border neighbors of p.
     - The `touched`/`stamp` marks lie inside the set.
   - So winners are independent, and every candidate is decided only after all
     higher-ranked overlapping candidates. That reproduces the current serial in-round order
@@ -173,7 +173,7 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
 - **Cost / risk.** Medium, about 300 lines plus the arena change. On tiny meshes, use a serial
   fallback below a size threshold; the result is identical either way.
 
-## 4. Reducer: replace the neighbour × corner nested loop with one partitioning pass and branch-free compaction (Ross; Polychroniou-Raghavan-Ross; Inoue)
+## 4. Reducer: replace the neighbor × corner nested loop with one partitioning pass and branch-free compaction (Ross; Polychroniou-Raghavan-Ross; Inoue)
 
 - **Source.**
   - K. A. Ross, "Conjunctive selection conditions in main memory", PODS 2002
@@ -193,12 +193,12 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
   as an all-pairs SIMD compare instead of an early-exit scan.
 - **Transfer (W1).**
   - The main mispredict source today: `best_candidate` calls `map_from_corners` once per
-    neighbour q. Each call scans *all* corners of p with `if c.pa == q ... else if c.pb == q ...
+    neighbor q. Each call scans *all* corners of p with `if c.pa == q ... else if c.pb == q ...
     else continue`, which is taken about 2 times in 6, so it mispredicts. It then runs
     `out.iter().find` over a tiny variable-length list.
-  - That is a nested-loop join (neighbours × corners). Replace it with one pass over p's corners
-    that scatters each corner to its two neighbours (pa, pb). Neighbour slots come from a small
-    position→slot table built in the same `neighbors_into` pass. You get all neighbours' wedge
+  - That is a nested-loop join (neighbors × corners). Replace it with one pass over p's corners
+    that scatters each corner to its two neighbors (pa, pb). Neighbor slots come from a small
+    position→slot table built in the same `neighbors_into` pass. You get all neighbors' wedge
     maps in O(corners) with no data-dependent branches.
   - In `validity`, the link-condition count uses epoch marker writes and reads into an array of
     size np. Replace it with a SIMD all-pairs compare of N(p) (≤ 8 lanes) against N(q), which
@@ -207,7 +207,7 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
     rule says this pays exactly when the outcome is unpredictable. Flips are rare, so first
     measure that path's mispredicts separately.
 - **Why it should win.** Callgrind attributes about 85% of reducer mispredicts to these three
-  functions. BENCHMARKS.md already identifies mispredicts on short neighbour loops as the
+  functions. BENCHMARKS.md already identifies mispredicts on short neighbor loops as the
   bottleneck.
 - **Determinism.** Keep corner order and first-match semantics, and the outputs are
   bit-identical. Verify with the existing `simd_and_baseline_builds_agree` and determinism tests.
@@ -232,7 +232,7 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
 - **Transfer (W1).**
   - Today's SIMD is *intra*-candidate: a 12-wide dot product per quadric. It cut instructions
     about 8% but wall time only 3-4%.
-  - Switch to *inter*-candidate lanes. In `best_candidate(p)`, every neighbour q is evaluated
+  - Switch to *inter*-candidate lanes. In `best_candidate(p)`, every neighbor q is evaluated
     against the same `Q_p`. Broadcast Q_p's 10 coefficients, put 4 (AVX2 f64) or 8 (AVX-512)
     q-positions' monomials in SoA lanes, and get 4-8 costs from about 10 FMAs, with no
     horizontal sums.
@@ -273,7 +273,7 @@ The ideas below are ranked by expected payoff divided by effort, using this prof
     3. prefetch the `aq` lines of the wedges involved, then compute.
   - Use `core::arch::x86_64::_mm_prefetch`; prefetches are hints, so this is deterministic.
   - Complement: renumber positions, triangles and wedges in Morton or Hilbert order once in
-    `State::new`, so ring neighbours share lines. Weigh this against Balaji & Lucia (IISWC 2018,
+    `State::new`, so ring neighbors share lines. Weigh this against Balaji & Lucia (IISWC 2018,
     [pdf](https://bvignesh.github.io/papers/Reordering-IISWC18.pdf)): reordering pays only when
     the reuse it creates outweighs its cost, and it can slow some inputs down.
   - Optionally store `aq` as f32 to halve the lines (meshoptimizer works in f32). This is a

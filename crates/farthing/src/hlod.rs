@@ -52,7 +52,7 @@ pub enum HlodGeometry {
 pub struct HlodOptions {
     /// Hidden-surface removal (None: keep everything).
     pub visibility: Option<VisibilityOptions>,
-    /// Rings of neighbours kept around seen triangles, so sub-pixel misses don't open holes.
+    /// Rings of neighbors kept around seen triangles, so sub-pixel misses don't open holes.
     pub grow_rings: usize,
     /// Connected parts smaller than this many visibility pixels are kept or dropped whole
     /// (kept when any camera saw them): culling them triangle by triangle would leave shards

@@ -268,7 +268,7 @@ pub trait RenderHost {
         Err(crate::Error::Unsupported("render_views_behind"))
     }
 
-    /// Triangle-ID renders. The default is farthing's CPU ray caster, which honours
+    /// Triangle-ID renders. The default is farthing's CPU ray caster, which honors
     /// [`MaterialClass::Blended`] (never occludes) but treats masked materials as opaque.
     /// Hosts that can evaluate alpha should override this.
     fn render_ids(&mut self, req: &IdRenderRequest) -> Result<Vec<IdImage>> {

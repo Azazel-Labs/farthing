@@ -145,7 +145,7 @@ fn city(blocks: usize) -> Scene {
     s
 }
 
-/// Colours by world position; registers materials by counting.
+/// Colors by world position; registers materials by counting.
 struct Host {
     materials: u32,
 }

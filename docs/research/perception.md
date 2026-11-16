@@ -81,7 +81,7 @@ Current farthing state that matters here (I read the code):
     their plot).
 - Modern CSF: castleCSF, Ashraf, Mantiuk, Chapiro, Wuerger 2024, J. Vision 24(4)
   ([project](https://www.cl.cam.ac.uk/research/rainbow/projects/castleCSF/)). Inputs: spatial
-  and temporal frequency, colour direction, luminance, eccentricity, stimulus area.
+  and temporal frequency, color direction, luminance, eccentricity, stimulus area.
 
 **Mechanism.** A geometric change is visible if the luminance contrast it produces, divided by
 the detection threshold at its retinal spatial frequency (the CSF), exceeds 1 (one JND). The
@@ -238,7 +238,7 @@ pieces are not novel.
   Large-Scale Dataset and Deep Learning-based Quality Metric*, ACM TOG
   ([arXiv](https://arxiv.org/pdf/2202.02397)):
   - 343,750 stimuli, 148,929 crowdsourced judgments.
-  - Geometric complexity and rich colour texture both mask geometric artifacts. Near-uniform
+  - Geometric complexity and rich color texture both mask geometric artifacts. Near-uniform
     textures are less sensitive to UV quantization. Front lighting masks geometric detail.
   - Texture JPEG quality ≥ 50 and sizes > 712² had little effect on their rendered stimuli.
 
@@ -262,7 +262,7 @@ Divide the shading term of idea 1 by M. Optionally divide the UV/texture-deviati
 too. Precompute only: O(n) over the source mesh, and textures sampled once per face.
 
 **Why better.** It moves triangle budget off busy or rough or textured regions, where
-simplification artifacts are invisible, onto smooth, uniformly coloured areas, where faceting is
+simplification artifacts are invisible, onto smooth, uniformly colored areas, where faceting is
 glaring. Pure QEM does the opposite: rough areas have large quadric error.
 
 **Cost/risk.** About 150 lines plus a host hook for per-face texture statistics.
@@ -359,7 +359,7 @@ reducer is not a standard published practice as far as I found.
 - Cauchy's surface-area formula: the mean projected area of a convex body is area/4, i.e.
   E[max(0, n·v)] = 1/4 for every surface element under uniform views.
 
-**Mechanism and derivation (mine; check).** Minimise Σ_c w_c·A_c·D(ρ_c) subject to
+**Mechanism and derivation (mine; check).** Minimize Σ_c w_c·A_c·D(ρ_c) subject to
 Σ_c A_c·ρ_c² = B (atlas area), where D is perceptual loss at texel density ρ.
 - With 1/f amplitude spectra, the energy lost above the cutoff is ∝ log(ρ_max/ρ) (equal energy
   per octave). This gives **ρ_c ∝ √w_c**.
@@ -380,12 +380,12 @@ Per-chart weight is w_c = V_c · T_c · U_c:
 Scale each chart's UVs by √w_c before packing. Keep the existing binary search on the global
 density at `param.rs:602`. This also helps W4 slightly: shrinking low-weight charts frees area.
 
-**Why better.** Uniform density spends texels on occluded interiors, flat-colour regions and
+**Why better.** Uniform density spends texels on occluded interiors, flat-color regions and
 detail the eye cannot resolve at the LOD's distance. Nehmé et al. found texture size above
 ~712² barely mattered on their stimuli, which suggests substantial slack.
 
 **Cost/risk.** Low (about 100 lines plus a host hook). Risk: density discontinuities between
-adjacent charts can show as a texture-sharpness seam. Limit the ratio between neighbours
+adjacent charts can show as a texture-sharpness seam. Limit the ratio between neighbors
 (e.g. ≤ 2×). This is a **heuristic, unverified** rule.
 
 **Absorbed?** Partly. Signal-specialized parametrization and visibility-guided ideas exist. The
@@ -443,7 +443,7 @@ smooth offset or inflation, which is useful for conservative proxies, and penali
 filling and ridge loss. Projection back to the source can then accept a smooth bias to avoid
 high-frequency noise. For QEM, a Laplacian-difference attribute is possible but expensive.
 
-**Why it might help.** It favours proxies that keep relief structure over ones that minimize
+**Why it might help.** It favors proxies that keep relief structure over ones that minimize
 Hausdorff. **Uncertain**: the perceptual ambiguity result is about pictorial relief *without*
 reference. In side-by-side or popping comparisons, absolute differences become visible again.
 So use it for the far proxy LODs only.
@@ -509,7 +509,7 @@ switch rules for impostors are not common practice as far as I know.
     random and curvature models significantly (18 participants).
   - Lavoué, Cordier, Seo, Larabi 2018, *Visual Attention for Rendered 3D Shapes*, CGF/EG
     ([PDF](https://perso.liris.cnrs.fr/guillaume.lavoue/revue/EG2018.pdf)):
-    - a **centre-bias model beat all four mesh-saliency models**;
+    - a **center-bias model beat all four mesh-saliency models**;
     - the best methods do not exceed 0.50 linear correlation / 0.76 AUC;
     - attention goes to faces and semantic features, large protrusions, holes, small details on
       smooth areas, and specular highlights;
@@ -542,4 +542,4 @@ switch rules for impostors are not common practice as far as I know.
 
 Uncertain or derived claims are marked inline. The θ/π silhouette probability, the √w texel
 rule and the impostor frame-count rule are my derivations from standard geometry and
-optimisation, not published results.
+optimization, not published results.

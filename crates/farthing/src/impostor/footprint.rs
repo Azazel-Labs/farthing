@@ -74,7 +74,7 @@ impl Default for FootprintOptions {
 /// The measured patch of one surfel.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SurfelFootprint {
-    /// Area-weighted centroid of the patch (the splat centre).
+    /// Area-weighted centroid of the patch (the splat center).
     pub center: Vec3,
     /// Unit area-weighted mean normal (the surfel's own normal if the patch is empty or its
     /// normals cancel).
@@ -147,7 +147,7 @@ pub struct ChannelSpec {
     /// Values per sample (1..=16).
     pub components: u8,
     /// The last component is coverage alpha (alpha-tested leaves): the other components are
-    /// averaged weighted by it, so transparent texels don't bleed their colour, and the alpha
+    /// averaged weighted by it, so transparent texels don't bleed their color, and the alpha
     /// itself is the plain area-weighted mean.
     pub alpha_weighted: bool,
 }
@@ -496,7 +496,7 @@ where
     })?;
     red.flush(&mut eval);
     // Single-point fallback for surfels without samples (and, for alpha-weighted channels,
-    // the colour of surfels whose patch is fully transparent).
+    // the color of surfels whose patch is fully transparent).
     let lonely: Vec<usize> = (0..n)
         .filter(|&i| red.wsum[i] <= 0.0 || (red.alpha && red.wa[i] <= 0.0))
         .collect();
@@ -881,7 +881,7 @@ mod tests {
         }
     }
 
-    /// Alpha-tested texels: the colour average ignores transparent texels, the alpha is the
+    /// Alpha-tested texels: the color average ignores transparent texels, the alpha is the
     /// covered fraction.
     #[test]
     fn alpha_weighted_channels_skip_transparent_texels() {

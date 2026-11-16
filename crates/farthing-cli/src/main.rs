@@ -145,7 +145,7 @@ enum Cmd {
         hemisphere: bool,
         #[arg(long, default_value_t = 128)]
         resolution: u32,
-        /// Rings of neighbours kept around visible triangles when culling.
+        /// Rings of neighbors kept around visible triangles when culling.
         #[arg(long, default_value_t = 1)]
         rings: usize,
     },
@@ -276,8 +276,8 @@ enum Cmd {
     },
     /// Foliage / distant proxy as Gaussian splats: blue-noise surfels written as a 3DGS .ply
     /// (progressive order: any prefix is a coarser covering). Each splat takes the shape,
-    /// normal and coverage (opacity) of the patch of surface it stands for, coloured with the
-    /// vertex colours averaged over that patch.
+    /// normal and coverage (opacity) of the patch of surface it stands for, colored with the
+    /// vertex colors averaged over that patch.
     Splats {
         input: PathBuf,
         #[arg(short, long)]
@@ -287,7 +287,7 @@ enum Cmd {
         /// Write only the first N splats of the cloud (a coarser level), shaped for that level.
         #[arg(long)]
         prefix: Option<usize>,
-        /// Old fixed-size mode: round splats at half the surfel radius, fixed opacity, colour
+        /// Old fixed-size mode: round splats at half the surfel radius, fixed opacity, color
         /// from one point per surfel.
         #[arg(long)]
         round: bool,

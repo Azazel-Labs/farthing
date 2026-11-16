@@ -61,7 +61,7 @@ This is not legal advice.
   464:575-578, 2010 ([PDF](https://irvinelab.uchicago.edu/papers/nature08906.pdf)).
   - Depletion attraction scales with the overlap of the particles' excluded-volume shells.
   - The paper's words: "surfaces that fit together maximize the overlap of excluded volume
-    and their binding is thus favoured."
+    and their binding is thus favored."
   - So the physics selects shape-complementary (concave-into-convex) binding because it
     maximizes shell overlap.
 
@@ -74,12 +74,12 @@ which is exactly lock-and-key binding.
 1. **Free-space search that is not a skyline.** Keep an occupancy bitboard: one `u64` per 64
    columns per row. The chart masks already exist (`ChartMask`).
    - Generate candidate offsets from three sources:
-     - (a) the current skyline positions, which keep today's behaviour as a baseline;
+     - (a) the current skyline positions, which keep today's behavior as a baseline;
      - (b) concave pockets: local maxima of an exact Euclidean distance transform of free
        space;
      - (c) a seeded random sample, as xatlas does.
    - Prune with a "pole" test, the same trick sparrow and jagua-rs use (see idea 2). Precompute
-     each chart's pole of inaccessibility (centre and inscribed radius r). An offset survives
+     each chart's pole of inaccessibility (center and inscribed radius r). An offset survives
      only if the free-space distance transform at the pole's landing pixel is at least r. That
      is one lookup.
    - Then run an exact overlap test row by row: `AND` plus early exit. This per-candidate test
@@ -339,7 +339,7 @@ borderline pairs.
 - **Tissue rigidity.** Bi, Lopez, Schwarz & Manning, "A density-independent rigidity transition
   in biological tissues", Nature Physics 2015 ([arXiv 1409.0593](https://arxiv.org/pdf/1409.0593)).
   - Whether a confluent tissue is solid or fluid is controlled by the energy barriers to T1
-    (neighbour-exchange) transitions, not by density.
+    (neighbor-exchange) transitions, not by density.
 
 **Mechanism.** A system stuck because every local move violates a hard constraint becomes
 mobile when a second, connectivity-changing move class is added, or when the hard constraint
@@ -381,7 +381,7 @@ the schedule, which is to add a second move class exactly when the first jams.
 formulations in topology optimization", SMO 2011
 ([DTU Orbit](https://orbit.dtu.dk/en/publications/on-projection-methods-convergence-and-robust-formulations-in-topo/)).
 Analytical rules linking filter radius and thresholds to minimum solid and void sizes are in
-Fernández et al. 2021 ([arXiv 2101.08605](https://arxiv.org/pdf/2101.08605)). Bone remodelling
+Fernández et al. 2021 ([arXiv 2101.08605](https://arxiv.org/pdf/2101.08605)). Bone remodeling
 is the biological analogue (Wolff's law) of the same density-filter idea.
 
 **Mechanism.** Filter a density field with a radius-R kernel, then project it at three
@@ -435,7 +435,7 @@ These come from background knowledge and were not individually re-verified this 
   "pleats"): the insight that curvature is screened by defects is the same as cone placement
   (Ben-Chen 2008, BFF). Nothing extra for farthing.
 - **Leaf venation and space colonization** (Runions et al. 2005): graphics already uses it,
-  for growth modelling, not LOD.
+  for growth modeling, not LOD.
 - **Phyllotaxis, scutoids, epithelial Voronoi packing, Cellpose flow-field segmentation:** no
   concrete advantage over existing chart growing or watershed segmentation.
 - **Lubachevsky-Stillinger growth packing:** a special case of idea 2.

@@ -543,7 +543,7 @@ fn lscm_or_split(
         .collect()
 }
 
-/// Merges neighbouring charts while the union still flattens without overlap and within the
+/// Merges neighboring charts while the union still flattens without overlap and within the
 /// stretch limit. Pairs are ranked by shared seam length relative to the smaller perimeter;
 /// each pass evaluates a matching of pairs in parallel, so the result does not depend on the
 /// thread count. Fewer charts means shorter seams and less packing padding.

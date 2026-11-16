@@ -7,7 +7,7 @@
 //!
 //! * **Footprint splats** (with [`SurfelFootprint`]s from
 //!   [`surfel_footprints`](super::footprint::surfel_footprints)): each Gaussian takes the
-//!   shape of the patch of surface its surfel stands for. It is centred on the patch
+//!   shape of the patch of surface its surfel stands for. It is centered on the patch
 //!   centroid, its tangent sigmas and rotation come from the patch's second moments (a leaf
 //!   strip gives a stretched splat along the strip), its thickness from the patch's normal
 //!   spread, and its opacity from the fraction of the footprint actually covered by surface,
@@ -16,10 +16,10 @@
 //!   radius, at fixed opacity, rotated so its two wide axes lie in the surfel's tangent plane
 //!   and its thin axis along the normal (a 2D-Gaussian-Splatting-style disc).
 //!
-//! Colour is spherical-harmonics degree 0 from a host-evaluated [`SurfelChannel`] (albedo, or
+//! Color is spherical-harmonics degree 0 from a host-evaluated [`SurfelChannel`] (albedo, or
 //! lit radiance if the host baked lighting in): evaluated at each surfel's point, or averaged
 //! over its patch with [`average_surfel_channel`](super::footprint::average_surfel_channel).
-//! farthing places and shapes the splats; the colours are the host's.
+//! farthing places and shapes the splats; the colors are the host's.
 //!
 //! The cloud's progressive order is kept, so the first `k` splats are a coarser even covering,
 //! as for the discs: with sigmas grown by
@@ -32,14 +32,14 @@ use super::surfels::{Surfel, SurfelChannel};
 use crate::{Error, Result};
 use glam::{Mat3, Quat, Vec3};
 
-/// SH degree-0 basis constant: colour = 0.5 + C0 · f_dc.
+/// SH degree-0 basis constant: color = 0.5 + C0 · f_dc.
 const SH_C0: f32 = 0.282_094_8;
 
 /// How surfels become Gaussians.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SplatOptions {
     /// Round splats: tangent-plane sigma as a fraction of the surfel radius. 0.5 puts the disc
-    /// edge at 2σ, where neighbouring splats overlap enough to leave no holes on an even
+    /// edge at 2σ, where neighboring splats overlap enough to leave no holes on an even
     /// covering.
     pub sigma_scale: f32,
     /// Footprint splats: tangent sigmas as a multiple of the patch's. A patch's own sigmas
@@ -50,7 +50,7 @@ pub struct SplatOptions {
     /// degenerate, which some renderers reject). Footprint splats are thicker where the
     /// patch's normals spread.
     pub thickness: f32,
-    /// Peak opacity, multiplied by the footprint coverage (footprint splats) and by the colour
+    /// Peak opacity, multiplied by the footprint coverage (footprint splats) and by the color
     /// channel's alpha when it has four components (alpha-tested leaves).
     pub opacity: f32,
     /// Extra size multiplier, e.g. [`SurfelCloud::lod`](super::surfels::SurfelCloud::lod)'s
@@ -78,14 +78,14 @@ pub struct Splat {
     /// Standard deviations along the rotated x, y (tangent) and z (normal) axes.
     pub sigma: Vec3,
     pub rotation: Quat,
-    /// Linear 0..1 colour.
+    /// Linear 0..1 color.
     pub color: Vec3,
     pub opacity: f32,
 }
 
 /// Gaussians for `surfels`: shaped by `footprints` when given (one per surfel, see the module
-/// docs), round otherwise. Coloured from `color` (unorm8 RGB or RGBA per surfel, in cloud
-/// order; mid grey without one).
+/// docs), round otherwise. Colored from `color` (unorm8 RGB or RGBA per surfel, in cloud
+/// order; mid gray without one).
 pub fn surfels_to_splats(
     surfels: &[Surfel],
     footprints: Option<&[SurfelFootprint]>,
@@ -104,13 +104,13 @@ pub fn surfels_to_splats(
     if let Some(c) = color {
         if !(3..=4).contains(&c.components) {
             return Err(Error::InvalidInput(format!(
-                "splat colour channel `{}` has {} components (need 3 or 4)",
+                "splat color channel `{}` has {} components (need 3 or 4)",
                 c.name, c.components
             )));
         }
         if c.data.len() < surfels.len() * c.components as usize {
             return Err(Error::InvalidInput(format!(
-                "splat colour channel `{}` covers {} surfels, the cloud has {}",
+                "splat color channel `{}` covers {} surfels, the cloud has {}",
                 c.name,
                 c.data.len() / c.components as usize,
                 surfels.len()
@@ -183,8 +183,8 @@ fn footprint_splat(f: &SurfelFootprint, rgb: Vec3, a: f32, opts: &SplatOptions) 
 
 /// The standard 3DGS binary `.ply` (little endian; x y z, nx ny nz, f_dc_0..2, opacity,
 /// scale_0..2, rot_0..3 with rot_0 = w). Scales are stored as ln σ, opacity as its logit and
-/// colour as SH degree-0 coefficients, as the reference renderer expects. No higher SH bands
-/// (view-independent colour), which every common viewer accepts.
+/// color as SH degree-0 coefficients, as the reference renderer expects. No higher SH bands
+/// (view-independent color), which every common viewer accepts.
 pub fn write_splat_ply(splats: &[Splat]) -> Vec<u8> {
     let mut out = format!(
         "ply\nformat binary_little_endian 1.0\ncomment farthing surfel splats\nelement vertex {}\n",
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn short_colour_channels_are_rejected() {
+    fn short_color_channels_are_rejected() {
         let s = [surfel(Vec3::ZERO, Vec3::Z, 1.0); 2];
         let c = SurfelChannel {
             name: "albedo".into(),

@@ -20,7 +20,7 @@ W2 and W4 where a real transfer exists.
   filling voxels.
 - `crates/farthing/src/reduce/simplify.rs` (around lines 567-596): both endpoints of any edge shared
   by more than 2 triangles are locked, and so are border vertices of degree >2. The link check
-  (around lines 1055-1084) is the manifold version: it compares common neighbours with shared
+  (around lines 1055-1084) is the manifold version: it compares common neighbors with shared
   triangles.
 
 These points come up again in the ideas below.
@@ -283,7 +283,7 @@ summary by Dey, Hirani, Krishnamoorthy, Smith, *Edge Contractions and Simplicial
 cheaper per-dimension "p-link conditions" that preserve specific homology groups.
 
 **Mechanism.** Contract edge ab only if Lk(a) ∩ Lk(b) = Lk(ab), checked at every level:
-- vertices: common neighbours of a and b are exactly the apexes of triangles on ab;
+- vertices: common neighbors of a and b are exactly the apexes of triangles on ab;
 - edges: no edge xy with both triangles axy and bxy present;
 - boundary: handled with a dummy vertex joined to the boundary.
 
@@ -312,7 +312,7 @@ topological control. The general link condition is a principled middle ground.
 
 **Cost/risk.**
 - Low to medium. The vertex-level check already exists; the edge-level check is another marker pass
-  over the neighbours' fans.
+  over the neighbors' fans.
 - The real risk is the attribute/wedge mapping (`map_wedges`) around non-manifold fans, and the
   flip test at a non-manifold edge, where "the" normal is ambiguous. Run the flip test per incident
   fan.
@@ -328,7 +328,7 @@ version to game-asset LOD is uncommon as far as I could find, but the math is 25
 **Sources.**
 - Digital topology: Bertrand & Malandain, *A new characterization of three-dimensional simple
   points*, Pattern Recognition Letters 1994. A voxel is *simple* if flipping it changes no topology,
-  decidable from its 26-neighbourhood.
+  decidable from its 26-neighborhood.
 - Topology-preserving level sets: Han, Xu, Prince, *A topology preserving level set method for
   geometric deformable models*, IEEE TPAMI 2003.
 - Ségonne, *Active contours under topology control — genus preserving level sets*, IJCV 2008
@@ -356,7 +356,7 @@ version to game-asset LOD is uncommon as far as I could find, but the math is 25
   classes the user asked for (Ségonne's idea).
 - (c) For handles, compute the saddle-saddle persistence pairs of the SDF (Discrete Morse Sandwich
   is the fast route). Pair (s1, s2) with small persistence is a handle or tunnel whose thickness is
-  set by the pair's values. Kill it either with the Kissi et al. optimisation, or (simpler, Wood
+  set by the pair's values. Kill it either with the Kissi et al. optimization, or (simpler, Wood
   et al. style) by filling or cutting along the shortest loop.
 
 The result is a W7 control surface:
@@ -486,7 +486,7 @@ must be turned back into a distance field *without moving its zero crossing*. Le
 do this as follows:
 - Russo & Smereka, *A remark on computing distance functions*, J. Comput. Phys. 2000
   ([record](https://portal.mardi4nfdi.de/wiki/Publication:1587862)): the "subcell fix" uses the
-  interface location implied by the neighbours to keep the zero set fixed during re-initialization.
+  interface location implied by the neighbors to keep the zero set fixed during re-initialization.
 - Zhao, *A fast sweeping method for Eikonal equations*, Math. Comp. 2005
   ([doi](https://www.doi.org/10.1090/S0025-5718-04-01678-3)): O(N) Gauss–Seidel sweeps in 2^d
   orderings. It is deterministic and branch-light, unlike heap-based fast marching.

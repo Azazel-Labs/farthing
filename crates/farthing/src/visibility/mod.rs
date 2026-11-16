@@ -191,7 +191,7 @@ impl VisibilityResult {
     }
 }
 
-/// Removes triangles no view saw, keeping `grow_rings` rings of neighbours around visible
+/// Removes triangles no view saw, keeping `grow_rings` rings of neighbors around visible
 /// ones. Every instance gets its own mesh in the output. Returns the scene and the number of
 /// triangles removed.
 pub fn cull_invisible(scene: &Scene, vis: &VisibilityResult, grow_rings: usize) -> (Scene, usize) {

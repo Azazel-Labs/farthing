@@ -5,7 +5,7 @@
 //! box, plus a cheap attribute term: the area-weighted squared distance between each of p's
 //! wedges and the q wedge it maps to (normals, UVs, colors). Each pass rebuilds a flat
 //! position→triangle index, costs every edge in its cheaper allowed direction, sorts the
-//! candidates once, and collapses them in cost order, at most one collapse per neighbourhood
+//! candidates once, and collapses them in cost order, at most one collapse per neighborhood
 //! per pass, up to a cost limit. There is no candidate heap and no incremental re-ranking:
 //! everything is linear passes over flat arrays. Border vertices slide along their border and
 //! junction vertices along their non-manifold junction (duplicated double-sided faces count
@@ -317,7 +317,7 @@ pub(crate) fn simplify_fast(
             break;
         }
         // Near an aggressive target, parts whose removal moves the surface less than a quarter of
-        // the deviation collapses have accepted go (the full reducer's rule); analysed on first
+        // the deviation collapses have accepted go (the full reducer's rule); analyzed on first
         // need.
         if let Some(t) =
             target.filter(|&t| opts.remove_parts && alive_tris <= 4 * t && 10 * t <= nt)
@@ -881,7 +881,7 @@ impl St {
             let mut moved = Vec::new();
             for k in s..e {
                 let t = self.list[k] as usize;
-                // Dead now (shared with q) or alive: both still list p's border neighbours.
+                // Dead now (shared with q) or alive: both still list p's border neighbors.
                 for &r in &self.tp[t] {
                     if r != p && self.border_edges.remove(&ekey(p, r)) && r != q {
                         moved.push(r);

@@ -353,7 +353,7 @@ pub fn reduce_quads(input: &QuadMesh, opts: &QuadReduceOptions) -> Result<QuadRe
         }
         let vquads = |v: u32| &vq[vstart[v as usize] as usize..vstart[v as usize + 1] as usize];
         // Never take a ring dearer than the cap-th cheapest: rings blocked this pass by a
-        // neighbour wait for the next pass instead of letting dearer ones through.
+        // neighbor wait for the next pass instead of letting dearer ones through.
         let limit = cands.get(cap - 1).map_or(f64::INFINITY, |c| c.0) * (1.0 + 1e-4) + 1e-30;
         let open = cands
             .iter()
@@ -364,10 +364,10 @@ pub fn reduce_quads(input: &QuadMesh, opts: &QuadReduceOptions) -> Result<QuadRe
         cands.truncate(open);
         // Rings are taken serially in cost order. Validity depends only on the mesh as it
         // stands at the start of the pass (nothing changes until the pass is applied), so it is
-        // checked in parallel for blocks of the next rings not yet blocked by a neighbour; the
+        // checked in parallel for blocks of the next rings not yet blocked by a neighbor; the
         // block size only decides how much checking is wasted, never the result.
         let hood_of = |ring: &Ring| {
-            // Neighbourhood: every quad touching a rung vertex.
+            // Neighborhood: every quad touching a rung vertex.
             let mut hood: Vec<u32> = ring
                 .rungs
                 .iter()
@@ -388,7 +388,7 @@ pub fn reduce_quads(input: &QuadMesh, opts: &QuadReduceOptions) -> Result<QuadRe
         let mut left = qm.quad_count();
         let mut cands = cands.into_iter().peekable();
         'pass: while cands.peek().is_some() {
-            // The next block of rings: neighbourhoods in parallel, then those already blocked
+            // The next block of rings: neighborhoods in parallel, then those already blocked
             // are dropped, then the rest are checked in parallel.
             let next: Vec<(f64, Ring)> = cands.by_ref().take(block).collect();
             let hoods: Vec<Vec<u32>> = next
@@ -487,7 +487,7 @@ pub fn reduce_quads(input: &QuadMesh, opts: &QuadReduceOptions) -> Result<QuadRe
 }
 
 /// Per-thread scratch for [`ring_valid`]: vertex and quad arrays stamped per call, so a
-/// check costs time in the size of its neighbourhood, not of the mesh.
+/// check costs time in the size of its neighborhood, not of the mesh.
 #[derive(Default)]
 struct Scratch {
     stamp: u32,

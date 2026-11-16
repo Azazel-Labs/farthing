@@ -12,7 +12,7 @@
 //
 // Layered impostors (frames.w = 2) bind a second pair of atlases: per frame, the nearest
 // front-facing surface behind the first (depth peeling). The march takes whichever layer the
-// ray reaches first, so surfaces a neighbouring view uncovers are drawn instead of stretched.
+// ray reaches first, so surfaces a neighboring view uncovers are drawn instead of stretched.
 // Single-layer impostors bind the first pair twice and set frames.w = 1.
 
 struct Impostor {
@@ -134,7 +134,7 @@ fn sample_frame(cell: vec2<f32>, ray_o: vec3<f32>, ray_d: vec3<f32>, n: f32) -> 
     let right = normalize(cross(-d, up));
     let true_up = cross(right, -d);
     // March the ray through the frame's height field (relief mapping): the surface sits h above
-    // the capture plane (normal atlas alpha = h / radius * 0.5 + 0.5) where the colour alpha
+    // the capture plane (normal atlas alpha = h / radius * 0.5 + 0.5) where the color alpha
     // says the texel is covered. Step from where the ray enters the slab |height| <= r to where
     // it leaves, take the first step that passes below the surface, then bisect. Unlike a
     // fixed-point iteration this does not jump across depth discontinuities, which left gaps.
@@ -149,7 +149,7 @@ fn sample_frame(cell: vec2<f32>, ray_o: vec3<f32>, ray_d: vec3<f32>, n: f32) -> 
     var hi = t0;
     let steps = 16;
     // A height field is solid all the way down; treat it as a shell instead, so rays passing
-    // behind the front surface of a neighbouring frame (near silhouettes) do not hit the
+    // behind the front surface of a neighboring frame (near silhouettes) do not hit the
     // extrusion. The shell is 2.5 march steps thick so steps cannot skip it (2–4 steps tested;
     // 2.5 balanced close and distant views best).
     let shell = 5.0 * r / f32(steps);

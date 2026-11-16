@@ -22,7 +22,7 @@ binaries, headers, samples or plugins were used, inspected or traced.
 | | Batched rounds of non-conflicting collapses (independent-set decimation) | cf. DeCoro & Tatarchuk, *Real-time Mesh Simplification Using the GPU*, I3D 2007; Papageorgiou & Platis, *Triangular Mesh Simplification on the GPU*, The Visual Computer 2015. The freshness rule for skipping re-evaluation is farthing's own |
 | | Lazy re-ranking with monotone lower bounds | Standard lazy-greedy evaluation (cf. Minoux, *Accelerated Greedy Algorithms*, 1978) |
 | | Area-weighted (unnormalized) error ranking, area-scaled normal term, constraint planes without normalization weight | farthing's own choices, selected by the benchmark in `bench-compare/` (see docs/BENCHMARKS.md) |
-| `farthing::reduce::optimize` | Linear-speed vertex cache optimisation | Forsyth, *Linear-Speed Vertex Cache Optimisation*, 2006 |
+| `farthing::reduce::optimize` | Linear-speed vertex cache optimization | Forsyth, *Linear-Speed Vertex Cache Optimisation*, 2006 |
 | `farthing::bvh` | Binned SAH BVH | Wald, *On fast Construction of SAH-based Bounding Volume Hierarchies*, 2007 |
 | | Ray/triangle | Möller & Trumbore, *Fast, Minimum Storage Ray/Triangle Intersection*, 1997 |
 | | Closest point on triangle | Ericson, *Real-Time Collision Detection*, 2005, §5.1.5 |
@@ -64,7 +64,7 @@ binaries, headers, samples or plugins were used, inspected or traced.
 | `farthing::reduce` | Quad edge rings as union-find classes, walked per class | Union-find: Tarjan, *Efficiency of a Good But Not Linear Set Union Algorithm*, JACM 1975 |
 | | Deterministic parallel quadric setup (gather in triangle order) and speculative candidate evaluation | Own |
 | `snugly` | Hole-filling packer: bottom-left placement over per-column free intervals, branch and bound on a column-subsampled lower bound | Bottom-left placement: Baker, Coffman & Rivest, *Orthogonal Packings in Two Dimensions*, SIAM J. Comput. 1980; Chazelle, *The Bottom-Left Bin-Packing Heuristic*, IEEE TC 1983 |
-| `farthing::voxel` | Sub-voxel signed boundary: centre sign by angle-weighted pseudo-normals, confirmed by ray winding counts; thin-sheet and lone-sheet guards | Bærentzen & Aanæs, *Signed Distance Computation Using the Angle Weighted Pseudonormal*, IEEE TVCG 2005; ray crossing parity (classic point-in-polyhedron test); guards are own |
+| `farthing::voxel` | Sub-voxel signed boundary: center sign by angle-weighted pseudo-normals, confirmed by ray winding counts; thin-sheet and lone-sheet guards | Bærentzen & Aanæs, *Signed Distance Computation Using the Angle Weighted Pseudonormal*, IEEE TVCG 2005; ray crossing parity (classic point-in-polyhedron test); guards are own |
 | `farthing::reduce` | Parallel commits by deterministic reservations | Blelloch, Fineman, Gibbons & Shun, *Internally Deterministic Parallel Algorithms Can Be Fast*, PPoPP 2012 |
 | `farthing::reduce::fast` | Fast mode: f32 quadrics, sorted passes over all edges, part deletion on stall | Quadrics: Garland & Heckbert 1997; pass-based scheduling (sort candidate collapses by cost, apply non-conflicting ones in order) is standard independent-set decimation (see the batched-rounds row); attribute penalty Σ area·|Δattribute|² is own |
 | `farthing::reduce` | Visible-sample part removal error (rays from each sample must escape the other parts), transparent-material pass-through, error capped at gap + part size, protection on stall | Own; the visibility test is ambient-occlusion-style ray casting (cf. Zhukov, Iones & Kronin, *An Ambient Light Illumination Model*, 1998) |

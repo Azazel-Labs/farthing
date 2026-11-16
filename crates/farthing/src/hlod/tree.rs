@@ -1,7 +1,7 @@
 //! Nested HLOD cells: a level partitioned into a tree of proxies.
 //!
 //! [`build_hlod_tree`] assigns every instance to one cell of a loose octree (or quadtree) by
-//! the centre of its bounds, builds a proxy per leaf cell from its instances with the
+//! the center of its bounds, builds a proxy per leaf cell from its instances with the
 //! [`build_hlod`](super::build_hlod) pipeline, then a proxy per parent cell from its
 //! children's proxies (or from the source, see [`ParentSource`]). Instances too large for a
 //! cell go up to the first level whose cells are big enough. [`HlodTree::select`] picks, for a
@@ -18,7 +18,7 @@
 //! A node's [`error`](HlodNode::error) is a world-space deviation, in the same convention as
 //! [`crate::cluster`]: the proxy may replace the instances once
 //! [`LodView::projected`] of that error at the node's bounding sphere is at most the pixel
-//! threshold, that is beyond [`HlodNode::switch_distance`] from the sphere's centre. Built from
+//! threshold, that is beyond [`HlodNode::switch_distance`] from the sphere's center. Built from
 //! children, a parent's error is its own reduction error plus the largest child error. With
 //! [`HlodTreeOptions::texel_error`], one atlas texel (in world units) counts as error too, so
 //! a proxy is not drawn while its texels are larger than the pixel threshold. A node's error
@@ -290,7 +290,7 @@ pub fn build_hlod_tree_with(
     }
     let origin = flat(origin);
 
-    // Leaf cell of each instance's centre, and the level whose cells fit it.
+    // Leaf cell of each instance's center, and the level whose cells fit it.
     let mut coord0 = vec![[0u32; 3]; scene.instances.len()];
     let mut level = vec![0u32; scene.instances.len()];
     for &i in &placed {

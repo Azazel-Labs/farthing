@@ -47,7 +47,7 @@ pub struct SurfelOptions {
     /// Number of surfels.
     pub count: usize,
     /// Disc radius relative to the radius that would tile the area exactly once (above 1,
-    /// neighbouring discs overlap so no gaps show).
+    /// neighboring discs overlap so no gaps show).
     pub coverage: f32,
     /// Candidates generated per final surfel before elimination.
     pub candidates_per_surfel: usize,
@@ -217,7 +217,7 @@ fn eliminate(pts: &[Vec3], scale: Option<&[f32]>, n: usize, area: f64) -> Vec<us
 }
 
 /// [`eliminate`], also returning the indices in the order they were removed.
-/// `scale` (≥ 1 per point, optional) widens each point's neighbourhood: spacing grows with it,
+/// `scale` (≥ 1 per point, optional) widens each point's neighborhood: spacing grows with it,
 /// so a point at scale s ends up with about 1/s² the density (adaptive elimination).
 fn eliminate_ordered(
     pts: &[Vec3],
@@ -231,7 +231,7 @@ fn eliminate_ordered(
     }
     let sc = |i: usize| scale.map_or(1.0, |s| s[i]);
     let smax = scale.map_or(1.0, |s| s.iter().copied().fold(1.0f32, f32::max));
-    // Neighbourhood radius from the 2D Poisson disk packing density over the surface area.
+    // Neighborhood radius from the 2D Poisson disk packing density over the surface area.
     let rmax = (2.0 * (area / (2.0 * 3f64.sqrt() * n as f64)).sqrt()) as f32;
     let cell = (rmax * smax).max(1e-12);
     let key = |p: Vec3| -> (i32, i32, i32) {
@@ -245,7 +245,7 @@ fn eliminate_ordered(
     for (i, &p) in pts.iter().enumerate() {
         grid.entry(key(p)).or_default().push(i as u32);
     }
-    let neighbours = |i: usize, out: &mut Vec<(u32, f32)>| {
+    let neighbors = |i: usize, out: &mut Vec<(u32, f32)>| {
         out.clear();
         let p = pts[i];
         let (cx, cy, cz) = key(p);
@@ -255,7 +255,7 @@ fn eliminate_ordered(
                     if let Some(list) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
                         for &j in list {
                             if j as usize != i {
-                                // Distance in units of the pair's neighbourhood radius.
+                                // Distance in units of the pair's neighborhood radius.
                                 let r = rmax * 0.5 * (sc(i) + sc(j as usize));
                                 let d = (pts[j as usize] - p).length() / r;
                                 if d < 1.0 {
@@ -272,7 +272,7 @@ fn eliminate_ordered(
     let mut weight = vec![0.0f32; m];
     let mut nb = Vec::new();
     for i in 0..m {
-        neighbours(i, &mut nb);
+        neighbors(i, &mut nb);
         weight[i] = nb.iter().map(|&(_, d)| wfn(d)).sum();
     }
     // Max-heap by weight with lazy invalidation (ties broken by index for determinism).
@@ -303,7 +303,7 @@ fn eliminate_ordered(
         alive[i] = false;
         removed.push(i);
         left -= 1;
-        neighbours(i, &mut nb);
+        neighbors(i, &mut nb);
         for &(j, d) in &nb {
             let j = j as usize;
             if alive[j] {
@@ -408,7 +408,7 @@ pub struct DecodedSurfels {
     pub cloud: SurfelCloud,
     pub channels: Vec<SurfelChannel>,
     /// Footprints, when the stream carries them
-    /// ([`encode_with_footprints`](SurfelCloud::encode_with_footprints)). Each one's centre
+    /// ([`encode_with_footprints`](SurfelCloud::encode_with_footprints)). Each one's center
     /// and normal are its surfel's decoded position and normal.
     pub footprints: Option<Vec<SurfelFootprint>>,
     /// Surfel count of the whole stream.
@@ -427,7 +427,7 @@ const FLAG_RADII: u16 = 2;
 /// angle from [`tangent_basis`]'s `t` (u8, π ⁄ 256 steps), σx and σy (u8 each, log2 steps of
 /// 1/16 relative to the base radius, ×1/256 to ×256), thickness ⁄ σx (u8, square-root coded),
 /// coverage and normal spread (unorm8). The record's position and normal are then the
-/// footprint's centre and mean normal.
+/// footprint's center and mean normal.
 const FLAG_FOOTPRINT: u16 = 4;
 /// Bytes a footprint adds to each record.
 pub const FOOTPRINT_BYTES: usize = 6;
@@ -484,7 +484,7 @@ impl SurfelCloud {
 
     /// [`encode`](Self::encode) with a footprint per surfel (from [`surfel_footprints`] or
     /// [`footprints`](Self::footprints)), [`FOOTPRINT_BYTES`] more per record. The record
-    /// stores the footprint's centre and mean normal in place of the surfel's point and point
+    /// stores the footprint's center and mean normal in place of the surfel's point and point
     /// normal (the source triangle and barycentrics, if kept, still name the surfel's point).
     /// Footprints measured for the whole cloud describe the whole cloud: a decoded prefix can
     /// grow their sigmas by its radius scale, as it does the radii, or the host can measure
@@ -746,7 +746,7 @@ pub fn progressive_surfel_cloud(mesh: &Mesh, opts: &SurfelOptions) -> Result<Sur
 }
 
 /// Ranks points so every prefix is well spread: eliminate in stages (each halving the count,
-/// with the neighbourhood radius for that stage's size) down to one point, then reverse.
+/// with the neighborhood radius for that stage's size) down to one point, then reverse.
 fn progressive_order(pts: &[Vec3], scale: Option<&[f32]>, area: f64) -> Vec<usize> {
     let n = pts.len();
     let mut alive: Vec<usize> = (0..n).collect();
@@ -788,7 +788,7 @@ pub fn surfels_to_mesh(source: &Mesh, surfels: &[Surfel], sides: u32) -> Mesh {
         let v = n.cross(u);
         let tri = source.triangle(s.triangle as usize);
         let base = pos.len() as u32;
-        // Centre plus rim; the polygon's area matches the disc's.
+        // Center plus rim; the polygon's area matches the disc's.
         let rim = s.radius
             * (std::f32::consts::TAU
                 / (sides as f32 * (std::f32::consts::TAU / sides as f32).sin()))

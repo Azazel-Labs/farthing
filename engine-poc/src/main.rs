@@ -184,7 +184,7 @@ fn impostor_shot_mode(args: &[String]) -> Result<()> {
         }
         let atlas = &imp.atlas[channels::BASE_COLOR].image;
         atlas.save_png(out.join(format!("d{dpx}_atlas.png")), true)?;
-        // Colour + normal atlases, RGBA8 each, uncompressed.
+        // Color + normal atlases, RGBA8 each, uncompressed.
         let bytes = atlas.width as usize * atlas.height as usize * 4 * 2;
         let row = json!({"diameter_px": dpx, "frame_px": frame, "atlas_px": atlas.width, "atlas_bytes_rgba8_color_normal": bytes,
             "triangles": scene.triangle_count(), "psnr_db": diffs.iter().map(|d| d.psnr).collect::<Vec<_>>(),
@@ -200,7 +200,7 @@ fn impostor_shot_mode(args: &[String]) -> Result<()> {
 /// by slot index) from the standard views and prints PSNR / silhouette mismatch per file.
 /// Progressive surfels as continuous LOD on the bush: each prefix of one progressive cloud
 /// against a cloud generated for that count (relit PSNR against the mesh), and the image change
-/// between neighbouring LOD steps (popping) for both.
+/// between neighboring LOD steps (popping) for both.
 fn surfel_lod_mode() -> Result<()> {
     use farthing::impostor::surfels::{progressive_surfel_cloud, surfel_cloud, surfels_to_mesh, Surfel, SurfelCloud, SurfelOptions};
     let mut engine = Engine::new()?;

@@ -1,7 +1,7 @@
 //! Half-edge collapse simplification (v2).
 //!
 //! * Positions are welded internally; each input vertex is a *wedge* of its position.
-//!   Collapsing position P onto neighbour Q remaps every wedge of P to a wedge of Q found
+//!   Collapsing position P onto neighbor Q remaps every wedge of P to a wedge of Q found
 //!   through the triangles P and Q share. In [`SeamMode::Strict`] a wedge without a partner
 //!   rejects the collapse (seams never move off their line); in [`SeamMode::Permissive`] it maps
 //!   to Q's wedge with the cheapest attribute error, and the attribute quadrics price the
@@ -568,7 +568,7 @@ struct State<'a> {
     pos_alive: Vec<bool>,
     locked: Vec<bool>,
     border: Vec<bool>,
-    /// Border neighbours per position (open-border edges).
+    /// Border neighbors per position (open-border edges).
     bnbr: Vec<Vec<u32>>,
     quadric: Vec<Quadric>,
     attrs: AttrLayout,
@@ -768,7 +768,7 @@ impl<'a> State<'a> {
         let mut border = vec![false; np];
         let mut bnbr: Vec<Vec<u32>> = vec![Vec::new(); np];
         let mut border_degree = vec![0u32; np];
-        // Non-manifold junctions (edges shared by three or more triangles): neighbours along them.
+        // Non-manifold junctions (edges shared by three or more triangles): neighbors along them.
         let mut jnbr: Vec<Vec<u32>> = vec![Vec::new(); np];
         let mut k = 0;
         while k < edges.len() {
@@ -798,7 +798,7 @@ impl<'a> State<'a> {
             }
             // A junction vertex (not on an open border) may only collapse along the junction,
             // like a border vertex along its border: inside a junction curve it slides; at an end
-            // or a branch point it merges into a junction neighbour, which shortens or merges
+            // or a branch point it merges into a junction neighbor, which shortens or merges
             // junction curves (the link condition still guards topology). On a border too: put.
             if !jnbr[p].is_empty() && border[p] {
                 locked[p] = true;
@@ -1550,7 +1550,7 @@ impl<'a> State<'a> {
         Validity::Ok
     }
 
-    /// The link condition: p and q share no neighbours beyond the triangles they share.
+    /// The link condition: p and q share no neighbors beyond the triangles they share.
     fn link_ok(&self, p: u32, q: u32) -> bool {
         let mut s = self.scratch().borrow_mut();
         let s = &mut *s;
@@ -1559,7 +1559,7 @@ impl<'a> State<'a> {
         self.neighbors_into(p, &mut s.nbr_a, &mut s.mark, e1);
         s.epoch = s.epoch.wrapping_add(1);
         let e2 = s.epoch;
-        // Re-mark p's neighbours with e2 then count q's neighbours that carry e2.
+        // Re-mark p's neighbors with e2 then count q's neighbors that carry e2.
         for &x in &s.nbr_a {
             s.mark[x as usize] = e2;
         }
@@ -1584,7 +1584,7 @@ impl<'a> State<'a> {
     /// UV safety of collapsing p onto q, with the boundary drift it leaves in `out` as
     /// (wedge, drift) to record (see [`State::drift`]). For each wedge of p merging into a
     /// wedge of q on the same UV island, in every UV set: the moved triangles must not fold
-    /// over in UV, and where p sits on the island's boundary and q is its boundary neighbour,
+    /// over in UV, and where p sits on the island's boundary and q is its boundary neighbor,
     /// the boundary loses its corner at p. If that corner is reflex (the island wraps more than
     /// half way round p) the new edge cuts across texture outside the island: the gutter, which
     /// shows as white cracks. Such drift is summed per boundary and capped at [`DRIFT_UV`].
@@ -1643,7 +1643,7 @@ impl<'a> State<'a> {
             if !fan().any(|c| at_q(c.pa, c.a) || at_q(c.pb, c.b)) {
                 continue; // q's wedge is on another island: a tear, priced in the cost
             }
-            // A closed fan (every neighbour on both sides of p on this island) whose triangles
+            // A closed fan (every neighbor on both sides of p on this island) whose triangles
             // keep their winding is covered exactly once from q: only open fans can spill.
             let closed = fan()
                 .all(|c| fan().any(|d| d.pa == c.pb && same(set[d.a as usize], set[c.b as usize])));
@@ -2130,7 +2130,7 @@ impl<'a> State<'a> {
     }
 
     /// After collapsing `p` onto `q`: q's quadric and one-ring changed, so q is fully re-ranked.
-    /// A neighbour's other candidates keep their cost (half-edge collapse moves nothing), so it
+    /// A neighbor's other candidates keep their cost (half-edge collapse moves nothing), so it
     /// only needs the new or changed candidate x→q scored, unless its cached target died or was q.
     /// Validity is re-checked lazily when an entry reaches the top of the heap.
     fn refresh(&mut self, p: u32, q: u32, heap: &mut IndexedHeap) {
@@ -2268,7 +2268,7 @@ fn run_loop(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             StopWhen::All => tri_met || target.is_none(), // All: hit the triangle target first
         };
         if over && enforce {
-            continue; // dropped; a neighbourhood refresh may queue p again later
+            continue; // dropped; a neighborhood refresh may queue p again later
         }
         let partner = st.mirror.as_ref().and_then(|m| {
             let (mp, mq) = (m[p as usize], m[q as usize]);
@@ -2659,7 +2659,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             if over && enforce {
                 continue;
             }
-            // Neither endpoint's neighbourhood changed since validity was checked at ranking:
+            // Neither endpoint's neighborhood changed since validity was checked at ranking:
             // cost, wedge map and validity are all still exact.
             let at = checked_at[p as usize];
             let fresh = c.checked && touched[p as usize] < at && touched[q as usize] < at;
@@ -3475,7 +3475,7 @@ pub(crate) mod tests {
 
     #[test]
     fn permissive_seams_reach_target_where_strict_stalls() {
-        // Four UV islands meeting at the centre of a grid: the four-wedge centre vertex is
+        // Four UV islands meeting at the center of a grid: the four-wedge center vertex is
         // locked under strict seams.
         let g = grid(12);
         let mut pos = Vec::new();

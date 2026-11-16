@@ -560,7 +560,7 @@ fn proxy_textures(bake: &farthing::bake::BakeOutput) -> ExportTextures {
     tex
 }
 
-/// The scene tiled `n × n` on the xz plane (copy offsets centred on the original), plus the
+/// The scene tiled `n × n` on the xz plane (copy offsets centered on the original), plus the
 /// offsets.
 fn tiled_scene(scene: &Scene, n: u32) -> (Scene, Vec<Vec3>, f32) {
     let b = scene.bounds();

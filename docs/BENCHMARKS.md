@@ -300,7 +300,7 @@ What the speed work changed, and what it found:
 - **Batched collapse order (v5 default).** Instead of one collapse at a time from a priority
   queue, each round ranks candidates in parallel and takes the cheapest eighth. It executes
   them in cost order, each position at most once per round. A candidate is re-evaluated only
-  if an earlier collapse in the round touched its neighbourhood; otherwise its cached cost,
+  if an earlier collapse in the round touched its neighborhood; otherwise its cached cost,
   wedge map and validity are provably still exact. Changed positions are re-ranked in parallel
   between rounds, and a stalled round escalates (all candidates, then a full re-rank) before
   stopping. There is no heap. On the benchmark it matches or beats the exact greedy order on
@@ -314,7 +314,7 @@ What the speed work changed, and what it found:
   at runtime. The association order is fixed in the source, so the AVX2 and baseline builds
   give identical results (tested).
 - **Where time goes.** Callgrind cache and branch simulation shows the loop is bound by branch
-  mispredicts on short neighbour loops and by attribute-quadric cache misses, not by
+  mispredicts on short neighbor loops and by attribute-quadric cache misses, not by
   arithmetic. SIMD cut instructions by about 8% but wall time by only 3–4%. Compiling the whole
   loop for AVX2 with forced inlining was slower (instruction-cache pressure).
 - **Cluster-parallel reduction** (meshes ≥ 120k triangles): 32k-triangle Morton clusters are
@@ -426,7 +426,7 @@ parts. The default ratios are unchanged (2.19% / 0.187%). Raw rows:
 ### v15: junction branch points, fast-mode parity
 
 Junction endpoints and branch points (one or 3+ non-manifold edges, not on a border) may now
-collapse onto a junction neighbour, which shortens or merges junction curves. The link
+collapse onto a junction neighbor, which shortens or merges junction curves. The link
 condition still guards topology. The watch at 1% reaches 1,175 triangles (v14: 1,937). Fast
 mode now has the same handling as the default: twin faces count once, junction vertices
 slide, and stalled parts are removed by visible error with the target floor and protection.
@@ -633,7 +633,7 @@ What changed in v6 (v5 → v6 on the same eight assets: 4.2 s → 1.5 s):
   envelope Cholesky (reverse Cuthill–McKee order, contiguous rows, fixed-order dot products).
   This replaces thousands of conjugate-gradient iterations per chart, with a CG fallback for
   very large charts.
-- **Chart merging.** Neighbouring charts merge, longest shared seam first, while the union
+- **Chart merging.** Neighboring charts merge, longest shared seam first, while the union
   still flattens without overlap. A merge also has to keep per-chart L2 stretch ≤ 1.005 and
   fill its bounding rectangle at least as well as its worse part (or 70%). Each pass evaluates
   a matching of pairs in parallel, so the result is identical on any thread count.
@@ -794,24 +794,24 @@ except the Duck (+9%) and Avocado (+0.5%). At resolution 192 (3000 triangles), t
 0.398 / 0.0133, BoomBox 2.265 / 0.0149, Lantern 3.470 / 0.0773 and the dragon 1.399 / 0.0348.
 
 How it works (`crates/farthing/src/voxel/sdf.rs`). The flood still decides inside and outside
-for cells the source does not touch. A touched cell is now solid only if its centre is inside
+for cells the source does not touch. A touched cell is now solid only if its center is inside
 the source:
 
 1. **Sign.** The closest point's angle-weighted pseudo-normal (face, edge or vertex: Bærentzen
-   & Aanæs 2005) gives the sign, exact for closed, consistently wound meshes. A centre found
+   & Aanæs 2005) gives the sign, exact for closed, consistently wound meshes. A center found
    outside is carved only if none of three winding rays finds it enclosed. Each ray counts +1
    where it leaves a face and −1 where it enters. Inside a body, the closest face can belong
    to a nested or overlapping piece that faces outwards; the rays still see the body. Rays
    that leave through a hole of an open mesh count 0 or −1, never "enclosed". The dragon is
    open: 1.2% of its faces read as inverted and 4% as ambiguous.
-2. **No lost surface.** Surface samples at half-cell spacing each need a solid cell centre
+2. **No lost surface.** Surface samples at half-cell spacing each need a solid cell center
    behind them, within a cell, that lies inside a volume: an interior cell, or a boundary cell
    that all three rays find enclosed. Otherwise the cell stays solid. Sheets thinner than a cell
-   have no such centre and survive, where a signed-distance contourer loses them. On the dragon,
+   have no such center and survive, where a signed-distance contourer loses them. On the dragon,
    baby_shark's MC leaves 11,402 source samples more than half a cell outside its unreduced
    proxy; farthing leaves 1,541. The other side is where the dragon still trails: 55,990
    samples lie more than half a cell inside farthing's unreduced proxy (v11: 58,765;
-   baby_shark: 2,275). They sit in slots between pieces, where no cell centre falls in the gap.
+   baby_shark: 2,275). They sit in slots between pieces, where no cell center falls in the gap.
 3. **Lone sheets keep their slab.** A sample with no volume on either side keeps every boundary
    cell around it. Without this, the dragon's backdrop (an open sheet) thinned to a staircase
    that fell apart into islands, which the reducer then deleted (Hausdorff 1.87%).
@@ -826,7 +826,7 @@ Steps taken on the way, measured on the dragon (3000 triangles, Hausdorff / mean
 | + support only from volumes all rays agree on | 1.874 / 0.0406 | backdrop sheet thins and breaks up |
 | + lone sheets keep their slab (v12) | **1.402 / 0.0390** | Duck 0.471, Fox 0.451, Helmet 3.162 at 3000 |
 
-**v13: slot pass tried and reverted.** A second pass opened boundary cells whose centre is
+**v13: slot pass tried and reverted.** A second pass opened boundary cells whose center is
 inside but which touch air, hold facing walls, have a point of their 2×2×2 sub-grid outside the
 source, and keep volume behind every surface sample. It repeated so slots open from the mouth.
 Dragon unreduced forward error went 1.302 → 1.232%, but reduced it stayed at 1.402%. The Fox
@@ -842,10 +842,10 @@ cell, which conservative voxelization fills to their mouths. The worst sample is
 deep in a slot 0.15 cells wide. No closing is involved: with `close_gaps = 0` the counts are
 the same. A flood-unreachable pocket test (ray parity on enclosed air regions) found none.
 
-A guarded carving pass was tried. It carves solid cells whose centre lies outside the source:
-the closest point is inside a face, the centre is on the face's outer side, and there are facing
+A guarded carving pass was tried. It carves solid cells whose center lies outside the source:
+the closest point is inside a face, the center is on the face's outer side, and there are facing
 walls within a cell. A cell is carved only if every surface sample in it keeps a kept solid
-cell behind it among the 26 neighbours. Results:
+cell behind it among the 26 neighbors. Results:
 
 | variant | unreduced: worst / samples > ½ cell inside / outside | 3000 tris: Hausdorff / mean | ms |
 |---|---|---|---|
@@ -944,7 +944,7 @@ Visibility-weighted surfels beat the triangle LOD at every budget (+1.9 to +2.8 
 silhouette error or better), tie the voxel proxy at 1500 and beat it at 3000. They also keep
 the leafy look the proxy smooths into a blob: PSNR rewards that smoothing, so the table flatters
 the proxy. The proxy keeps the best silhouette and wins at 600, and in this test it carries a
-single material (its trunk is leaf-coloured; a real pipeline would bake it). Surfels are fast to
+single material (its trunk is leaf-colored; a real pipeline would bake it). Surfels are fast to
 make (0.01–0.1 s, against about 1 s for the LOD and 6 s for the fitted proxy). The PoC draws
 each disc as a 6-triangle fan through the ordinary mesh pipeline, opaque, so no blending is
 involved; a production renderer would draw one quad per disc.
@@ -955,7 +955,7 @@ and a perceptual metric instead of PSNR.
 ### Progressive order and streaming (v14)
 
 `progressive_surfel_cloud` orders the same surfels so every prefix is an even covering. It
-continues the weighted sample elimination in halving stages, each with the neighbourhood radius
+continues the weighted sample elimination in halving stages, each with the neighborhood radius
 for its target size, and reverses the elimination order. The runtime draws the first `k` at
 `radius_for(k)` and fades the next one in (`lod(k)` takes fractional `k`). Bush (3,000 leaves,
 visibility-weighted, 256 px views, relit, against the mesh):
@@ -1007,7 +1007,7 @@ standard views (close) and from three distant views with a long lens (far).
   iterations on the stored height, which jumped across depth discontinuities and left the dark
   gaps noted in the limitations. The shader now marches the view ray through each frame's
   height field (16 steps between the slab planes, then 5 bisection steps) and treats the height
-  field as a shell 2.5 steps thick rather than solid, so rays passing behind a neighbouring
+  field as a shell 2.5 steps thick rather than solid, so rays passing behind a neighboring
   frame's front surface near the silhouette no longer hit its extrusion (with a solid height
   field the far views got worse, 19.96 dB, and silhouettes grew). Shell thickness was swept from
   1.5 to 4 steps.
@@ -1090,7 +1090,7 @@ benchmark meshes. Scaling on 2 threads is weak (1.24× at 240k) because the walk
 table are memory-bound and these two vCPUs share caches. The union-find, the side-table
 numbering and the take-in-order loop are still serial.
 
-Without the per-pass cost cap, rings blocked by a neighbour let dearer ones through, and error
+Without the per-pass cost cap, rings blocked by a neighbor let dearer ones through, and error
 at 21,600 quads rose 55% (mean 0.082%); with it, quality matches or beats the one-at-a-time
 order except on the smallest mesh.
 
@@ -1239,9 +1239,9 @@ only. Unlike EA's US 9,978,176, nothing is decided by casting rays along normals
 
 `farthing::impostor::splats` (CLI: `farthing splats`) writes a progressive surfel cloud as a
 standard 3D Gaussian Splatting `.ply`: one flat Gaussian per surfel, with tangent σ at half the
-disc radius and normal σ at 5% of that, SH degree 0 colour from a host channel, and logit
+disc radius and normal σ at 5% of that, SH degree 0 color from a host channel, and logit
 opacity. The progressive order carries over: the first k splats, grown by `SurfelCloud::lod`'s
 radius scale, are a coarser even covering. These are placed, not optimized. There is no
-photometric training, so the colour is whatever the host evaluates at each surfel (albedo, or
+photometric training, so the color is whatever the host evaluates at each surfel (albedo, or
 baked lighting), and the result is view-independent.
 

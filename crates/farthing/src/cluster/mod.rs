@@ -4,9 +4,9 @@
 //! [`build_cluster_dag`] splits a mesh into clusters of at most `max_triangles` triangles and
 //! `max_vertices` vertices, then repeats:
 //!
-//! 1. group neighbouring clusters (by shared border, `group_size` per group);
+//! 1. group neighboring clusters (by shared border, `group_size` per group);
 //! 2. reduce each group to half its triangles with [`crate::reduce::simplify`], its border with
-//!    other groups locked, so neighbours still meet exactly;
+//!    other groups locked, so neighbors still meet exactly;
 //! 3. split the reduced group into new, coarser clusters.
 //!
 //! Groups whose border is locked at one level are interior at the next, so no edge stays
@@ -753,7 +753,7 @@ impl Ctx<'_> {
             }
         }
         drop(fill);
-        // Neighbours with shared-position counts. A position joins at most its first 16
+        // Neighbors with shared-position counts. A position joins at most its first 16
         // clusters (a vertex shared by hundreds of clusters says little about adjacency).
         let lists: Vec<Vec<(u32, u32)>> = (0..n as u32)
             .into_par_iter()
@@ -853,7 +853,7 @@ impl Ctx<'_> {
                         let pick = match best {
                             Some(b) => b.2,
                             None => {
-                                // No neighbour left: the nearest free cluster of the block.
+                                // No neighbor left: the nearest free cluster of the block.
                                 let near =
                                     sweep.iter().copied().filter(|c| !taken.contains(c)).min_by(
                                         |&a, &b| {

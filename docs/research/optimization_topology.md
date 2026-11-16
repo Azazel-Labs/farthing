@@ -61,7 +61,7 @@ appeared), so line references may drift.
 
 **Mechanism**
 - Compute the exact Euclidean distance d from the surface voxels.
-- Visit air voxels in decreasing d and union them with already-visited neighbours, using the elder
+- Visit air voxels in decreasing d and union them with already-visited neighbors, using the elder
   rule.
 - Each air pocket is born at its inscribed radius b and dies at the neck radius s where it joins the
   outside-seeded component. The voxel where the join happens is the neck's location.
@@ -151,12 +151,12 @@ documented Lantern failure. The change:
 
 1. Classify edges by face count: 1 = border, 2 = manifold, ≥3 = junction (keep the multiplicity).
 2. A vertex with exactly two incident junction edges of the *same multiplicity* becomes a
-   "junction-interior" vertex. Generalize `border`/`bnbr` to a "feature curve" class and neighbour
+   "junction-interior" vertex. Generalize `border`/`bnbr` to a "feature curve" class and neighbor
    list, so `valid()` allows p→q only along a junction edge.
 3. Endpoints and branch points (junction degree 1 or ≥3, or mixed multiplicity) stay locked, like
    today's border-degree > 2 rule.
 4. Extend the link check (the `common > shared` count in `valid()`) to the complex version:
-   - common neighbours of p and q must equal the opposite vertices of all triangles on pq (k of them
+   - common neighbors of p and q must equal the opposite vertices of all triangles on pq (k of them
      for a junction edge of multiplicity k);
    - common *edges* in the two links must be empty, the 1-dimensional part of Lk(ab).
 5. Add a junction-curve quadric: perpendicular planes per incident sheet, the same construction as

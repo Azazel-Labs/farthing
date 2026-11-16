@@ -1,6 +1,6 @@
 //! Reducer timing + golden hashes: `cargo run --release -p farthing --example bench_assets -- [-n RUNS] files...`
 //! Prints min-of-N wall time per (asset, ratio) and an FNV hash of the output mesh so layout and
-//! SIMD refactors can be checked for identical behaviour.
+//! SIMD refactors can be checked for identical behavior.
 use farthing::Mesh;
 use farthing::reduce::{SimplifyOptions, simplify};
 use std::time::Instant;

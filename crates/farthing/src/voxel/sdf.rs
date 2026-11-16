@@ -3,18 +3,18 @@
 //! Conservative voxelization makes every cell the surface touches solid, so the extracted
 //! shell sits up to a cell outside the source everywhere, and slots narrower than a cell fill
 //! to their mouths. Here each touched cell instead takes the sign of the source's signed
-//! distance at its centre, which puts the shell on the surface (as a signed-distance contourer
+//! distance at its center, which puts the shell on the surface (as a signed-distance contourer
 //! would). Three guards keep that safe on real assets:
 //!
 //! * **Sign.** Angle-weighted pseudo-normals at the closest point (Bærentzen & Aanæs,
 //!   *Signed Distance Computation Using the Angle Weighted Pseudonormal*, IEEE TVCG 2005).
-//!   A centre found outside is carved only if no winding ray finds it enclosed: inside a
+//!   A center found outside is carved only if no winding ray finds it enclosed: inside a
 //!   body, the closest face may belong to a nested or overlapping piece that faces outwards.
 //!   A ray leaving through a hole of an open source counts 0 or −1, never "enclosed".
 //! * **No lost surface.** Every surface sample (half-cell spacing) must keep a solid cell
-//!   centre behind it, within a cell, that lies inside a volume: an interior cell, or a
+//!   center behind it, within a cell, that lies inside a volume: an interior cell, or a
 //!   boundary cell that every winding ray finds enclosed. Otherwise its cell stays solid. A
-//!   sheet thinner than a cell has no such centre, so it survives, where a pure
+//!   sheet thinner than a cell has no such center, so it survives, where a pure
 //!   signed-distance contourer drops it.
 //! * **Lone sheets keep their slab.** A sample with no volume on either side (an open sheet
 //!   on its own) keeps every boundary cell around it, so the slab does not thin into a
@@ -118,7 +118,7 @@ const WINDING_DIRS: [Vec3; 3] = [
 ];
 
 /// Relabels the boundary cells of `solid` (those in `surface`, the cells the source touches)
-/// by the sign at their centre, with the guards in the module docs. Returns how many cells
+/// by the sign at their center, with the guards in the module docs. Returns how many cells
 /// became air.
 pub(crate) fn relabel_boundary(
     grid: &Grid,
@@ -129,7 +129,7 @@ pub(crate) fn relabel_boundary(
     let n = grid.len();
     let cell = grid.cell;
     let [nx, ny, nz] = grid.dims;
-    // Per boundary cell that is solid now: (centre inside, centre inside a volume for sure).
+    // Per boundary cell that is solid now: (center inside, center inside a volume for sure).
     // None: no surface within 1.5 cells.
     let inside: Vec<Option<(bool, bool)>> = (0..n)
         .into_par_iter()
@@ -142,7 +142,7 @@ pub(crate) fn relabel_boundary(
             let c = grid.center(x, y, z);
             let d = signed.distance(c, 1.5 * cell)?;
             let w = WINDING_DIRS.map(|dir| signed.bvh.ray_winding(c, dir));
-            // Outside by the closest face: confirmed only if no ray finds the centre
+            // Outside by the closest face: confirmed only if no ray finds the center
             // enclosed (a nested or overlapping piece can face outwards inside the body; a
             // ray leaving through a hole in an open source counts 0 or −1, never enclosed).
             // Inside for sure only if every ray agrees: behind a lone open sheet, rays that
@@ -152,11 +152,11 @@ pub(crate) fn relabel_boundary(
             Some((d < 0.0 || enclosed_any, d < 0.0 && enclosed_all))
         })
         .collect();
-    // A cell centre supports a surface sample if it is solid and inside a volume: interior
+    // A cell center supports a surface sample if it is solid and inside a volume: interior
     // cells (inside by the flood), or boundary cells inside for sure.
-    let centre_in = |j: usize| solid[j] && inside[j].is_none_or(|(_, sure)| sure);
+    let center_in = |j: usize| solid[j] && inside[j].is_none_or(|(_, sure)| sure);
     // Surface samples no farther apart than half a cell; a sample is supported if a cell
-    // centre within a cell of it, behind it, is inside.
+    // center within a cell of it, behind it, is inside.
     let tris = &signed.bvh.triangles;
     let unsupported: Vec<u32> = tris
         .par_iter()
@@ -198,12 +198,12 @@ pub(crate) fn relabel_boundary(
                                 let j = grid.idx(cx, cy, cz);
                                 let off = grid.center(cx, cy, cz) - p;
                                 // An interior cell (solid, untouched by the surface) or a
-                                // centre inside for sure means a volume is near: not a lone
+                                // center inside for sure means a volume is near: not a lone
                                 // sheet.
-                                if solid[j] && (!surface[j] || centre_in(j)) {
+                                if solid[j] && (!surface[j] || center_in(j)) {
                                     any_in = true;
                                 }
-                                if centre_in(j) && off.dot(nrm) < 0.0 && off.length() <= cell {
+                                if center_in(j) && off.dot(nrm) < 0.0 && off.length() <= cell {
                                     ok = true;
                                     break 'search;
                                 }

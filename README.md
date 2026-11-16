@@ -51,7 +51,7 @@ meshoptimizer's speed and still has lower distance and UV error (normals are sli
 farthing measures each level's worst-case deviation from the original and turns it into a
 switch distance: the point where that error is one pixel on a 1080p screen. You don't have to
 tune distances by eye. The farthest level here is a baked proxy, one new mesh with a new UV
-atlas and colour, normal and roughness/metal textures baked from the original. Most of its
+atlas and color, normal and roughness/metal textures baked from the original. Most of its
 difference is the glass visor, which an opaque proxy can't reproduce.
 
 ## UV atlases with fewer seams and less wasted texture
@@ -84,11 +84,11 @@ and marches depth for parallax.
 
 | | What it does | How |
 |---|---|---|
-| **Reduction** | LODs by ratio, triangle count, error bound or screen size, with a switch distance for each level | Attribute-aware quadric edge collapse (UVs, colours, normals, skin weights, morph targets), silhouette-weighted, with batched parallel rounds. UV seams are permissive or strict. Whole parts are removed when they stop being visible. Symmetry is detected and preserved. Includes a fast mode |
+| **Reduction** | LODs by ratio, triangle count, error bound or screen size, with a switch distance for each level | Attribute-aware quadric edge collapse (UVs, colors, normals, skin weights, morph targets), silhouette-weighted, with batched parallel rounds. UV seams are permissive or strict. Whole parts are removed when they stop being visible. Symmetry is detected and preserved. Includes a fast mode |
 | **Quad reduction** | Lowers quad meshes and keeps them all quads | Removes edge rings, ranked by quadric error, in linear time |
 | **Proxies** | Rebuilds a messy kitbash or scene as one closed, manifold mesh | Voxelization with sub-voxel signed boundaries, leak-aware gap sealing, surface nets, then reduction |
 | **UV atlases** | Fresh atlases for proxies and far LODs | LSCM + ARAP charts with exact overlap tests, split and merge under stretch limits, packed by `snugly` |
-| **Baking** | Moves colour, normal, roughness/metal and any custom channel onto the new mesh | farthing finds where each texel comes from on the source surface, and your engine shades it. Supersampled, dilated, MikkTSpace normals. Has a two-phase API for async GPUs |
+| **Baking** | Moves color, normal, roughness/metal and any custom channel onto the new mesh | farthing finds where each texel comes from on the source surface, and your engine shades it. Supersampled, dilated, MikkTSpace normals. Has a two-phase API for async GPUs |
 | **Cluster LOD** | Nanite-style cluster DAGs for per-cluster LOD on the GPU, crack-free for any camera | Meshlets (128 triangles, 255 vertices) grouped by shared border, each group reduced to half with its border locked, levels down to one root. Errors and bounds grow monotonically, so the select test runs per cluster with no traversal. Parallel, deterministic |
 | **HLOD** | Turns a whole area (buildings, props, terrain pieces) into one distant proxy with one atlas, or a whole level into a tree of nested cells | Camera-sampled hidden-surface removal, small parts kept whole, merge, then reduction or voxel remesh, unwrap, and a bake from the visible source only. Loose-octree cells, each parent built from its children, switch distances per node and a selection that covers every instance exactly once |
 | **Aggregation** | Merges many objects into one draw call | Material classes, island repacking by texel density, texel copy |
@@ -165,7 +165,7 @@ use farthing::Mesh;
 
 let mut mesh = Mesh::new(positions, indices);       // Vec<Vec3>, Vec<u32>
 mesh.normals = Some(normals);                       // all optional: normals, tangents,
-mesh.uvs = vec![uv0];                               // any number of UV sets, colours,
+mesh.uvs = vec![uv0];                               // any number of UV sets, colors,
 mesh.material_ids = vec![0; mesh.triangle_count()]; // skin weights, morph targets
 mesh.validate()?;
 ```
@@ -306,7 +306,7 @@ impl RenderHost for MyEngine {
     }
     fn bake_surface(&mut self, req: &SurfaceBakeRequest) -> farthing::Result<ChannelImages> {
         // One optional sample per texel: the source surface's world position, normal,
-        // tangent, both UV sets and vertex colour at that texel, and its material.
+        // tangent, both UV sets and vertex color at that texel, and its material.
         let mut color = Image::new(req.width, req.height, Vec4::ZERO);
         for (i, s) in req.samples.iter().enumerate() {
             if let Some(s) = s {
@@ -414,7 +414,7 @@ use farthing::impostor::{build_impostor, frame_size_for_screen, ImpostorKind};
 let frame = frame_size_for_screen(96.0);       // 96 px across when the impostor takes over
 let kind = ImpostorKind::Octahedral { frames_per_side: 12, hemisphere: false };
 let imp = build_impostor(&mut engine, &scene, &kind, frame, false)?;
-// imp.atlas: colour, normal and height atlases. imp.quad: the card.
+// imp.atlas: color, normal and height atlases. imp.quad: the card.
 // imp.params: serialize it next to the atlas for the shader.
 ```
 
@@ -430,7 +430,7 @@ Other kinds of impostor:
   `impostor::footprint`, each splat takes the shape of the patch of surface its surfel stands
   for: stretched along leaf strips, as opaque as the patch is covered (so coarse levels of
   sparse foliage stay see-through), and thicker and rougher where the normals spread.
-  Colours come from your engine, evaluated at each surfel's source point or averaged over its
+  Colors come from your engine, evaluated at each surfel's source point or averaged over its
   patch (`average_surfel_channel`).
 
 The reference shader is
@@ -486,7 +486,7 @@ use farthing::hlod::{build_hlod, HlodGeometry, HlodOptions};
 let hlod = build_hlod(&mut engine, &scene, &HlodOptions {
     target_triangles: Some(2000),
     geometry: HlodGeometry::Reduce,       // or HlodGeometry::Remesh(RemeshOptions { .. })
-    ..Default::default()                  // 64 cameras, 1024² atlas, colour + normal + ORM
+    ..Default::default()                  // 64 cameras, 1024² atlas, color + normal + ORM
 })?;
 // hlod.mesh: world-space proxy. hlod.bake: its textures. hlod.hidden_triangles: what was culled.
 ```
@@ -497,7 +497,7 @@ undersides go too.
 
 **Nested cells.** `build_hlod_tree` partitions a whole level and builds a tree of proxies, as
 world-partition HLOD layers do. Every instance goes to one cell of a loose octree (or a
-quadtree over XZ) by the centre of its bounds. Instances too large for a cell go up to the first
+quadtree over XZ) by the center of its bounds. Instances too large for a cell go up to the first
 level whose cells fit them. Each leaf cell gets a proxy of its instances, and each parent gets
 a proxy of its children's proxies (or of the source, with `ParentSource::Source`). Cells double
 in size per level, and so does the error budget. Every node gets the same triangle budget, at

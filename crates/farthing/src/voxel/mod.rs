@@ -55,7 +55,7 @@ pub struct RemeshOptions {
     pub target_triangles: Option<usize>,
     pub max_error: Option<f32>,
     pub hard_angle_deg: f32,
-    /// Boundary cells take the sign of the source's signed distance at their centre instead
+    /// Boundary cells take the sign of the source's signed distance at their center instead
     /// of being solid whenever the surface touches them, except where that would lose a sheet
     /// thinner than a cell. The shell then sits on the surface instead of up to a cell outside
     /// it, and slots narrower than a cell stay open. Needs a consistently oriented source.

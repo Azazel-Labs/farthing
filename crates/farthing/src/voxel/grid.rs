@@ -133,7 +133,7 @@ impl Grid {
             .collect()
     }
 
-    /// 6-neighbourhood dilation, `iterations` times.
+    /// 6-neighborhood dilation, `iterations` times.
     pub fn dilate(&self, mask: &[bool], iterations: usize) -> Vec<bool> {
         let mut m = mask.to_vec();
         for _ in 0..iterations {
@@ -147,7 +147,7 @@ impl Grid {
         m
     }
 
-    /// 6-neighbourhood erosion (grid boundary counts as empty).
+    /// 6-neighborhood erosion (grid boundary counts as empty).
     pub fn erode(&self, mask: &[bool], iterations: usize) -> Vec<bool> {
         let mut m = mask.to_vec();
         for _ in 0..iterations {
