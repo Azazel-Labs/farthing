@@ -4,9 +4,10 @@
 use farthing::image::Image;
 use farthing::io::{ExportTextures, glb_bytes, load_gltf_slice};
 use farthing::{Mesh, Scene};
+use farthing_demo_web::cook::TextureCompression;
 use farthing_demo_web::modes::ViewRequest;
 use farthing_demo_web::pipeline::{
-    Buffer, Demo, DemoMode, Event, LevelInfo, LevelKind, LodOptions, TextureMode,
+    Buffer, Demo, DemoMode, Event, LevelInfo, LevelKind, LodOptions, TextureMode, TextureShrink,
 };
 use glam::{Vec2, Vec3, Vec4};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -347,6 +348,186 @@ fn recut_keeps_every_triangle_then_reduces() {
     assert!(area(lod0) < area(full), "{lod0:?} vs {full:?}");
     let ratio = coarse[2].triangles as f32 / lod0.triangles as f32;
     assert!(ratio > 0.4 && ratio < 0.6, "{:?}", coarse[2]);
+}
+
+#[test]
+fn later_levels_shrink_their_textures() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let opts = LodOptions {
+        levels: 3,
+        shared_size: 512,
+        texture_shrink: TextureShrink::Halve,
+        texture_filter: "kaiser".into(),
+        texture_sharpen: 3,
+        ..Default::default()
+    };
+    let (levels, textures) = chain_levels(&mut demo, &opts);
+    // Original, then LOD0 with the full atlas and each reduction with its own at half the
+    // side of the one before, which its GLB carries.
+    let lod0 = &levels[1];
+    let (w, h) = (lod0.atlas_width.unwrap(), lod0.atlas_height.unwrap());
+    assert_eq!(lod0.texture_halvings, None);
+    for (k, l) in levels[1..].iter().enumerate() {
+        let k = k as u32;
+        assert_eq!(l.shared_textures, Some(l.level), "{l:?}");
+        assert_eq!(
+            (l.atlas_width, l.atlas_height),
+            (Some(w >> k), Some(h >> k))
+        );
+        assert_eq!(l.texture_halvings, (k > 0).then_some(k));
+        let sizes: Vec<_> = textures.iter().filter(|t| t.0 == l.level).collect();
+        assert_eq!(sizes.len(), 3, "{textures:?}");
+        assert!(sizes.iter().all(|t| (t.1, t.2) == (w >> k, h >> k)));
+    }
+    let bytes = |l: &LevelInfo| l.texture_bytes.unwrap();
+    assert!(bytes(&levels[2]) * 4 == bytes(&levels[1]));
+
+    // Fitting: LOD0 keeps the atlas, and later levels halve once their error spans texels,
+    // never growing back. The checker is coarse (about 10 texels a unit), so only steep
+    // steps get there.
+    let (fit, _) = chain_levels(
+        &mut demo,
+        &LodOptions {
+            texture_shrink: TextureShrink::Fit,
+            step: 0.2,
+            ..opts.clone()
+        },
+    );
+    let k: Vec<u32> = fit[1..]
+        .iter()
+        .map(|l| l.texture_halvings.unwrap_or(0))
+        .collect();
+    assert_eq!(k[0], 0);
+    assert!(
+        k.windows(2).all(|w| w[0] <= w[1]) && k[3] > 0,
+        "{k:?} {fit:?}"
+    );
+    let (keep, _) = chain_levels(
+        &mut demo,
+        &LodOptions {
+            texture_shrink: TextureShrink::Keep,
+            ..opts.clone()
+        },
+    );
+    assert!(
+        keep[1..]
+            .iter()
+            .all(|l| l.texture_halvings.is_none() && l.shared_textures == Some(1))
+    );
+
+    // Proxies bake each later level at half the side.
+    let (baked, _) = chain_levels(
+        &mut demo,
+        &LodOptions {
+            textures: TextureMode::Original,
+            bake_from: 2,
+            atlas: 512,
+            ..opts.clone()
+        },
+    );
+    let side = |l: &LevelInfo| l.atlas_width.unwrap().max(l.atlas_height.unwrap());
+    assert!(matches!(baked[3].kind, LevelKind::Baked));
+    assert!(
+        side(&baked[2]) <= 512 && side(&baked[3]) <= 256,
+        "{baked:?}"
+    );
+    assert_eq!(baked[3].texture_halvings, Some(1));
+}
+
+#[test]
+fn cooked_textures_ship_in_gpu_formats() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let opts = LodOptions {
+        levels: 2,
+        shared_size: 256,
+        texture_shrink: TextureShrink::Halve,
+        texture_compression: TextureCompression::Bc,
+        compression_effort: 2,
+        ..Default::default()
+    };
+    let (levels, textures) = chain_levels(&mut demo, &opts);
+    assert!(levels[0].cooked.is_none());
+    for l in &levels[1..] {
+        let c = l.cooked.as_ref().unwrap_or_else(|| panic!("{l:?}"));
+        assert_eq!(Some(c.level), l.shared_textures);
+        let formats: Vec<_> = c.textures.iter().map(|t| (t.channel, t.format)).collect();
+        assert_eq!(
+            formats,
+            [("base_color", "bc7"), ("normal", "bc5"), ("orm", "bc7")]
+        );
+        // 8 bits a texel against RGBA8's 32, mips on both sides (the smallest mips round up to
+        // whole 4x4 blocks, which counts in a 32-texel atlas).
+        let ratio = c.rgba_bytes as f64 / c.gpu_bytes as f64;
+        assert!((3.5..=4.0).contains(&ratio), "{c:?}");
+        assert!(
+            c.ktx2_bytes > 0 && c.ktx2_bytes <= c.gpu_bytes + 4096,
+            "{c:?}"
+        );
+        assert!(c.ship_bytes > c.ktx2_bytes);
+        let base = &c.textures[0];
+        // A red and white checker at effort 2, which skips most of BC7's partitioned modes: once
+        // the atlas is halved to a few dozen texels a side, nearly every block holds a chart or
+        // checker edge (effort 9 gains about 7 dB there).
+        let floor = if l.level == 1 { 30.0 } else { 20.0 };
+        assert!(base.psnr.is_none_or(|db| db > floor), "{base:?}");
+        assert!(c.textures[1].normal_error.unwrap() < 3.0, "{c:?}");
+        // The panel shows each carrier's decoded textures once; LOD1's follow the atlas bake's,
+        // which show as the atlas bakes.
+        let shown = textures.iter().filter(|t| t.0 == l.level).count();
+        let expect = match (c.level == l.level, l.level) {
+            (false, _) => 0,
+            (true, 1) => 6,
+            _ => 3,
+        };
+        assert_eq!(shown, expect, "{} {textures:?}", l.level);
+    }
+
+    // The download: the bare GLB, a manifest and a KTX2 per texture.
+    let zipped = demo.level_cooked(2).unwrap();
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(zipped)).unwrap();
+    let mut names: Vec<String> = (0..z.len())
+        .map(|i| z.by_index(i).unwrap().name().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "manifest.json",
+            "model.glb",
+            "textures/base_color.ktx2",
+            "textures/normal.ktx2",
+            "textures/orm.ktx2"
+        ]
+    );
+    let mut ktx = Vec::new();
+    std::io::Read::read_to_end(&mut z.by_name("textures/normal.ktx2").unwrap(), &mut ktx).unwrap();
+    assert_eq!(&ktx[..12], b"\xABKTX 20\xBB\r\n\x1A\n");
+    let mut glb = Vec::new();
+    std::io::Read::read_to_end(&mut z.by_name("model.glb").unwrap(), &mut glb).unwrap();
+    assert!(load_gltf_slice(&glb).is_ok());
+    assert!(demo.level_cooked(0).is_err());
+
+    // Mobile proxies: ETC2 color and data, EAC RG11 normals.
+    let (baked, _) = chain_levels(
+        &mut demo,
+        &LodOptions {
+            textures: TextureMode::Original,
+            bake_from: 2,
+            atlas: 128,
+            texture_compression: TextureCompression::Etc2,
+            ..opts.clone()
+        },
+    );
+    assert!(
+        baked[1].cooked.is_none(),
+        "reduced levels keep the original materials"
+    );
+    let c = baked[2].cooked.as_ref().unwrap();
+    assert_eq!(c.level, 2);
+    let formats: Vec<_> = c.textures.iter().map(|t| t.format).collect();
+    assert_eq!(formats, ["etc2-rgb", "eac-rg11", "etc2-rgb"]);
+    assert!(c.textures[1].normal_error.unwrap() < 3.0, "{c:?}");
+    assert!(demo.level_cooked(2).is_ok());
 }
 
 /// Runs the chain and returns each level's info and the size of each texture it emitted.

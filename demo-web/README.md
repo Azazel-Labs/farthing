@@ -40,11 +40,48 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 - **Far levels** merge the scene into one mesh and reduce it. The mesh is then unwrapped
   (LSCM, or planar charts) and the original's base color, normals (including normal maps) and
   roughness/metalness are baked into an atlas.
-  The textures appear in the panel as soon as they are baked.
+  The textures appear in the panel as soon as they are baked. Selecting the *Original* (or an
+  Original-materials level) shows the source material's textures instead, with that level's
+  UV triangles drawn over the base color; a picker chooses among several textured materials,
+  and the *UVs* box turns the overlay off.
+- **Texture LODs** shrink the atlas along the chain, like a texture's LOD bias and mip
+  settings in a game engine. *Keep* (the default) samples LOD0's atlas at every level. *Halve
+  per level* stores each level's atlas at half the side of the level before (a quarter of the
+  memory). *Fit to switch distance* drops whole mips while a texel still covers at most a
+  pixel where the level switches in (a texel per its measured error). The *Downsample filter*
+  is Unreal's mip-gen choice: *Unfiltered* (nearest), *Simple average* (box), *Triangle*,
+  *Kaiser*, *Lanczos* or *Blur 1*–*5*, all in linear light with normal maps renormalized, and
+  *Sharpen* (0–10) is an unsharp mask after each halving. Each shrunk level's download carries
+  its own atlas. Baked proxies are baked at the halved size rather than halved afterwards, so
+  their padding stays intact. In *Original materials* only the proxies shrink: the reduced
+  levels before them draw with the original textures.
+- **Texture compression** cooks the atlases and proxy textures the way a game would ship them,
+  using [mipple](https://azazel-labs.github.io/Mipple/)
+  ([crates.io](https://crates.io/crates/mipple), [GitHub](https://github.com/Azazel-Labs/mipple)),
+  farthing's sister crate for GPU texture compression. *Desktop* is BC7 for base color and
+  roughness/metalness and BC5 for normals. *ASTC 4×4 / 6×6 / 8×8* uses that block size for
+  color and keeps normals at 4×4. *ETC2* is ETC2 color (RGBA when the base color has alpha)
+  with EAC RG11 normals. Each texture is encoded with its full mip chain (alpha-tested base
+  color keeps its coverage down the mips), then decoded back for the viewer and the panel, so
+  what you see is what a GPU would sample. The panel lists each texture's format and quality
+  (PSNR, or the mean normal error in degrees), and the textures column shows the GPU memory
+  against RGBA8. *Effort* trades encode time for quality. *Rate-distortion* (RDO) picks blocks
+  that Zstd compresses better, so the files shrink at a small cost in quality; it is much
+  slower. Each cooked row adds a *.zip* download with the level as it ships: `model.glb`
+  (compact, without textures), `textures/*.ktx2` (KTX2 with Zstd level 19) and a
+  `manifest.json` that names each file's material slot, format, size and mip count. The *.glb*
+  download keeps the uncompressed textures.
 - **Viewing budget** is for models that are only ever seen from so close: a rock that never
-  comes nearer than a metre doesn't need detail finer than a pixel there. Set *Closest view*
-  (in the model's units: metres for glTF), the camera's field of view and the screen height,
-  and the chain keeps nothing that view can't show. LOD1 is reduced until it deviates about a
+  comes nearer than a meter doesn't need detail finer than a pixel there. *Closest view* picks
+  how much of the screen height the model fills when the camera is nearest (all of it, half, a
+  quarter, a tenth), which sets the *Distance* (in the model's units: meters for glTF, from the
+  model's center); or type a distance. A prop the player walks up to fills about the screen or
+  half of it; scenery that stays in the distance a tenth or less. *Texel density target* sets
+  it the way studios often do, in texels per meter: the camera comes as close as shows one
+  texel per screen pixel at that density. Presets cover top-down, third person and first
+  person at HD, 2K and 4K (512 px/m, about 5 px/cm, is the usual third-person target at 1080p;
+  first person doubles it and 4K doubles it again), and picking one sets the screen too. With the camera's field of
+  view and the screen height, the chain keeps nothing that view can't show. LOD1 is reduced until it deviates about a
   pixel at that distance (or by one step, if that goes further), and the later levels step
   from it. The recut and shared atlases are capped at a texel per pixel there (the shared
   one re-unwrapped, when that cap is below the artist's resolution); a recut's LOD0 is reduced
@@ -101,6 +138,8 @@ gains a *Size* column (GLB, PLY or packed GPU bytes).
 
 ```sh
 rustup target add wasm32-unknown-unknown
+# mipple's Zstd is C: build.sh needs a clang that targets wasm32 (`clang` on PATH, or set
+# CC_wasm32_unknown_unknown and AR_wasm32_unknown_unknown to clang and llvm-ar).
 cargo install wasm-bindgen-cli --version 0.2.129   # must match the pin in Cargo.toml
 ./build.sh                                         # → web/pkg/
 python fetch_samples.py                            # optional: sample models → web/samples/

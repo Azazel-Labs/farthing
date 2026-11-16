@@ -2,6 +2,7 @@
 //! chain build and bake, all in WebAssembly. The pipeline itself is in [`pipeline`] and runs
 //! natively too; this file only adapts it to JavaScript.
 
+pub mod cook;
 mod gpu;
 pub mod modes;
 pub mod pipeline;
@@ -66,6 +67,13 @@ mod web {
         #[wasm_bindgen(js_name = levelGlb)]
         pub fn level_glb(&self, level: usize, compact: bool) -> Result<Vec<u8>, JsError> {
             self.0.level_glb(level, compact).map_err(js_err)
+        }
+
+        /// A level of the last run as it would ship with texture compression: a zip of its
+        /// compact GLB, mipple's KTX2 files and a manifest.
+        #[wasm_bindgen(js_name = levelCooked)]
+        pub fn level_cooked(&self, level: usize) -> Result<Vec<u8>, JsError> {
+            self.0.level_cooked(level).map_err(js_err)
         }
 
         /// A splat level of the last splat run as a Gaussian splatting PLY.

@@ -159,9 +159,46 @@
 
       <fieldset data-modes="chain">
         <legend>Viewing budget</legend>
-        <label class="select" title="The closest the model is ever seen from, in its own units (glTF: metres). The first level is reduced until it deviates about a pixel there, the shared atlas is capped at a texel per pixel, and baked atlases are sized for the distance their level appears at. 0 keeps everything.">
+        <label class="select" title="How close the camera ever gets, picked by how much of the screen height the model then fills, or by a texel density target. Off keeps every triangle and texel the artist made.">
           Closest view
-          <input type="number" name="view_distance" min="0" step="0.1" value="0" style="width: 6em">
+          <select name="view_preset">
+            <option value="0" selected>Off</option>
+            <option value="1">Fills the screen</option>
+            <option value="0.5">Half the screen</option>
+            <option value="0.25">A quarter</option>
+            <option value="0.1">A tenth</option>
+            <option value="density">Texel density target</option>
+            <option value="custom">Custom distance</option>
+          </select>
+        </label>
+        <label class="select" id="view-density-preset" title="Common texel density targets: the texels per meter a surface needs to show a texel per pixel at the closest view. Picking one also sets the screen. Third person at 1080p is the usual 512 px/m; first person doubles it, and 4K doubles it again.">
+          Target
+          <select name="view_density_preset">
+            <optgroup label="HD (1080p)">
+              <option value="256@1080">Top-down: 256 px/m</option>
+              <option value="512@1080" selected>Third person: 512 px/m</option>
+              <option value="1024@1080">First person: 1024 px/m</option>
+            </optgroup>
+            <optgroup label="2K (1440p)">
+              <option value="341@1440">Top-down: 341 px/m</option>
+              <option value="683@1440">Third person: 683 px/m</option>
+              <option value="1365@1440">First person: 1365 px/m</option>
+            </optgroup>
+            <optgroup label="4K (2160p)">
+              <option value="512@2160">Top-down: 512 px/m</option>
+              <option value="1024@2160">Third person: 1024 px/m</option>
+              <option value="2048@2160">First person: 2048 px/m</option>
+            </optgroup>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <label class="select" id="view-density" title="Texels per meter at the closest view: the camera comes as close as gives one screen pixel per texel at this density, with the field of view and screen below.">
+          Density
+          <span><input type="number" name="view_density" min="1" step="1" value="512" style="width: 6em"> px/m</span>
+        </label>
+        <label class="select" title="The closest the model is ever seen from, in its own units (glTF: meters), from the camera to the model's center. The first level is reduced until it deviates about a pixel there, the shared atlas is capped at a texel per pixel, and baked atlases are sized for the distance their level appears at. 0 keeps everything.">
+          Distance
+          <span><input type="number" name="view_distance" min="0" step="0.1" value="0" style="width: 6em"> m</span>
         </label>
         <label class="select" title="Vertical field of view of that camera">
           Field of view
@@ -181,6 +218,74 @@
           </select>
         </label>
         <p class="hint" id="view-hint"></p>
+      </fieldset>
+
+      <fieldset data-modes="chain">
+        <legend>Texture LODs</legend>
+        <label class="select" title="How the atlas shrinks from level to level. Keep: every level samples LOD0's atlas. Halve: each level stores it at half the side of the level before, like a LOD bias of one mip per level. Fit: whole halvings for as long as a texel still covers no more than a pixel at the distance the level switches in.">
+          Later levels
+          <select name="texture_shrink">
+            <option value="keep" selected>Keep LOD0's size</option>
+            <option value="halve">Halve per level</option>
+            <option value="fit">Fit to switch distance</option>
+          </select>
+        </label>
+        <label class="select" id="tex-filter" title="How texels are averaged when an atlas is halved, in linear light (normal maps are renormalized). Unfiltered keeps one texel of each block and aliases; simple average is a 2 × 2 box; triangle, Kaiser and Lanczos weigh a wider window and keep more detail, Lanczos sharpest; blur softens on purpose.">
+          Downsample filter
+          <select name="texture_filter">
+            <option value="nearest">Unfiltered</option>
+            <option value="box" selected>Simple average</option>
+            <option value="triangle">Triangle</option>
+            <option value="kaiser">Kaiser</option>
+            <option value="lanczos">Lanczos</option>
+            <option value="blur1">Blur 1</option>
+            <option value="blur2">Blur 2</option>
+            <option value="blur3">Blur 3</option>
+            <option value="blur4">Blur 4</option>
+            <option value="blur5">Blur 5</option>
+          </select>
+        </label>
+        <label class="range" id="tex-sharpen" title="An unsharp mask after each downsample, to win back the contrast averaging loses">Sharpen <output name="texture_sharpen_out"></output>
+          <input type="range" name="texture_sharpen" min="0" max="10" value="0">
+        </label>
+        <p class="hint" id="shrink-hint"></p>
+      </fieldset>
+
+      <fieldset data-modes="chain" id="cook">
+        <legend>Texture compression</legend>
+        <p class="hint mipple">Cooked by <a href="https://azazel-labs.github.io/Mipple/" target="_blank" rel="noopener">mipple</a>,
+          farthing's sister crate: BC, ETC2 and ASTC encoders with rate-distortion optimization, mip chains
+          and KTX2 + Zstd output, in pure Rust and running right here in your browser.
+          <a href="https://crates.io/crates/mipple" target="_blank" rel="noopener">crates.io</a> ·
+          <a href="https://github.com/Azazel-Labs/mipple" target="_blank" rel="noopener">GitHub</a></p>
+        <label class="select" title="The GPU formats the atlas and proxy textures ship in. Desktop: BC7 for base color and rough/metal, BC5 for normals. ASTC: base color and rough/metal at the block size, normals at 4 × 4. ETC2: ETC2 color, EAC RG11 normals.">
+          Target
+          <select name="texture_compression">
+            <option value="off" selected>Off (RGBA8)</option>
+            <option value="bc">Desktop: BC7 + BC5</option>
+            <option value="astc4x4">Mobile: ASTC 4×4</option>
+            <option value="astc6x6">Mobile: ASTC 6×6</option>
+            <option value="astc8x8">Mobile: ASTC 8×8</option>
+            <option value="etc2">Mobile: ETC2 + EAC</option>
+          </select>
+        </label>
+        <label class="select" id="cook-effort" title="How many block encodings mipple tries: Fast for quick looks, Best for the last fraction of a dB">
+          Effort
+          <select name="compression_effort">
+            <option value="2">Fast</option>
+            <option value="5" selected>Balanced</option>
+            <option value="8">Best</option>
+          </select>
+        </label>
+        <label class="select" id="cook-rdo" title="Rate-distortion optimization: blocks are chosen to repeat what Zstd has just seen, so the KTX2 files shrink for a little quality. GPU memory does not change.">
+          Rate-distortion
+          <select name="compression_lambda">
+            <option value="0" selected>Off</option>
+            <option value="1">Light (λ 1)</option>
+            <option value="4">Strong (λ 4)</option>
+          </select>
+        </label>
+        <p class="hint" id="cook-hint"></p>
       </fieldset>
 
       <fieldset data-modes="chain">
@@ -286,13 +391,18 @@
         <dl id="cut-stats"></dl>
       </div>
       <div id="bake">
-        <h3 id="bake-title">Baked textures</h3>
+        <div class="bake-head">
+          <h3 id="bake-title">Baked textures</h3>
+          <label class="check" title="Draw the selected level's UV triangles over its base color"><input type="checkbox" id="uv-wire" checked> UVs</label>
+        </div>
+        <select id="bake-material" hidden title="The original material whose textures are shown"></select>
         <div class="tex">
           <figure><canvas id="tex-base_color" width="1" height="1"></canvas><figcaption>Base color</figcaption></figure>
           <figure><canvas id="tex-normal" width="1" height="1"></canvas><figcaption>Normal</figcaption></figure>
           <figure><canvas id="tex-orm" width="1" height="1"></canvas><figcaption>Rough / metal</figcaption></figure>
         </div>
         <p id="bake-stats"></p>
+        <p id="bake-cooked" hidden></p>
       </div>
     </section>
   </main>

@@ -40,10 +40,12 @@ self.onmessage = async ({ data }) => {
       const [json, ...buffers] = session.select(JSON.stringify(data.view));
       post({ type: "select", seq: data.seq, info: JSON.parse(json), buffers }, buffers.map((b) => b.buffer));
     } else if (data.type === "download") {
-      const ply = data.format === "ply";
-      // Plain glTF, so the download opens in any tool (the viewer loads compact GLBs).
-      const bytes = ply ? session.levelPly(data.level) : session.levelGlb(data.level, false);
-      post({ type: "download", level: data.level, format: ply ? "ply" : "glb", glb: bytes.buffer }, [bytes.buffer]);
+      const { format, level } = data;
+      // Plain glTF, so the download opens in any tool (the viewer loads compact GLBs); "zip" is
+      // the level as it would ship: compact GLB plus mipple's KTX2 textures.
+      const bytes =
+        format === "ply" ? session.levelPly(level) : format === "zip" ? session.levelCooked(level) : session.levelGlb(level, false);
+      post({ type: "download", level, format, glb: bytes.buffer }, [bytes.buffer]);
     }
   } catch (e) {
     // A wasm trap (`unreachable`, out of bounds...) poisons the module: nothing in this worker

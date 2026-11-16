@@ -3,6 +3,9 @@
 # version matches the `wasm-bindgen = "=…"` pin in Cargo.toml:
 #   rustup target add wasm32-unknown-unknown
 #   cargo install wasm-bindgen-cli --version 0.2.129
+# mipple's Zstd (zstd-sys) is C, so it also needs a clang that can target wasm32: `clang` on
+# PATH, or CC_wasm32_unknown_unknown (and AR_wasm32_unknown_unknown, an llvm-ar). Ubuntu's clang
+# package works; on Windows the LLVM or Swift toolchain's clang does.
 # If binaryen's wasm-opt is on PATH, the output is size-optimized too.
 set -eu
 cd "$(dirname "$0")"

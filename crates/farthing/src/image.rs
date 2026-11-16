@@ -1,10 +1,14 @@
 //! Images: [`Image`], linear float RGBA for work in progress (bakes, captures, metrics), and
-//! [`Texture`], compact shared 8-bit RGBA for material textures as they are stored.
+//! [`Texture`], compact shared 8-bit RGBA for material textures as they are stored, which
+//! [`Texture::downsample`] shrinks with a choice of [`Downsample`] filter.
 
 use crate::{Error, Result};
 use glam::{Vec2, Vec4};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+
+mod downsample;
+pub use downsample::{Downsample, DownsampleOptions};
 
 /// Row-major RGBA32F image. UV (0, 0) is the top-left corner, matching glTF.
 #[derive(Clone, Debug, PartialEq)]
@@ -229,7 +233,7 @@ pub(crate) fn downsample_coverage_rows(src: &[Vec4], width: u32, factor: u32, ou
 /// A material texture as stored: 8-bit RGBA, a quarter of an [`Image`]'s memory (a 2048²
 /// texture is 16 MB instead of 64 MB), behind an `Arc` so clones share the texels.
 ///
-/// With `srgb` the RGB bytes are sRGB-encoded (glTF base colour) and sampling decodes them to
+/// With `srgb` the RGB bytes are sRGB-encoded (glTF base color) and sampling decodes them to
 /// linear; alpha is always linear. Without it the bytes are linear unorm data (metallic-
 /// roughness, normal maps with xyz in 0..1). Sampling decodes each texel before filtering, so
 /// it returns exactly what the same lookups on [`Image::from_rgba8`]'s output would.

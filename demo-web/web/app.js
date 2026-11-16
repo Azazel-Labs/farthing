@@ -30,6 +30,9 @@ let runId = 0;
 let runStart = 0;
 let runOpts = null; // options of the current run
 let selected = 0;
+let texPinned = false; // the texture panel stays on the selected level, which the user picked
+let texShown = -1; // the level the texture panel was last asked for
+let texMaterial = -1; // the original's glTF material the panel shows, when it has several
 let mode = "single";
 let wireOn = false;
 /** levels[n] = { info, object, tex: { channel: ImageData }, stale } */
@@ -217,6 +220,8 @@ function resetViewer() {
   levels = [];
   original = null;
   selected = 0;
+  texPinned = false;
+  texMaterial = -1;
   syncCutPanel();
 }
 
@@ -1265,7 +1270,7 @@ loadingEl.querySelector(".cancel").addEventListener("click", () => {
   }
   for (const b of cards.values()) b.removeAttribute("aria-current");
   hideLoading();
-  setStatus("Cancelled");
+  setStatus("Canceled");
 });
 
 function setStatus(text, cls = "") {
@@ -1274,12 +1279,13 @@ function setStatus(text, cls = "") {
 }
 
 async function onWorker(m) {
-  if (m.runId !== undefined && m.runId !== runId) return; // a cancelled run
+  if (m.runId !== undefined && m.runId !== runId) return; // a canceled run
   switch (m.type) {
     case "loaded":
       if (m.quiet) return;
       busy = false;
       assetInfo = m.info;
+      applyViewPreset();
       showInfo(m.info);
       try {
         await showOriginal(m.glb);
@@ -1298,7 +1304,7 @@ async function onWorker(m) {
     case "texture": {
       const l = entry(m.level);
       l.tex[m.channel] = new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height);
-      drawTextures(m.level);
+      if (followTextures(m.level)) drawTextures(m.level);
       break;
     }
     case "level":
@@ -1313,13 +1319,13 @@ async function onWorker(m) {
     case "done": {
       busy = false;
       const chain = shownMode === "chain";
-      const n = chain ? runOpts.levels : MODE_LEVELS[shownMode];
+      const n = chain ? chainLevels(runOpts) : MODE_LEVELS[shownMode];
       for (let i = levels.length - 1; i > n; i--) {
         disposeLevel(levels[i]);
         levels.pop();
       }
       if (selected > n) select(n);
-      drawTextures(selected);
+      drawTextures(texPinned ? selected : Math.min(texShown, n));
       const what = {
         chain: `${n + 1} levels`,
         presets: `${n} configurations`,
@@ -1335,13 +1341,12 @@ async function onWorker(m) {
       break;
     }
     case "download": {
-      const ply = m.format === "ply";
-      const url = URL.createObjectURL(
-        new Blob([m.glb], { type: ply ? "application/octet-stream" : "model/gltf-binary" }),
-      );
+      const type = { ply: "application/octet-stream", zip: "application/zip" }[m.format] ?? "model/gltf-binary";
+      const url = URL.createObjectURL(new Blob([m.glb], { type }));
+      const stem = `${(assetInfo?.name ?? "model").replace(/\.(glb|gltf|zip)$/i, "")}_${lodName(m.level)}`;
       const a = Object.assign(document.createElement("a"), {
         href: url,
-        download: `${(assetInfo?.name ?? "model").replace(/\.(glb|gltf|zip)$/i, "")}_${lodName(m.level)}.${ply ? "ply" : "glb"}`,
+        download: m.format === "zip" ? `${stem}_cooked.zip` : `${stem}.${m.format}`,
       });
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
@@ -1404,8 +1409,7 @@ async function onLevel(info, glb, id) {
   root.add(gltf.scene);
   setWire(gltf.scene);
   renderRows();
-  if (info.kind !== "reduced" && (selected === info.level || !levels[selected]?.tex.base_color))
-    drawTextures(info.level);
+  if (info.kind !== "reduced" ? followTextures(info.level) : selected === info.level) drawTextures(info.level);
 }
 
 function startRun() {
@@ -1470,7 +1474,7 @@ function renderRows() {
   const chain = m === "chain";
   // A recut chain is the original, LOD0 (the recut) and the levels reduced from it.
   const recut = chain && form.elements.textures.value === "recut";
-  const n = chain ? +form.elements.levels.value + (recut ? 1 : 0) : MODE_LEVELS[m];
+  const n = chain ? chainLevels(readOptions()) : MODE_LEVELS[m];
   const bakeFrom = recut ? Infinity : +form.elements.bake_from.value || Infinity;
   const near = form.elements.textures.value === "original" ? "reduced" : "shared";
   const total = assetInfo?.triangles ?? 0;
@@ -1516,10 +1520,15 @@ function renderRows() {
         : (info?.label ?? (i === 0 && (!chain || recut) ? "Original" : `LOD${i - (recut ? 1 : 0)}`));
     const kindText = recut && kind === "shared" ? "recut" : kind;
     const ext = kind === "splats" ? "ply" : "glb";
+    const cooked = info?.cooked;
     const dl =
       pending || live || (i === 0 && m === "hlod")
         ? ""
-        : `<button type="button" data-dl="${i}" data-fmt="${ext}" title="Download ${esc(name)} as .${ext}">.${ext}</button>`;
+        : `<button type="button" data-dl="${i}" data-fmt="${ext}" title="Download ${esc(name)} as .${ext}">.${ext}</button>` +
+          (cooked
+            ? ` <button type="button" data-dl="${i}" data-fmt="zip" title="${esc(name)} as it ships, ${fmtBytes(cooked.ship_bytes)}: ` +
+              `compact GLB plus mipple's KTX2 textures (${esc(cookedFormats(cooked))}, Zstd ${cooked.zstd_level}) and a manifest">.zip</button>`
+            : "");
     out.push(
       `<tr data-level="${i}" class="${i === selected ? "selected" : ""} ${pending ? "pending" : ""}">` +
         `<td class="label" title="${esc(info?.note ?? "")}">${esc(name)}</td><td><span class="kind ${kind}">${kindText}</span></td>` +
@@ -1533,9 +1542,59 @@ function renderRows() {
 
 /** A level's texture memory; shared levels after the first draw with the first's atlas. */
 function texCell(info) {
-  const bytes = fmtBytes(info.texture_bytes);
-  if (info.kind !== "shared" || info.shared_textures === info.level) return bytes;
-  return `<span title="The atlas ${esc(lodName(info.shared_textures))} carries, not a second copy">${bytes}</span>`;
+  const c = info.cooked;
+  const reused = info.kind === "shared" && info.shared_textures !== info.level;
+  const carried = reused ? `The atlas ${lodName(info.shared_textures)} carries, not a second copy. ` : "";
+  if (!c) {
+    const bytes = fmtBytes(info.texture_bytes);
+    return reused ? `<span title="${esc(carried)}">${bytes}</span>` : bytes;
+  }
+  const title =
+    `${carried}GPU memory as ${cookedFormats(c)} with mips, cooked by mipple; RGBA8 would be ${fmtBytes(c.rgba_bytes)}. ` +
+    `Ships as ${fmtBytes(c.ktx2_bytes)} of KTX2 + Zstd.`;
+  return `<span class="cooked" title="${esc(title)}">${fmtBytes(c.gpu_bytes)}</span>`;
+}
+
+/** "BC7 + BC5" style names of a level's cooked formats. */
+function cookedFormats(c) {
+  return [...new Set(c.textures.map((t) => FORMAT_NAMES[t.format] ?? t.format.toUpperCase()))].join(" + ");
+}
+
+const FORMAT_NAMES = {
+  "etc2-rgb": "ETC2",
+  "etc2-rgba": "ETC2 RGBA",
+  "eac-rg11": "EAC RG11",
+  "astc-4x4": "ASTC 4×4",
+  "astc-6x6": "ASTC 6×6",
+  "astc-8x8": "ASTC 8×8",
+};
+
+const TEX_CAPTIONS = { base_color: "Base color", normal: "Normal", orm: "Rough / metal" };
+
+/** The panel's mipple line: formats, quality, sizes. */
+function drawCooked(i) {
+  const el = $("#bake-cooked");
+  const c = i?.cooked;
+  for (const ch of Object.keys(TEX_CAPTIONS)) {
+    const t = c?.textures.find((x) => x.channel === ch);
+    const cap = $(`#tex-${ch}`).nextElementSibling;
+    cap.textContent = t ? `${TEX_CAPTIONS[ch]} · ${cookedFormats({ textures: [t] })}` : TEX_CAPTIONS[ch];
+  }
+  el.hidden = !c;
+  if (!c) return;
+  const quality = c.textures
+    .map((t) => {
+      const q = t.normal_error != null ? `${t.normal_error.toFixed(2)}° off` : t.psnr != null ? `${t.psnr.toFixed(1)} dB` : "lossless";
+      return `${CHANNEL_NAMES[t.channel]} ${q}`;
+    })
+    .join(", ");
+  const rdo = c.lambda > 0 ? `, RDO λ ${c.lambda}` : "";
+  el.innerHTML =
+    `Cooked by <a href="https://azazel-labs.github.io/Mipple/" target="_blank" rel="noopener">mipple</a> for ${esc(c.target)} ` +
+    `(effort ${c.effort}${rdo}) in ${(c.ms / 1000).toFixed(1)} s and drawn decoded, so what you see is what the GPU samples: ` +
+    `${esc(quality)}. ${fmtBytes(c.gpu_bytes)} on the GPU instead of ${fmtBytes(c.rgba_bytes)} as RGBA8 ` +
+    `(${(c.rgba_bytes / c.gpu_bytes).toFixed(1)}× less); ${fmtBytes(c.ktx2_bytes)} of KTX2 + Zstd on disk, ` +
+    `${fmtBytes(c.ship_bytes)} with the geometry (the row's .zip).`;
 }
 
 /** How far a recut's base color is from the original materials. */
@@ -1545,16 +1604,193 @@ const texErrorText = (i) =>
 
 const updateRow = () => renderRows();
 
+/** Rows after the original in a chain: a recut adds LOD0, the recut itself, before `levels` reductions. */
+function chainLevels(o) {
+  return o.levels + (o.textures === "recut" ? 1 : 0);
+}
+
 function select(level) {
   selected = level;
+  texPinned = true;
   for (const tr of rowsEl.children) tr.classList.toggle("selected", +tr.dataset.level === level);
-  if (levels[level]?.tex.base_color) drawTextures(level);
+  if (hasTextures(level)) drawTextures(level);
   if (shownMode === "splats") cutStats();
 }
 
+/** Chain levels drawn with the original's materials: the original, and Original-materials reductions. */
+const usesOriginal = (level) =>
+  shownMode === "chain" && !!original && (level === 0 || levels[level]?.info?.kind === "reduced");
+
+/** Whether the texture panel has something of this level's own to show. */
+const hasTextures = (level) => !!levels[level]?.tex.base_color || usesOriginal(level);
+
+/** Whether textures arriving for `level` should replace what the panel shows. */
+const followTextures = (level) => level === selected || !texPinned || !hasTextures(selected);
+
+// Original textures can be large; the panel shows them at most this many texels across.
+const PANEL_SIDE = 1024;
+// The UV overlay is skipped above this many triangles: it would be a solid fill anyway.
+const UV_MAX_TRIANGLES = 300_000;
+
+/** Puts `src` (ImageData or a drawable image; null clears) on the panel canvas of channel `ch`. */
+function putTexture(ch, src) {
+  const c = $(`#tex-${ch}`);
+  if (!c) return null;
+  const ctx = c.getContext("2d");
+  if (src instanceof ImageData) {
+    c.width = src.width;
+    c.height = src.height;
+    ctx.putImageData(src, 0, 0);
+    return c;
+  }
+  const w = src?.width ?? 0;
+  const h = src?.height ?? 0;
+  const s = Math.min(1, PANEL_SIDE / Math.max(w, h, 1));
+  c.width = Math.max(1, Math.round(w * s));
+  c.height = Math.max(1, Math.round(h * s));
+  ctx.clearRect(0, 0, c.width, c.height);
+  if (!w || !h) return null;
+  try {
+    ctx.drawImage(src, 0, 0, c.width, c.height);
+  } catch {
+    return null; // a compressed texture (KTX2 and the like) has no drawable image
+  }
+  return c;
+}
+
+/**
+ * Draws the UV triangles of `object`'s meshes whose material passes `keep` over canvas `c`,
+ * each triangle moved into the 0-1 tile it starts in. Returns how many triangles there are.
+ */
+function drawUvs(c, object, keep = () => true) {
+  const meshes = [];
+  object?.traverse((o) => {
+    const material = [o.material].flat()[0];
+    if (o.isMesh && material && o.geometry?.attributes.uv && keep(material)) meshes.push(o);
+  });
+  const count = (g) => (g.index ? g.index.count : g.attributes.position.count) / 3;
+  const tris = meshes.reduce((n, o) => n + count(o.geometry), 0);
+  if (!c || !$("#uv-wire").checked || !tris || tris > UV_MAX_TRIANGLES) return tris;
+  const { width: w, height: h } = c;
+  const ctx = c.getContext("2d");
+  ctx.save();
+  // About one screen pixel wide, and inverting what is under it so it shows on any texture.
+  ctx.lineWidth = Math.max(1, w / (c.clientWidth || 96));
+  ctx.strokeStyle = "#fff";
+  ctx.globalCompositeOperation = "difference";
+  ctx.beginPath();
+  for (const o of meshes) {
+    const g = o.geometry;
+    const channel = [o.material].flat()[0].map?.channel ?? 0;
+    const uv = (channel && g.attributes[`uv${channel}`]) || g.attributes.uv;
+    const idx = g.index;
+    const n = count(g) * 3;
+    for (let t = 0; t < n; t += 3) {
+      const a = idx ? idx.getX(t) : t;
+      const b = idx ? idx.getX(t + 1) : t + 1;
+      const d = idx ? idx.getX(t + 2) : t + 2;
+      const u0 = uv.getX(a);
+      const v0 = uv.getY(a);
+      const u1 = uv.getX(b);
+      const v1 = uv.getY(b);
+      const u2 = uv.getX(d);
+      const v2 = uv.getY(d);
+      const ou = Math.floor(Math.min(u0, u1, u2));
+      const ov = Math.floor(Math.min(v0, v1, v2));
+      ctx.moveTo((u0 - ou) * w, (v0 - ov) * h);
+      ctx.lineTo((u1 - ou) * w, (v1 - ov) * h);
+      ctx.lineTo((u2 - ou) * w, (v2 - ov) * h);
+      ctx.closePath();
+    }
+  }
+  ctx.stroke();
+  ctx.restore();
+  return tris;
+}
+
+/** The original's materials that have textures, by glTF material index. */
+function texturedOriginals() {
+  return (original?.materials ?? [])
+    .map((m, index) => ({ m, index }))
+    .filter(({ m }) => m && (m.map || m.normalMap || m.roughnessMap || m.metalnessMap));
+}
+
+const CHANNEL_NAMES = { base_color: "base color", normal: "normal", orm: "rough / metal" };
+
+/** The panel for the original and Original-materials levels: a source material's textures, this level's UVs on them. */
+function drawOriginalTextures(level) {
+  const list = texturedOriginals();
+  const pick = $("#bake-material");
+  if (!list.some((e) => e.index === texMaterial)) texMaterial = list[0]?.index ?? -1;
+  const label = (e) => e.m.name || `Material ${e.index}`;
+  const key = list.map((e) => e.index).join();
+  if (pick.dataset.key !== key) {
+    pick.replaceChildren(...list.map((e) => new Option(label(e), String(e.index))));
+    pick.dataset.key = key;
+  }
+  pick.hidden = list.length < 2;
+  pick.value = String(texMaterial);
+  const e = list.find((x) => x.index === texMaterial);
+  const l = levels[level];
+  $("#bake").classList.toggle("empty", !e);
+  $("#bake-title").textContent = `Original textures · ${lodName(level)}${l?.stale ? " (updating)" : ""}`;
+  if (!e) {
+    $("#bake-stats").textContent = "The original has no textures: its materials are plain colors.";
+    return;
+  }
+  const m = e.m;
+  const maps = { base_color: m.map, normal: m.normalMap, orm: m.roughnessMap ?? m.metalnessMap };
+  const mine = new Set(Object.values(maps).filter(Boolean));
+  const drawn = {};
+  for (const [ch, t] of Object.entries(maps)) drawn[ch] = putTexture(ch, t?.image ?? null);
+  // Levels reuse the original's textures (material clones share them), so meshes match by texture.
+  const keep = (mat) => [mat.map, mat.normalMap, mat.roughnessMap, mat.metalnessMap].some((t) => t && mine.has(t));
+  const tris = drawUvs(drawn.base_color ?? drawn.normal ?? drawn.orm, l?.object, keep);
+  const img = (m.map ?? m.normalMap ?? m.roughnessMap ?? m.metalnessMap)?.image;
+  const parts = [label(e)];
+  if (img?.width) {
+    const big = img.width > PANEL_SIDE || img.height > PANEL_SIDE;
+    parts.push(`${img.width} × ${img.height}${big ? ` (shown at most ${PANEL_SIDE} across)` : ""}`);
+  }
+  const missing = Object.entries(maps)
+    .filter(([, t]) => !t)
+    .map(([ch]) => CHANNEL_NAMES[ch]);
+  if (missing.length) parts.push(`no ${missing.join(" or ")} map`);
+  if (Object.entries(maps).some(([ch, t]) => t && !drawn[ch])) parts.push("compressed textures can't be shown");
+  parts.push(
+    tris > UV_MAX_TRIANGLES && $("#uv-wire").checked
+      ? `${fmtInt(tris)} triangles, too many to draw their UVs`
+      : `UVs of ${fmtInt(tris)} triangles`,
+  );
+  if (list.length > 1) parts.push(`${list.length} textured materials`);
+  $("#bake-stats").textContent = parts.join(" · ");
+}
+
+$("#bake-material").addEventListener("change", (e) => {
+  texMaterial = +e.target.value;
+  drawTextures(texShown);
+});
+$("#uv-wire").addEventListener("change", () => drawTextures(texShown));
+
+/** Unreal-style names of the downsample filters. */
+const FILTER_NAMES = {
+  nearest: "unfiltered",
+  box: "simple average",
+  triangle: "triangle",
+  kaiser: "Kaiser",
+  lanczos: "Lanczos",
+};
+const filterName = (f) => FILTER_NAMES[f] ?? (f?.startsWith("blur") ? `blur ${f.slice(4)}` : f);
+
 function drawTextures(level) {
   if (shownMode === "hlod") return drawHlodTextures();
+  texShown = level;
   const bake = $("#bake");
+  if (usesOriginal(level)) {
+    drawCooked(null);
+    return drawOriginalTextures(level);
+  }
+  $("#bake-material").hidden = true;
   // Show this level's bake, else the most recent baked level.
   let l = levels[level];
   if (!l?.tex.base_color) {
@@ -1562,6 +1798,7 @@ function drawTextures(level) {
     l = levels[level];
   }
   bake.classList.toggle("empty", !l);
+  drawCooked(l?.info);
   if (!l) {
     $("#bake-title").textContent = "Baked textures";
     $("#bake-stats").textContent =
@@ -1570,24 +1807,26 @@ function drawTextures(level) {
         : "";
     return;
   }
-  for (const [ch, img] of Object.entries(l.tex)) {
-    const c = $(`#tex-${ch}`);
-    if (!c) continue;
-    c.width = img.width;
-    c.height = img.height;
-    c.getContext("2d").putImageData(img, 0, 0);
-  }
+  for (const [ch, img] of Object.entries(l.tex)) putTexture(ch, img);
+  drawUvs($("#tex-base_color"), l.object);
   const i = l.info;
   const shared = i?.kind === "shared";
   // A recut's levels carry labels; a shared chain's do not.
   const what = shared ? (i.label ? "Recut atlas" : "Shared atlas") : "Baked textures";
   $("#bake-title").textContent = `${what} · ${lodName(level)}${l.stale ? " (updating)" : ""}`;
   const parts = [];
+  const k = i?.texture_halvings ?? 0;
   if (shared)
     parts.push(
       `${i.atlas_width} × ${i.atlas_height}`,
-      `${(i.density_scale * 100).toFixed(0)}% of the ${i.view_texel_density ? "capped" : "artist's"} texel density`,
+      `${((i.density_scale * 100) / 2 ** k).toPrecision(2)}% of the ${i.view_texel_density ? "capped" : "artist's"} texel density`,
     );
+  if (k) {
+    const sharpen = runOpts?.texture_sharpen ? `, sharpen ${runOpts.texture_sharpen}` : "";
+    const from = shared ? `LOD${i.label ? 0 : 1}'s atlas` : "the proxy atlas";
+    parts.push(`${from} at 1/${2 ** k} the side (${filterName(i.texture_filter ?? runOpts?.texture_filter)}${sharpen})`);
+  } else if (shared && i.shared_textures != null && i.shared_textures !== level)
+    parts.push(`drawn with ${lodName(i.shared_textures)}'s atlas`);
   if (shared && i.view_texel_density)
     parts.push(
       `capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit, a texel per the error LOD${i.label ? 0 : 1} may have` +
@@ -1666,9 +1905,18 @@ function readOptions() {
     lod0_error: Math.max(0, +f.lod0_error.value || 0) / 100,
     shared_size: +f.shared_size.value,
     view_distance: Math.max(0, +f.view_distance.value || 0),
+    view_preset: f.view_preset.value,
+    view_density: Math.max(0, +f.view_density.value || 0),
+    view_density_preset: f.view_density_preset.value,
     view_fov: +f.view_fov.value,
     view_height: +f.view_height.value,
     shared_keep_layout: f.shared_keep_layout.checked,
+    texture_shrink: f.texture_shrink.value,
+    texture_filter: f.texture_filter.value,
+    texture_sharpen: +f.texture_sharpen.value,
+    texture_compression: f.texture_compression.value,
+    compression_effort: +f.compression_effort.value,
+    compression_lambda: +f.compression_lambda.value,
     fast: f.fast.checked,
     strict_seams: f.strict_seams.checked,
     symmetry: f.symmetry.checked,
@@ -1697,6 +1945,28 @@ function syncModeUi() {
   $("#lod0-error").hidden = $("#lod0-hint").hidden = tex !== "recut";
   // A recut bakes nothing per level.
   for (const el of form.querySelectorAll(".baked-only")) el.hidden = tex === "recut";
+  const shrink = form.elements.texture_shrink.value;
+  $("#tex-filter").hidden = $("#tex-sharpen").hidden = shrink === "keep";
+  const only =
+    tex === "original" ? "Only the baked proxies shrink: the reduced levels before them draw with the original materials. " : "";
+  $("#shrink-hint").textContent =
+    shrink === "keep"
+      ? "Every level samples LOD0's atlas at full size."
+      : only +
+        (shrink === "halve"
+          ? "Each level stores the atlas at half the side of the level before: a quarter of the memory, one mip of LOD bias per level."
+          : "Each level drops whole mips for as long as a texel still covers at most a pixel where the level switches in.");
+  const cook = form.elements.texture_compression.value;
+  $("#cook-effort").hidden = $("#cook-rdo").hidden = cook === "off";
+  const rdo = +form.elements.compression_lambda.value > 0;
+  $("#cook-hint").textContent =
+    cook === "off"
+      ? "Atlases and proxies stay RGBA8: 32 bits a texel. Pick a target to see them as they would ship."
+      : "Every atlas and proxy texture is encoded with its mips, then drawn decoded, so the viewer shows the real artifacts; " +
+        "each row's .zip holds the level as it ships (compact GLB, KTX2 with Zstd). " +
+        (tex === "original" ? "Reduced levels before the proxies keep the original materials uncompressed. " : "") +
+        "The browser encodes on one thread, so large atlases take a while" +
+        (rdo ? "; with rate-distortion on, expect tens of seconds per 512² texture." : ".");
   $("#mode-hint").textContent = MODE_HINTS[m] ?? "";
   syncViewHint();
 }
@@ -1714,21 +1984,70 @@ function syncLod0Hint() {
 /** What the viewing budget means for this model: its size, and what a pixel is at the closest view. */
 function syncViewHint() {
   syncLod0Hint();
-  const { view_distance: d, view_fov: fov, view_height: h } = readOptions();
+  const { view_distance: d, view_fov: fov, view_height: h, view_preset, view_density: ppm } = readOptions();
+  const density = view_preset === "density";
+  $("#view-density-preset").hidden = $("#view-density").hidden = !density;
   const size = assetInfo ? `The model is ${fmtLen(assetInfo.diagonal)} across (bounding-box diagonal). ` : "";
   if (!d) {
-    $("#view-hint").textContent = `${size}Set the closest distance it is ever seen from to drop detail that view cannot show.`;
+    $("#view-hint").textContent =
+      `${size}Pick how much of the screen the model fills when the camera is closest, a texel density target, ` +
+      "or type a distance, to drop detail that view cannot show. A prop the player walks up to fills about the " +
+      "screen or half of it; scenery that stays in the distance a tenth or less.";
     return;
   }
   const ppu = h / (2 * d * Math.tan(THREE.MathUtils.degToRad(fov) / 2));
-  const spans = assetInfo ? ` it spans about ${fmtInt(Math.round(assetInfo.diagonal * ppu))} px, and` : "";
+  const px = assetInfo ? assetInfo.diagonal * ppu : 0;
+  if (density) {
+    const there = assetInfo
+      ? ` There the model spans about ${fmtInt(Math.round(px))} px, ${Math.round((px * 100) / h)}% of the screen height.`
+      : "";
+    const kept = levels[0]?.stale ? null : levels[0]?.info?.view_texels;
+    const texels = kept != null ? ` That keeps ${(kept * 100).toPrecision(2)}% of the artist's texels.` : "";
+    $("#view-hint").textContent =
+      `${size}${fmtInt(ppm)} px/m (${+(ppm / 100).toPrecision(4)} px/cm, a texel every ${fmtLen(1 / ppm)}) ` +
+      `is a texel per pixel from ${fmtLen(d)} on a ${h}-pixel-high screen at ${fov}°.${there}${texels}`;
+    return;
+  }
+  const spans = assetInfo ? ` it spans about ${fmtInt(Math.round(px))} px, ${Math.round((px * 100) / h)}% of the screen height, and` : "";
   const kept = levels[0]?.stale ? null : levels[0]?.info?.view_texels;
-  const texels =
-    kept != null ? ` That view shows ${(kept * 100).toPrecision(2)}% of the artist's texels.` : "";
+  const texels = kept != null ? ` That view shows ${(kept * 100).toPrecision(2)}% of the artist's texels.` : "";
   $("#view-hint").textContent = `${size}From ${fmtLen(d)}${spans} a pixel is ${fmtLen(1 / ppu)} (${fmtInt(Math.round(ppu))} px per unit).${texels}`;
 }
 
-/** A length in scene units, assumed metres (glTF). */
+/**
+ * The closest view's preset: the distance at which the model's bounding-box diagonal fills that
+ * fraction of the screen height, rounded to two significant digits.
+ */
+function applyViewPreset() {
+  const f = form.elements;
+  if (f.view_preset.value === "custom") return;
+  const tan = Math.tan(THREE.MathUtils.degToRad(+f.view_fov.value) / 2);
+  if (f.view_preset.value === "density") {
+    // The distance at which a screen pixel covers one texel of that density.
+    const ppm = +f.view_density.value;
+    f.view_distance.value = ppm > 0 ? String(+(+f.view_height.value / (2 * ppm * tan)).toPrecision(3)) : "0";
+    return;
+  }
+  const x = +f.view_preset.value;
+  if (!x) {
+    f.view_distance.value = "0";
+    return;
+  }
+  if (!assetInfo?.diagonal) return;
+  const d = assetInfo.diagonal / (2 * x * tan);
+  f.view_distance.value = String(+d.toPrecision(2));
+}
+
+/** A texel density preset ("512@1080"): its density, and the screen it is meant for. */
+function applyDensityPreset() {
+  const f = form.elements;
+  const [ppm, h] = f.view_density_preset.value.split("@");
+  if (!h) return;
+  f.view_density.value = ppm;
+  f.view_height.value = h;
+}
+
+/** A length in scene units, assumed meters (glTF). */
 function fmtLen(m) {
   if (m >= 1) return `${m.toPrecision(3)} m`;
   if (m >= 0.01) return `${(m * 100).toPrecision(3)} cm`;
@@ -1751,6 +2070,7 @@ function syncOutputs() {
   f.step_out.value = `${Math.round(+f.step.value * 100)}%`;
   f.supersample_out.value = `${f.supersample.value}×${f.supersample.value}`;
   f.preset_ratio_out.value = `${Math.round(+f.preset_ratio.value * 100)}%`;
+  f.texture_sharpen_out.value = f.texture_sharpen.value === "0" ? "off" : f.texture_sharpen.value;
   syncModeUi();
 }
 
@@ -1761,6 +2081,8 @@ function restoreOptions() {
   } catch {}
   if (saved) {
     if (saved.version !== STORE_VERSION) delete saved.textures;
+    // Saved before the presets: a distance was typed.
+    if (saved.view_preset === undefined) saved.view_preset = saved.view_distance > 0 ? "custom" : "0";
     const f = form.elements;
     for (const [k, v] of Object.entries(saved)) {
       const el = f[k];
@@ -1775,7 +2097,20 @@ function restoreOptions() {
 }
 
 let debounce = 0;
-form.addEventListener("input", () => {
+form.addEventListener("input", (e) => {
+  // A typed distance is a custom one; a preset or another field of view moves the distance.
+  // A density target sets the distance from the density, field of view and screen.
+  const f = form.elements;
+  const name = e.target.name;
+  if (name === "view_distance") f.view_preset.value = +e.target.value ? "custom" : "0";
+  else {
+    if (name === "view_density_preset") applyDensityPreset();
+    else if (name === "view_density") f.view_density_preset.value = "custom";
+    else if (name === "view_height" && !f.view_density_preset.value.endsWith(`@${f.view_height.value}`))
+      f.view_density_preset.value = "custom";
+    if (name.startsWith("view_density")) f.view_preset.value = "density";
+    if (["view_preset", "view_fov", "view_height"].includes(name) || name.startsWith("view_density")) applyViewPreset();
+  }
   syncOutputs();
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify({ ...readOptions(), version: STORE_VERSION }));
