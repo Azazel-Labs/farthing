@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "farthing"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "glam 0.34.3",
  "gltf",
