@@ -547,6 +547,45 @@ fn chain_levels(demo: &mut Demo, opts: &LodOptions) -> (Vec<LevelInfo>, Vec<(usi
     (levels, textures)
 }
 
+/// With an error limit, a chain stops at the first level past it, which is left out with the
+/// ones after it. The first level (a recut's LOD0) stays whatever it measures.
+#[test]
+fn chains_stop_past_the_error_limit() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let limit = 0.02;
+    for textures in [
+        TextureMode::Recut,
+        TextureMode::Original,
+        TextureMode::Shared,
+    ] {
+        let all = LodOptions {
+            levels: 8,
+            shared_size: 512,
+            atlas: 128,
+            textures,
+            ..Default::default()
+        };
+        let (full, _) = chain_levels(&mut demo, &all);
+        let n = full
+            .iter()
+            .skip(2)
+            .position(|l| l.relative_error > limit)
+            .map(|p| p + 2)
+            .unwrap_or_else(|| panic!("{textures:?}: nothing in the full chain is past {limit}"));
+        let (capped, _) = chain_levels(
+            &mut demo,
+            &LodOptions {
+                max_error: limit,
+                ..all.clone()
+            },
+        );
+        assert_eq!(capped.len(), n, "{textures:?}");
+        for (a, b) in capped.iter().zip(&full) {
+            assert_eq!(a.triangles, b.triangles, "{textures:?}");
+        }
+    }
+}
+
 #[test]
 fn viewing_budget_drops_what_the_view_cannot_show() {
     let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
@@ -634,7 +673,44 @@ fn reports_missing_files() {
     let e = Demo::load(vec![("notes.txt".into(), b"hi".to_vec())])
         .err()
         .unwrap();
-    assert!(e.contains("no .glb or .gltf"), "{e}");
+    assert!(e.contains("no model found"), "{e}");
+}
+
+/// Formats besides glTF arrive through polysmelt: the OBJ is the model (not its MTL or
+/// texture), and its material keeps the texture it names.
+#[test]
+fn zipped_obj_loads_with_its_texture() {
+    let obj = b"mtllib m.mtl
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+usemtl skin
+f 1/1 2/2 3/3 4/4
+";
+    let mtl = b"newmtl skin
+Kd 1 1 1
+map_Kd skin.png
+";
+    let path = std::env::temp_dir().join(format!("farthing-skin-{}.png", std::process::id()));
+    Image::new(4, 4, Vec4::new(0.8, 0.4, 0.2, 1.0))
+        .save_png(&path, true)
+        .unwrap();
+    let png = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let archive = zip(&[
+        ("crate/m.mtl", mtl),
+        ("crate/skin.png", &png),
+        ("crate/m.obj", obj),
+    ]);
+    let demo = Demo::load(vec![("crate.zip".into(), archive)]).unwrap();
+    let info = demo.info();
+    assert_eq!((info.name.as_str(), info.triangles), ("m.obj", 2));
+    assert_eq!(info.textured_materials, 1);
 }
 
 /// The sample models the page offers (`python fetch_samples.py` downloads them into

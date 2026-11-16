@@ -5,7 +5,10 @@ locally in WebAssembly in a Web Worker. Nothing is uploaded.
 
 - **Input:** a `.glb`, a `.gltf` together with its `.bin` and texture files, a folder, or a
   `.zip` of any of these. External files are resolved by relative path, with a fallback to a
-  unique file name.
+  unique file name. FBX, OBJ (with its MTL), USD (`.usdz`, `.usd`, `.usda`, `.usdc`), 3MF, 3DS,
+  PLY, STL and MagicaVoxel `.vox` load too, read into glTF by
+  [polysmelt](https://crates.io/crates/polysmelt); their PNG, JPEG, WebP, TGA and BMP textures
+  come along. With several models in a drop, the shallowest wins, glTF first.
 - **Textures: Recut skin** (the default) treats the whole scene's skin as one surface to cut
   again: farthing merges the scene, unwraps it from scratch into mip-safe charts, and resamples
   every texel of the original materials (base color, normal map, roughness/metalness) into one
@@ -149,7 +152,8 @@ python -m http.server -d web 8000                  # then open http://localhost:
 Any static file server works if it serves `.js` as JavaScript. Opening `index.html` from disk
 (`file://`) doesn't work, because module workers and wasm need http. If
 [binaryen](https://github.com/WebAssembly/binaryen)'s `wasm-opt` is on `PATH`, `build.sh`
-also optimizes the module for size.
+also optimizes the module for size. CI installs it (binaryen 133), so the deployed page
+always gets the smaller module.
 
 **Sample models.** `fetch_samples.py` downloads a few CC0 models from the
 [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets), pinned to

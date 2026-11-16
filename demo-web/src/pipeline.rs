@@ -22,7 +22,10 @@ use farthing::host::{
     channels,
 };
 use farthing::image::{Downsample, DownsampleOptions, Image, Texture, linear_to_srgb};
-use farthing::io::{ExportTextures, GlbOptions, GltfMaterial, glb_bytes_with, load_gltf_with};
+use farthing::io::{
+    ExportTextures, GlbOptions, GltfMaterial, MODEL_EXTENSIONS, glb_bytes_with, load_gltf_with,
+    load_model,
+};
 use farthing::metrics::{SurfaceDistance, surface_distance};
 use farthing::reduce::{Quality, SeamMode, SimplifyOptions, Symmetry, repair, simplify};
 use farthing::uv::{ParamOptions, SourceTexels, parameterize, texel_density};
@@ -121,8 +124,13 @@ pub enum TextureShrink {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct LodOptions {
-    /// Levels after LOD0 (1–8).
+    /// Levels after LOD0 (1–8): the most there are, with [`max_error`](Self::max_error).
     pub levels: usize,
+    /// Stop at the first level that measures more than this deviation, as a fraction of the
+    /// scene's bounding-box diagonal: that level and the ones after it are left out. The first
+    /// level (a recut's LOD0) is always kept. 0 = always build [`levels`](Self::levels). The page
+    /// uses 2%: past that, levels look plainly wrong.
+    pub max_error: f32,
     /// Triangle ratio between consecutive levels.
     pub step: f32,
     pub fast: bool,
@@ -202,6 +210,7 @@ impl Default for LodOptions {
     fn default() -> Self {
         LodOptions {
             levels: 4,
+            max_error: 0.0,
             step: 0.5,
             fast: false,
             strict_seams: false,
@@ -240,6 +249,12 @@ impl Default for LodOptions {
 }
 
 impl LodOptions {
+    /// Whether level `level`, measuring `error` (world units), ends the chain: it is past
+    /// [`max_error`](Self::max_error) of `diagonal`, and not the first level.
+    pub(crate) fn past_max_error(&self, level: usize, error: f32, diagonal: f32) -> bool {
+        level > 1 && self.max_error > 0.0 && error > self.max_error * diagonal
+    }
+
     /// Pixels per radian of the view: `view_height` pixels over `view_fov` degrees (the
     /// defaults give [`reference_ppr`]).
     pub(crate) fn ppr(&self) -> f32 {
@@ -537,25 +552,25 @@ pub struct Demo {
 }
 
 impl Demo {
-    /// Loads the first `.glb` / `.gltf` (shallowest path, GLB first) among `files`; `.zip`
-    /// files are expanded first. Other files resolve the glTF's external URIs.
+    /// Loads the first model among `files` (shallowest path, then by format in the order of
+    /// [`MODEL_EXTENSIONS`]: GLB, glTF, FBX, ...); `.zip` files are expanded first. Other files
+    /// are what the model refers to: glTF buffers and images, MTL libraries, textures.
     pub fn load(files: Vec<(String, Vec<u8>)>) -> Result<Demo, String> {
         let files = expand_zips(files)?;
         let lower = |s: &str| s.to_ascii_lowercase();
-        let mut mains: Vec<usize> = (0..files.len())
-            .filter(|&i| {
-                let n = lower(&files[i].0);
-                n.ends_with(".glb") || n.ends_with(".gltf")
-            })
+        let format = |name: &str| {
+            let ext = lower(name.rsplit_once('.').map_or("", |(_, e)| e));
+            MODEL_EXTENSIONS.iter().position(|&e| e == ext)
+        };
+        let mut mains: Vec<(usize, usize)> = (0..files.len())
+            .filter_map(|i| Some((i, format(&files[i].0)?)))
             .collect();
-        mains.sort_by_key(|&i| {
-            let n = lower(&files[i].0);
-            (n.matches('/').count(), !n.ends_with(".glb"), n)
-        });
-        let Some(&main) = mains.first() else {
+        mains.sort_by_key(|&(i, rank)| (files[i].0.matches('/').count(), rank, lower(&files[i].0)));
+        let Some(&(main, rank)) = mains.first() else {
             let names: Vec<&str> = files.iter().map(|f| f.0.as_str()).take(12).collect();
             return Err(format!(
-                "no .glb or .gltf found (got: {})",
+                "no model found: reads .{} (got: {})",
+                MODEL_EXTENSIONS.join(", ."),
                 if names.is_empty() {
                     "nothing".into()
                 } else {
@@ -564,6 +579,12 @@ impl Demo {
             ));
         };
         let main_name = files[main].0.clone();
+        // Other formats go through polysmelt, which finds the files they refer to itself.
+        if MODEL_EXTENSIONS[rank] != "glb" && MODEL_EXTENSIONS[rank] != "gltf" {
+            let (scene, materials) =
+                load_model(&main_name, files).map_err(|e| format!("{main_name}: {e}"))?;
+            return Demo::from_scene(&main_name, scene, materials);
+        }
         let dir = main_name
             .rfind('/')
             .map_or("", |i| &main_name[..=i])
@@ -590,14 +611,15 @@ impl Demo {
         };
         let (scene, materials) =
             load_gltf_with(&files[main].1, resolve).map_err(|e| format!("{main_name}: {e}"))?;
+        Demo::from_scene(&main_name, scene, materials)
+    }
+
+    /// The demo of a model loaded from `path`.
+    fn from_scene(path: &str, scene: Scene, materials: Vec<GltfMaterial>) -> Result<Demo, String> {
         if scene.triangle_count() == 0 {
-            return Err(format!("{main_name} has no triangles"));
+            return Err(format!("{path} has no triangles"));
         }
-        let name = main_name
-            .rsplit('/')
-            .next()
-            .unwrap_or(&main_name)
-            .to_owned();
+        let name = path.rsplit('/').next().unwrap_or(path).to_owned();
         Ok(Demo {
             name,
             levels: vec![(scene.clone(), original_textures(&materials))],
@@ -789,8 +811,9 @@ impl Demo {
         let mut from: Vec<usize> = self.scene.meshes.iter().map(Mesh::triangle_count).collect();
         let mut from_level = 0;
         let shared = opts.textures == TextureMode::Shared;
-        if shared && bake_from > 1 {
-            self.shared_levels(opts, false, bake_from, now, emit)?;
+        if shared && bake_from > 1 && self.shared_levels(opts, false, bake_from, now, emit)? {
+            emit(Event::Stage("done"));
+            return Ok(());
         }
         let first_reduced = if shared { bake_from } else { 1 };
         for level in first_reduced..bake_from {
@@ -818,6 +841,10 @@ impl Demo {
                 let d = measure(&s);
                 Ok(((next, s, d), d.hausdorff, extended))
             })?;
+            if opts.past_max_error(level, d.hausdorff, diag) {
+                emit(Event::Stage("done"));
+                return Ok(());
+            }
             prev = next;
             if limit.is_some() {
                 from = prev.iter().map(|(m, _)| m.triangle_count()).collect();
@@ -881,6 +908,10 @@ impl Demo {
                 let d = measure(&Scene::from_mesh(mesh.clone()));
                 Ok(((m, e, mesh, d), d.hausdorff, x))
             })?;
+            // Checked before the unwrap and bake: a level left out costs only its reduction.
+            if opts.past_max_error(level, error, diag) {
+                break;
+            }
             geo = m;
             geo_error += e;
 
@@ -970,7 +1001,8 @@ impl Demo {
     /// repacked (or re-unwrapped) at the artist's texel density (up to `opts.shared_size` per
     /// side) and baked by exact transfer, then reduced level by level. Level 1's GLB carries the
     /// atlas. A `recut` always unwraps afresh, and its level 1 is LOD0: every triangle (unless a
-    /// viewing budget drops some), with the texture error of the resampling.
+    /// viewing budget drops some), with the texture error of the resampling. Returns whether a
+    /// level went past [`LodOptions::max_error`], which ends the chain there.
     fn shared_levels(
         &mut self,
         opts: &LodOptions,
@@ -978,7 +1010,7 @@ impl Demo {
         end: usize,
         now: &dyn Fn() -> f64,
         emit: &mut dyn FnMut(Event),
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let err = |e: Error| e.to_string();
         let mut t0 = now();
         let what = if recut { "Recut" } else { "Shared atlas" };
@@ -1148,6 +1180,9 @@ impl Demo {
                 let d = surface_distance(&source, &s.flatten().0, MEASURE_SAMPLES);
                 Ok(((m, e, s, d), d.hausdorff, x))
             })?;
+            if opts.past_max_error(level, error, diag) {
+                return Ok(true);
+            }
             mesh = m;
             error_bound += e;
             if limit.is_some() {
@@ -1224,7 +1259,7 @@ impl Demo {
             self.levels.push((s, ltex.clone()));
             t0 = now();
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Base color deviation of `mesh` drawn with `atlas` from `source` (the flattened scene)
@@ -1343,6 +1378,22 @@ fn reduce_to(
     target: usize,
     limit: Option<f32>,
 ) -> Result<(Mesh, f32, bool), Error> {
+    // A step of none (a recut's LOD0) with a limit: only the limit reduces, so skip the pass
+    // that would build the whole reducer to remove nothing.
+    if let Some(l) = limit
+        && target >= mesh.triangle_count()
+    {
+        let r = simplify(
+            mesh,
+            &SimplifyOptions {
+                target_ratio: None,
+                target_triangles: None,
+                max_error: Some(l),
+                ..opts.clone()
+            },
+        )?;
+        return Ok((r.mesh, r.error, true));
+    }
     let r = simplify(
         mesh,
         &SimplifyOptions {

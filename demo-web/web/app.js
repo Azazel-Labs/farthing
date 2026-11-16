@@ -9,6 +9,8 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import { Wireframe } from "three/addons/lines/Wireframe.js";
 import { WireframeGeometry2 } from "three/addons/lines/WireframeGeometry2.js";
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
 
 const $ = (s) => document.querySelector(s);
 const form = $("#opts");
@@ -35,9 +37,11 @@ let texShown = -1; // the level the texture panel was last asked for
 let texMaterial = -1; // the original's glTF material the panel shows, when it has several
 let mode = "single";
 let wireOn = false;
+let seamOn = false;
 /** levels[n] = { info, object, tex: { channel: ImageData }, stale } */
 let levels = [];
 let pendingDownload = null;
+let stoppedAt = null; // the last chain level when the run stopped short at the error limit
 
 // ---------------------------------------------------------------- viewer
 
@@ -62,9 +66,12 @@ scene.add(root, lod);
 // Its resolution must match the viewport, so render() sets it for each one.
 const dark = matchMedia("(prefers-color-scheme: dark)");
 const wireMat = new LineMaterial({ linewidth: 1.25, transparent: true, depthWrite: false });
+// UV seams: thicker lines in a warm color, over the wireframe.
+const seamMat = new LineMaterial({ linewidth: 2.5, transparent: true, depthWrite: false });
 const setWireColor = () => {
   wireMat.color.set(dark.matches ? 0x8fbcff : 0x1453c4);
   wireMat.opacity = dark.matches ? 0.75 : 0.7;
+  seamMat.color.set(dark.matches ? 0xffa94d : 0xe8590c);
 };
 setWireColor();
 dark.addEventListener("change", setWireColor);
@@ -110,9 +117,12 @@ function constrainCamera() {
   camera.far = dist + radius * 2;
 }
 
+const OVERLAYS = new Set(["__wire", "__seam"]);
+
+/** Shows or hides the wireframe and UV seam overlays on `object`'s meshes, building them as needed. */
 function setWire(object) {
   object.traverse((o) => {
-    if (!o.isMesh || o.name === "__wire" || o.userData.noWire) return;
+    if (!o.isMesh || OVERLAYS.has(o.name) || o.userData.noWire) return;
     let w = o.children.find((c) => c.name === "__wire");
     if (!w && wireOn) {
       w = new Wireframe(wireFor(o.geometry), wireMat);
@@ -121,8 +131,17 @@ function setWire(object) {
       o.add(w);
     }
     if (w) w.visible = wireOn;
+    let sm = o.children.find((c) => c.name === "__seam");
+    const sg = !sm && seamOn ? seamFor(o.geometry) : null;
+    if (sg) {
+      sm = new LineSegments2(sg, seamMat);
+      sm.name = "__seam";
+      sm.renderOrder = 2;
+      o.add(sm);
+    }
+    if (sm) sm.visible = seamOn;
     for (const m of [o.material].flat()) {
-      m.polygonOffset = wireOn;
+      m.polygonOffset = wireOn || seamOn;
       m.polygonOffsetFactor = 1;
       m.polygonOffsetUnits = 1;
     }
@@ -133,7 +152,7 @@ function dispose(object, ownMaterials) {
   object?.traverse((o) => {
     dropWire(o.geometry);
     o.geometry?.dispose();
-    if (ownMaterials && o.material && o.material !== wireMat) {
+    if (ownMaterials && o.material && o.material !== wireMat && o.material !== seamMat) {
       for (const k of ["map", "normalMap"]) o.material[k]?.dispose();
       o.material.dispose();
     }
@@ -216,6 +235,8 @@ function resetViewer() {
   }
   for (const w of wires.values()) w.dispose();
   wires.clear();
+  for (const g of seams.values()) g?.dispose();
+  seams.clear();
   lod.clear();
   levels = [];
   original = null;
@@ -231,7 +252,7 @@ let lodKey = "";
 function syncLod() {
   const h = renderer.getDrawingBufferSize(new THREE.Vector2()).y;
   const ready = levels.filter((l) => l?.object && l.info && !l.stale);
-  const key = ready.map((l) => l.object.uuid).join() + h + wireOn + lodVersion;
+  const key = ready.map((l) => l.object.uuid).join() + h + wireOn + seamOn + lodVersion;
   if (key === lodKey) return;
   lodKey = key;
   lod.clear();
@@ -370,6 +391,7 @@ function render() {
     camera.aspect = half / h;
     camera.updateProjectionMatrix();
     wireMat.resolution.set(half, h);
+    seamMat.resolution.set(half, h);
     renderer.setScissorTest(true);
     show(displayed(0));
     renderer.setViewport(0, 0, half, h);
@@ -386,6 +408,7 @@ function render() {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     wireMat.resolution.set(w, h);
+    seamMat.resolution.set(w, h);
     if (mode === "auto") {
       syncLod();
       renderer.render(scene, camera);
@@ -444,6 +467,7 @@ let cutInflight = false;
 let cutKey = "";
 let lodVersion = 0;
 const wires = new Map(); // geometry -> its wireframe, shared by every mesh drawing it
+const seams = new Map(); // geometry -> its UV seam lines (null: none), likewise
 const plain = { vertexColors: false, flatShading: false };
 const tmpV2 = new THREE.Vector2();
 const tmpV3 = new THREE.Vector3();
@@ -475,6 +499,65 @@ function dropWire(geometry) {
     w.dispose();
     wires.delete(geometry);
   }
+  if (geometry && seams.has(geometry)) {
+    seams.get(geometry)?.dispose();
+    seams.delete(geometry);
+  }
+}
+
+function seamFor(geometry) {
+  if (!seams.has(geometry)) seams.set(geometry, seamGeometry(geometry));
+  return seams.get(geometry);
+}
+
+/**
+ * The UV seams of `geometry` as line segments, or null when it has none: edges whose triangles
+ * meet in position but not in texture coordinates. Open borders are not seams.
+ */
+function seamGeometry(geometry) {
+  const pos = geometry.attributes.position;
+  const uv = geometry.attributes.uv;
+  if (!pos || !uv) return null;
+  // Vertices split along a seam share a position: number the distinct positions.
+  const ids = new Map();
+  const pid = new Uint32Array(pos.count);
+  for (let v = 0; v < pos.count; v++) {
+    const k = `${pos.getX(v)},${pos.getY(v)},${pos.getZ(v)}`;
+    let id = ids.get(k);
+    if (id === undefined) ids.set(k, (id = ids.size));
+    pid[v] = id;
+  }
+  const n = ids.size;
+  const index = geometry.index;
+  const corners = index ? index.count : pos.count;
+  const at = index ? (i) => index.getX(i) : (i) => i;
+  const same = (a, b) =>
+    a === b || (Math.abs(uv.getX(a) - uv.getX(b)) < 1e-5 && Math.abs(uv.getY(a) - uv.getY(b)) < 1e-5);
+  const first = new Map(); // edge (lower position id first) -> the vertices of its first triangle
+  const seam = new Set();
+  for (let t = 0; t + 2 < corners; t += 3) {
+    for (let e = 0; e < 3; e++) {
+      let a = at(t + e);
+      let b = at(t + ((e + 1) % 3));
+      if (pid[a] === pid[b]) continue;
+      if (pid[a] > pid[b]) [a, b] = [b, a];
+      const key = pid[a] * n + pid[b];
+      const f = first.get(key);
+      if (!f) first.set(key, [a, b]);
+      else if (!same(f[0], a) || !same(f[1], b)) seam.add(key);
+    }
+  }
+  if (!seam.size) return null;
+  const out = new Float32Array(seam.size * 6);
+  let o = 0;
+  for (const key of seam) {
+    for (const v of first.get(key)) {
+      out[o++] = pos.getX(v);
+      out[o++] = pos.getY(v);
+      out[o++] = pos.getZ(v);
+    }
+  }
+  return new LineSegmentsGeometry().setPositions(out);
 }
 
 const tint = new THREE.Color();
@@ -723,14 +806,13 @@ function buildClusters(info, buffers) {
         inst.object.geometry = g;
         inst.object.material = material;
       }
-      // New triangles: the wireframe is rebuilt.
-      const w = inst.object.children.find((c) => c.name === "__wire");
-      if (w) {
-        inst.object.remove(w);
+      // New triangles: the wireframe and seams are rebuilt.
+      for (const c of inst.object.children.filter((c) => OVERLAYS.has(c.name))) {
+        inst.object.remove(c);
         dropWire(g);
       }
     }
-    if (wireOn) setWire(group);
+    if (wireOn || seamOn) setWire(group);
   };
   return {
     kind: "clusters",
@@ -834,7 +916,7 @@ function flatGeometry(m, sel, shading) {
 function nodeMeshes(node) {
   const out = node.isMesh ? [node] : [];
   for (const c of node.children)
-    if (c.isMesh && c.name !== "__wire" && original.assoc.get(c)?.nodes === undefined) out.push(c);
+    if (c.isMesh && !OVERLAYS.has(c.name) && original.assoc.get(c)?.nodes === undefined) out.push(c);
   return out;
 }
 
@@ -1009,7 +1091,7 @@ function drawHlodTextures() {
   bake.classList.toggle("empty", !maps.base_color?.image);
   $("#bake-title").textContent = p ? `Proxy textures · node ${p.info.node} (tree level ${p.info.level})` : "Proxy textures";
   if (!maps.base_color?.image) {
-    $("#bake-stats").textContent = extra?.kind === "hlod" ? "Proxies are geometry only (Bake proxy textures is off)." : "";
+    setStats(extra?.kind === "hlod" ? "Proxies are geometry only (Bake proxy textures is off)." : "");
     return;
   }
   for (const [ch, t] of Object.entries(maps)) {
@@ -1022,7 +1104,7 @@ function drawHlodTextures() {
     ctx.clearRect(0, 0, c.width, c.height);
     ctx.drawImage(img, 0, 0);
   }
-  $("#bake-stats").textContent = `coverage ${(p.info.coverage * 100).toFixed(1)}% · ${fmtInt(p.info.triangles)} tris · ${fmtBytes(p.info.bytes)}`;
+  setStats(`${fmtInt(p.info.triangles)} tris · ${fmtBytes(p.info.bytes)} · ${fmtPct(p.info.coverage)} covered`);
 }
 
 // ---- splats
@@ -1212,10 +1294,75 @@ $("#splat-draw").addEventListener("change", () => {
 
 // ---------------------------------------------------------------- worker
 
+// The engine: the wasm module, streamed in once with a progress bar (compiling as it arrives)
+// and handed, compiled, to every worker, so respawning one costs neither again.
+const engineProgress = { got: 0, total: 0, done: false }; // done: downloaded, maybe compiling
+let engineModule = null;
+let waitingForEngine = false; // a load is waiting for it, so the overlay shows its progress
+const engine = (async () => {
+  const pkg = (file) => new URL(`./pkg/${file}`, import.meta.url);
+  // A gzipped response's Content-Length is the compressed size, so build.sh writes the real one.
+  fetch(pkg("wasm-size.txt"))
+    .then((r) => (r.ok ? r.text() : ""))
+    .then((t) => {
+      if (!engineProgress.total && +t > 0) engineProgress.total = +t;
+      showEngine();
+    })
+    .catch(() => {});
+  const r = await fetch(pkg("farthing_demo_web_bg.wasm"));
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  if (!r.headers.get("content-encoding")) engineProgress.total = +r.headers.get("content-length") || 0;
+  if (!r.body) return WebAssembly.compile(await r.arrayBuffer());
+  const [counted, compiled] = r.body.tee();
+  const module = WebAssembly.compileStreaming
+    ? WebAssembly.compileStreaming(new Response(compiled, { headers: { "content-type": "application/wasm" } }))
+    : new Response(compiled).arrayBuffer().then((b) => WebAssembly.compile(b));
+  module.catch(() => {}); // reported through `engine` below, not as an unhandled rejection
+  const reader = counted.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    engineProgress.got += value.length;
+    showEngine();
+  }
+  engineProgress.done = true;
+  showEngine();
+  return module;
+})();
+engine.then(
+  (module) => {
+    engineModule = module;
+    $("#engine").hidden = true;
+  },
+  (err) => {
+    const el = $("#engine");
+    el.classList.remove("indeterminate");
+    el.querySelector(".nums").textContent = `Could not load the engine: ${err.message ?? err}`;
+    setStatus(`Could not load the engine: ${err.message ?? err}`, "error");
+  },
+);
+/** The engine's download, under the empty-state hint and, while a load waits for it, in the overlay. */
+function showEngine() {
+  if (engineModule) return;
+  const { got, done } = engineProgress;
+  const total = engineProgress.total >= got ? engineProgress.total : 0;
+  const phase = done ? "Preparing the engine…" : "Downloading the engine…";
+  const el = $("#engine");
+  el.hidden = false;
+  el.classList.toggle("indeterminate", done || !total);
+  el.querySelector(".meter").style.setProperty("--p", total ? got / total : 0);
+  el.querySelector(".nums").textContent = done ? phase : `${phase} ${mb(got)}${total ? ` of ${mb(total)}` : ""}`;
+  if (waitingForEngine) {
+    if (!done) loadingProgress(phase, got, total);
+    else if (loadingEl.querySelector(".phase").textContent !== phase) loadingBusy(phase);
+  }
+}
+
 function spawn() {
   worker?.terminate();
   cutInflight = false;
-  worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  const w = (worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" }));
+  engine.then((module) => w.postMessage({ type: "engine", module }), () => {});
   worker.onmessage = ({ data }) => onWorker(data);
   worker.onerror = (e) => {
     busy = false;
@@ -1244,7 +1391,9 @@ function loadingProgress(phase, got, total) {
   loadingEl.querySelector(".meter").style.setProperty("--p", total ? got / total : 0);
   loadingEl.querySelector(".nums").textContent = total
     ? `${mb(got)} of ${mb(total)} · ${Math.floor((100 * got) / total)}%`
-    : "";
+    : got
+      ? mb(got)
+      : "";
 }
 /** Indeterminate phase with an elapsed-time counter (decoding a textured model takes seconds). */
 function loadingBusy(phase) {
@@ -1262,6 +1411,8 @@ function hideLoading() {
 }
 loadingEl.querySelector(".cancel").addEventListener("click", () => {
   fetching?.abort();
+  loadToken++; // a load waiting for the engine gives up
+  waitingForEngine = false;
   if (busy && !original) {
     // Decoding: wasm can't be interrupted, so drop the worker.
     spawn();
@@ -1319,7 +1470,10 @@ async function onWorker(m) {
     case "done": {
       busy = false;
       const chain = shownMode === "chain";
-      const n = chain ? chainLevels(runOpts) : MODE_LEVELS[shownMode];
+      let n = chain ? chainLevels(runOpts) : MODE_LEVELS[shownMode];
+      // The chain stops at the first level past the error limit, which is left out.
+      const built = levels.findLastIndex((l) => l?.info && !l.stale);
+      if (chain && built < n) n = stoppedAt = Math.max(built, 0);
       for (let i = levels.length - 1; i > n; i--) {
         disposeLevel(levels[i]);
         levels.pop();
@@ -1334,7 +1488,11 @@ async function onWorker(m) {
         splats: `${n} splat levels`,
       }[shownMode];
       const live = shownMode === "clusters" || shownMode === "hlod" ? "; the cut follows the camera" : "";
-      setStatus(`Built ${what} in ${((performance.now() - runStart) / 1000).toFixed(2)} s${live}`);
+      const stop =
+        stoppedAt != null
+          ? `; stopped there, as the next level deviates more than ${+(runOpts.max_error * 100).toFixed(2)}%`
+          : "";
+      setStatus(`Built ${what} in ${((performance.now() - runStart) / 1000).toFixed(2)} s${stop}${live}`);
       cutKey = "";
       renderRows();
       cutStats();
@@ -1343,7 +1501,7 @@ async function onWorker(m) {
     case "download": {
       const type = { ply: "application/octet-stream", zip: "application/zip" }[m.format] ?? "model/gltf-binary";
       const url = URL.createObjectURL(new Blob([m.glb], { type }));
-      const stem = `${(assetInfo?.name ?? "model").replace(/\.(glb|gltf|zip)$/i, "")}_${lodName(m.level)}`;
+      const stem = `${(assetInfo?.name ?? "model").replace(/\.[^./]+$/, "")}_${lodName(m.level)}`;
       const a = Object.assign(document.createElement("a"), {
         href: url,
         download: m.format === "zip" ? `${stem}_cooked.zip` : `${stem}.${m.format}`,
@@ -1425,14 +1583,34 @@ function startRun() {
   runOpts = readOptions();
   if (runOpts.mode !== shownMode) switchMode(runOpts.mode);
   for (const l of levels) if (l) l.stale = true;
+  stoppedAt = null;
   renderRows();
   setStatus("Starting…", "busy");
   worker.postMessage({ type: "run", runId: id, options: runOpts });
 }
 
+let loadToken = 0; // bumped by every load and cancel, so a load waiting for the engine can tell
 async function load(list, title) {
   if (!list.length) return;
   if (loadingEl.hidden) showLoading(title ?? (list.length === 1 ? list[0].name : `${list.length} files`));
+  const token = ++loadToken;
+  if (!engineModule) {
+    waitingForEngine = true;
+    loadingProgress("Downloading the engine…", 0, 0);
+    showEngine();
+    try {
+      await engine;
+    } catch (err) {
+      if (token === loadToken) {
+        waitingForEngine = false;
+        hideLoading();
+        setStatus(`Could not load the engine: ${err.message ?? err}`, "error");
+      }
+      return;
+    }
+    if (token !== loadToken) return;
+    waitingForEngine = false;
+  }
   loadingBusy("Decoding geometry and textures…");
   resetViewer();
   rowsEl.replaceChildren();
@@ -1474,7 +1652,7 @@ function renderRows() {
   const chain = m === "chain";
   // A recut chain is the original, LOD0 (the recut) and the levels reduced from it.
   const recut = chain && form.elements.textures.value === "recut";
-  const n = chain ? chainLevels(readOptions()) : MODE_LEVELS[m];
+  const n = chain ? (stoppedAt ?? chainLevels(readOptions())) : MODE_LEVELS[m];
   const bakeFrom = recut ? Infinity : +form.elements.bake_from.value || Infinity;
   const near = form.elements.textures.value === "original" ? "reduced" : "shared";
   const total = assetInfo?.triangles ?? 0;
@@ -1571,17 +1749,35 @@ const FORMAT_NAMES = {
 
 const TEX_CAPTIONS = { base_color: "Base color", normal: "Normal", orm: "Rough / metal" };
 
-/** The panel's mipple line: formats, quality, sizes. */
+// The panel shows only the textures and their channel names; everything else about them lives in
+// the tooltip, so nothing under the images changes size when another level is picked.
+let statsTip = "";
+let cookedTip = "";
+let formatTips = {};
+function setTexTip() {
+  for (const ch of Object.keys(TEX_CAPTIONS))
+    $(`#tex-${ch}`).title = [formatTips[ch] ?? TEX_CAPTIONS[ch], statsTip, cookedTip].filter(Boolean).join("\n\n");
+}
+
+/** Sets the textures' tooltip: a short summary followed by the details. */
+function setStats(short, details = []) {
+  statsTip = [short, ...details].filter(Boolean).join("\n");
+  setTexTip();
+}
+
+/** A percentage with two significant digits, never in exponent notation. */
+const fmtPct = (x) => {
+  const p = x * 100;
+  return p >= 10 ? `${Math.round(p)}%` : `${p.toPrecision(2)}%`;
+};
+
+/** Adds the mipple cook (formats, sizes, quality) to the textures' tooltips. */
 function drawCooked(i) {
-  const el = $("#bake-cooked");
   const c = i?.cooked;
-  for (const ch of Object.keys(TEX_CAPTIONS)) {
-    const t = c?.textures.find((x) => x.channel === ch);
-    const cap = $(`#tex-${ch}`).nextElementSibling;
-    cap.textContent = t ? `${TEX_CAPTIONS[ch]} · ${cookedFormats({ textures: [t] })}` : TEX_CAPTIONS[ch];
-  }
-  el.hidden = !c;
-  if (!c) return;
+  formatTips = {};
+  for (const t of c?.textures ?? []) formatTips[t.channel] = `${TEX_CAPTIONS[t.channel]} · ${cookedFormats({ textures: [t] })}`;
+  cookedTip = "";
+  if (!c) return setTexTip();
   const quality = c.textures
     .map((t) => {
       const q = t.normal_error != null ? `${t.normal_error.toFixed(2)}° off` : t.psnr != null ? `${t.psnr.toFixed(1)} dB` : "lossless";
@@ -1589,17 +1785,18 @@ function drawCooked(i) {
     })
     .join(", ");
   const rdo = c.lambda > 0 ? `, RDO λ ${c.lambda}` : "";
-  el.innerHTML =
-    `Cooked by <a href="https://azazel-labs.github.io/Mipple/" target="_blank" rel="noopener">mipple</a> for ${esc(c.target)} ` +
-    `(effort ${c.effort}${rdo}) in ${(c.ms / 1000).toFixed(1)} s and drawn decoded, so what you see is what the GPU samples: ` +
-    `${esc(quality)}. ${fmtBytes(c.gpu_bytes)} on the GPU instead of ${fmtBytes(c.rgba_bytes)} as RGBA8 ` +
-    `(${(c.rgba_bytes / c.gpu_bytes).toFixed(1)}× less); ${fmtBytes(c.ktx2_bytes)} of KTX2 + Zstd on disk, ` +
-    `${fmtBytes(c.ship_bytes)} with the geometry (the row's .zip).`;
+  cookedTip =
+    `Cooked by mipple for ${c.target} (effort ${c.effort}${rdo}) in ${(c.ms / 1000).toFixed(1)} s and drawn decoded: ` +
+    `what you see is what the GPU samples.\n${quality}\n` +
+    `${fmtBytes(c.gpu_bytes)} on the GPU instead of ${fmtBytes(c.rgba_bytes)} as RGBA8 ` +
+    `(${(c.rgba_bytes / c.gpu_bytes).toFixed(1)}× less)\n` +
+    `${fmtBytes(c.ktx2_bytes)} of KTX2 + Zstd on disk, ${fmtBytes(c.ship_bytes)} with the geometry (the row's .zip)`;
+  setTexTip();
 }
 
 /** How far a recut's base color is from the original materials. */
 const texErrorText = (i) =>
-  `base color ${i.texture_error.toFixed(1)} levels in 255 from the original on average after resampling ` +
+  `Base color ${i.texture_error.toFixed(1)} levels in 255 from the original on average after resampling ` +
   `(99th percentile ${i.texture_error_p99.toFixed(0)})`;
 
 const updateRow = () => renderRows();
@@ -1636,11 +1833,12 @@ const UV_MAX_TRIANGLES = 300_000;
 function putTexture(ch, src) {
   const c = $(`#tex-${ch}`);
   if (!c) return null;
-  const ctx = c.getContext("2d");
+  const ctx = c.getContext("2d", { willReadFrequently: ch === "orm" });
   if (src instanceof ImageData) {
     c.width = src.width;
     c.height = src.height;
     ctx.putImageData(src, 0, 0);
+    if (ch === "orm") roughMetalOnly(ctx, c);
     return c;
   }
   const w = src?.width ?? 0;
@@ -1655,7 +1853,19 @@ function putTexture(ch, src) {
   } catch {
     return null; // a compressed texture (KTX2 and the like) has no drawable image
   }
+  if (ch === "orm") roughMetalOnly(ctx, c);
   return c;
+}
+
+/**
+ * Clears red on a metallic-roughness preview. glTF reads only green (roughness) and blue
+ * (metalness) there; red is occlusion when the texture doubles as one, which bakes write as 1
+ * (none) and many originals leave 0, so the same material would look recolored.
+ */
+function roughMetalOnly(ctx, c) {
+  const img = ctx.getImageData(0, 0, c.width, c.height);
+  for (let i = 0; i < img.data.length; i += 4) img.data[i] = 0;
+  ctx.putImageData(img, 0, 0);
 }
 
 /**
@@ -1735,7 +1945,7 @@ function drawOriginalTextures(level) {
   $("#bake").classList.toggle("empty", !e);
   $("#bake-title").textContent = `Original textures · ${lodName(level)}${l?.stale ? " (updating)" : ""}`;
   if (!e) {
-    $("#bake-stats").textContent = "The original has no textures: its materials are plain colors.";
+    setStats("No textures: plain-color materials.", ["The original has no textures: its materials are plain colors."]);
     return;
   }
   const m = e.m;
@@ -1747,23 +1957,29 @@ function drawOriginalTextures(level) {
   const keep = (mat) => [mat.map, mat.normalMap, mat.roughnessMap, mat.metalnessMap].some((t) => t && mine.has(t));
   const tris = drawUvs(drawn.base_color ?? drawn.normal ?? drawn.orm, l?.object, keep);
   const img = (m.map ?? m.normalMap ?? m.roughnessMap ?? m.metalnessMap)?.image;
-  const parts = [label(e)];
+  const short = [];
+  const details = [label(e)];
   if (img?.width) {
+    short.push(`${img.width} × ${img.height}`);
     const big = img.width > PANEL_SIDE || img.height > PANEL_SIDE;
-    parts.push(`${img.width} × ${img.height}${big ? ` (shown at most ${PANEL_SIDE} across)` : ""}`);
+    details.push(`${img.width} × ${img.height}${big ? ` (shown at most ${PANEL_SIDE} across)` : ""}`);
   }
   const missing = Object.entries(maps)
     .filter(([, t]) => !t)
     .map(([ch]) => CHANNEL_NAMES[ch]);
-  if (missing.length) parts.push(`no ${missing.join(" or ")} map`);
-  if (Object.entries(maps).some(([ch, t]) => t && !drawn[ch])) parts.push("compressed textures can't be shown");
-  parts.push(
+  if (missing.length) details.push(`No ${missing.join(" or ")} map`);
+  if (Object.entries(maps).some(([ch, t]) => t && !drawn[ch])) {
+    short.push("compressed");
+    details.push("Compressed textures can't be shown");
+  }
+  short.push(`${fmtInt(tris)} UV tris`);
+  details.push(
     tris > UV_MAX_TRIANGLES && $("#uv-wire").checked
       ? `${fmtInt(tris)} triangles, too many to draw their UVs`
       : `UVs of ${fmtInt(tris)} triangles`,
   );
-  if (list.length > 1) parts.push(`${list.length} textured materials`);
-  $("#bake-stats").textContent = parts.join(" · ");
+  if (list.length > 1) details.push(`${list.length} textured materials`);
+  setStats(short.join(" · "), details);
 }
 
 $("#bake-material").addEventListener("change", (e) => {
@@ -1801,10 +2017,11 @@ function drawTextures(level) {
   drawCooked(l?.info);
   if (!l) {
     $("#bake-title").textContent = "Baked textures";
-    $("#bake-stats").textContent =
+    setStats(
       form.elements.textures.value !== "recut" && +form.elements.bake_from.value === 0
         ? "No proxy levels (Bake proxy from: Never)."
-        : "";
+        : "",
+    );
     return;
   }
   for (const [ch, img] of Object.entries(l.tex)) putTexture(ch, img);
@@ -1814,32 +2031,38 @@ function drawTextures(level) {
   // A recut's levels carry labels; a shared chain's do not.
   const what = shared ? (i.label ? "Recut atlas" : "Shared atlas") : "Baked textures";
   $("#bake-title").textContent = `${what} · ${lodName(level)}${l.stale ? " (updating)" : ""}`;
-  const parts = [];
+  const short = [];
+  const details = [];
   const k = i?.texture_halvings ?? 0;
-  if (shared)
-    parts.push(
-      `${i.atlas_width} × ${i.atlas_height}`,
-      `${((i.density_scale * 100) / 2 ** k).toPrecision(2)}% of the ${i.view_texel_density ? "capped" : "artist's"} texel density`,
+  if (shared) {
+    const density = i.density_scale / 2 ** k;
+    short.push(`${i.atlas_width} × ${i.atlas_height}`, `${fmtPct(density)} density`);
+    details.push(
+      `${i.atlas_width} × ${i.atlas_height} atlas`,
+      `${fmtPct(density)} of the ${i.view_texel_density ? "capped" : "artist's"} texel density`,
     );
+  }
   if (k) {
     const sharpen = runOpts?.texture_sharpen ? `, sharpen ${runOpts.texture_sharpen}` : "";
     const from = shared ? `LOD${i.label ? 0 : 1}'s atlas` : "the proxy atlas";
-    parts.push(`${from} at 1/${2 ** k} the side (${filterName(i.texture_filter ?? runOpts?.texture_filter)}${sharpen})`);
+    details.push(`Drawn with ${from} at 1/${2 ** k} the side (${filterName(i.texture_filter ?? runOpts?.texture_filter)}${sharpen})`);
   } else if (shared && i.shared_textures != null && i.shared_textures !== level)
-    parts.push(`drawn with ${lodName(i.shared_textures)}'s atlas`);
+    details.push(`Drawn with ${lodName(i.shared_textures)}'s atlas`);
   if (shared && i.view_texel_density)
-    parts.push(
-      `capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit, a texel per the error LOD${i.label ? 0 : 1} may have` +
-        (i.view_texels != null ? ` (${(i.view_texels * 100).toPrecision(2)}% of the artist's texels)` : ""),
+    details.push(
+      `Capped at ${fmtInt(Math.round(i.view_texel_density))} texels per unit, a texel per the error LOD${i.label ? 0 : 1} may have` +
+        (i.view_texels != null ? ` (${fmtPct(i.view_texels)} of the artist's texels)` : ""),
     );
-  if (i?.texture_error != null) parts.push(texErrorText(i));
-  if (i?.coverage != null)
-    parts.push(
-      `coverage ${(i.coverage * 100).toFixed(1)}%`,
-      `${i.charts} charts`,
-      `utilization ${(i.utilization * 100).toFixed(1)}%`,
-    );
-  $("#bake-stats").textContent = parts.join(" · ");
+  if (i?.texture_error != null) {
+    short.push(`Δ ${i.texture_error.toFixed(1)}/255`);
+    details.push(texErrorText(i));
+  }
+  if (i?.coverage != null) {
+    if (!shared) short.push(`${fmtPct(i.coverage)} covered`);
+    short.push(`${fmtPct(i.utilization)} packed`);
+    details.push(`Coverage ${fmtPct(i.coverage)}, ${i.charts} charts, utilization ${fmtPct(i.utilization)}`);
+  }
+  setStats(short.join(" · "), details);
 }
 
 rowsEl.addEventListener("click", (e) => {
@@ -1889,6 +2112,10 @@ $("#wire").addEventListener("change", (e) => {
   wireOn = e.target.checked;
   for (const l of levels) if (l?.object) setWire(l.object);
 });
+$("#seams").addEventListener("change", (e) => {
+  seamOn = e.target.checked;
+  for (const l of levels) if (l?.object) setWire(l.object);
+});
 
 // ---------------------------------------------------------------- options
 
@@ -1903,6 +2130,7 @@ function readOptions() {
     planar_uv: f.planar_uv.checked,
     textures: f.textures.value,
     lod0_error: Math.max(0, +f.lod0_error.value || 0) / 100,
+    max_error: Math.max(0, +f.max_error.value || 0) / 100,
     shared_size: +f.shared_size.value,
     view_distance: Math.max(0, +f.view_distance.value || 0),
     view_preset: f.view_preset.value,
@@ -2294,3 +2522,6 @@ addEventListener("drop", clearCurrent);
 // ?model=<url> loads a .glb (or .zip) on start, e.g. index.html?model=samples/Lantern.glb
 const startUrl = new URLSearchParams(location.search).get("model");
 if (startUrl) loadUrl(startUrl, startUrl, 0);
+
+// Under the hint from the start, before the first bytes arrive (here, once `mb` and the overlay exist).
+showEngine();

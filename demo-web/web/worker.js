@@ -2,12 +2,16 @@
 // and respawns the worker to cancel a run, then re-sends the files.
 import init, { Session } from "./pkg/farthing_demo_web.js";
 
-const ready = init();
+// The page downloads and compiles the module once and posts it to every worker it spawns, so a
+// respawn (a cancel) neither downloads nor compiles it again.
+let start;
+const ready = new Promise((resolve) => (start = resolve));
 let session = null;
 
 const post = (msg, transfer = []) => self.postMessage(msg, transfer);
 
 self.onmessage = async ({ data }) => {
+  if (data.type === "engine") return start(init({ module_or_path: data.module }));
   try {
     await ready;
     if (data.type === "load") {

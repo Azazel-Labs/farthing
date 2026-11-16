@@ -100,6 +100,17 @@ jobs:
       # mipple's Zstd (zstd-sys) compiles C for wasm32 and needs a clang with the WebAssembly
       # backend (the runner image usually has one).
       - run: command -v clang || (sudo apt-get update && sudo apt-get install -y --no-install-recommends clang)
+      # binaryen's wasm-opt, which build.sh runs to shrink the module Pages serves. Pinned by hash.
+      - name: Install wasm-opt
+        env:
+          BINARYEN: version_133
+          SHA256: 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "https://github.com/WebAssembly/binaryen/releases/download/$BINARYEN/binaryen-$BINARYEN-x86_64-linux.tar.gz"
+          echo "$SHA256  binaryen-$BINARYEN-x86_64-linux.tar.gz" | sha256sum -c -
+          tar xzf "binaryen-$BINARYEN-x86_64-linux.tar.gz"
+          echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
       - run: sh demo-web/build.sh
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v5

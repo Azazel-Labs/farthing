@@ -3,7 +3,7 @@ name = "farthing-demo-web"
 description = "Browser demo: drop a glTF, tune LOD options, watch the chain build and bake."
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.96"
 license = "MIT-0"
 publish = false
 
@@ -14,7 +14,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-farthing = { path = "../crates/farthing" }
+# Every model format polysmelt reads (all pure Rust); USD is what needs Rust 1.96.
+farthing = { path = "../crates/farthing", features = ["usd"] }
 glam = "0.34"
 # Texture compression (BC, ETC2, ASTC, KTX2 + Zstd). CPU only: no wgpu, no CLI. Its Zstd is C,
 # so the wasm32 build needs a clang that targets wasm32 (see build.sh).

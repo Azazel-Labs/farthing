@@ -134,6 +134,12 @@ main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0;
   position: absolute; inset: 0; display: grid; place-items: center; padding: 24px;
   color: var(--muted); font-size: 16px; pointer-events: none; text-align: center;
 }
+#empty p { margin: 0; }
+/* The engine (wasm) download, under the hint until it is ready */
+#engine { display: flex; flex-direction: column; gap: 6px; width: min(320px, 100%); margin: 16px auto 0; }
+#engine[hidden] { display: none; }
+#engine .nums { font-family: var(--mono); font-size: 12px; }
+#engine.indeterminate .meter span { width: 35%; animation: slide 1.1s ease-in-out infinite; transition: none; }
 
 /* Auto mode's magnifier */
 #mag {
@@ -199,11 +205,11 @@ main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0;
 #loading .body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
 #loading .title { font-size: 17px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #loading .phase { color: var(--muted); font-size: 13px; }
-#loading .meter {
+.meter {
   position: relative; height: 10px; border-radius: 5px; overflow: hidden;
   background: color-mix(in srgb, var(--accent) 16%, var(--view));
 }
-#loading .meter span {
+.meter span {
   position: absolute; inset: 0 auto 0 0; width: calc(var(--p, 0) * 100%);
   border-radius: 5px; background: var(--accent); transition: width 0.15s;
 }
@@ -214,7 +220,7 @@ main { display: grid; grid-template-rows: 1fr auto; min-width: 0; min-height: 0;
 @keyframes slide { from { left: -35%; } to { left: 100%; } }
 @keyframes fade-in { from { opacity: 0; } }
 @media (prefers-reduced-motion: reduce) {
-  #loading.indeterminate .meter span { animation: none; width: 100%; opacity: 0.5; }
+  #loading.indeterminate .meter span, #engine.indeterminate .meter span { animation: none; width: 100%; opacity: 0.5; }
 }
 
 #panel {
@@ -251,22 +257,21 @@ td button { padding: 0 8px; font-size: 12px; }
 #cut dd.bad { color: var(--warn); }
 
 #bake { width: 300px; }
-#bake h3 { margin: 0; font-size: 13px; }
+#bake h3 { margin: 0; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 #bake .bake-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin: 0 0 6px; }
 #bake .bake-head label { font-size: 12px; color: var(--muted); }
-#bake-material { width: 100%; margin: 0 0 6px; font-size: 12px; }
+#bake-material { display: block; width: 100%; margin: 0 0 6px; font-size: 12px; }
+#bake-material[hidden] { visibility: hidden; }
 #bake .tex { display: flex; gap: 8px; }
-#bake figure { margin: 0; flex: 1; }
+#bake figure { margin: 0; flex: 1; min-width: 0; }
 #bake canvas {
   width: 100%; aspect-ratio: 1; display: block; border: 1px solid var(--line); border-radius: 4px;
   image-rendering: pixelated;
   background: repeating-conic-gradient(var(--line) 0 25%, transparent 0 50%) 0 0 / 16px 16px;
 }
-#bake figcaption { font-size: 12px; color: var(--muted); text-align: center; }
-#bake p { font-size: 12px; color: var(--muted); margin: 6px 0 0; font-family: var(--mono); }
+#bake figcaption { font-size: 12px; color: var(--muted); text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #bake.empty canvas { visibility: hidden; }
-#bake #bake-cooked { font-family: inherit; }
-#bake #bake-cooked a, #cook .mipple a { color: var(--accent); }
+#cook .mipple a { color: var(--accent); }
 #cook .mipple { line-height: 1.45; }
 
 @media (max-width: 900px) {
