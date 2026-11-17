@@ -300,8 +300,9 @@ What the speed work changed, and what it found:
 - **Batched collapse order (v5 default).** Instead of one collapse at a time from a priority
   queue, each round ranks candidates in parallel and takes the cheapest eighth. It executes
   them in cost order, each position at most once per round. A candidate is re-evaluated only
-  if an earlier collapse in the round touched its neighborhood; otherwise its cached cost,
-  wedge map and validity are provably still exact. Changed positions are re-ranked in parallel
+  if an earlier collapse in the round touched its neighborhood; otherwise its cached cost and
+  wedge map are provably still exact. Validity is checked at commit; see
+  [Reducer work per collapse](#reducer-work-per-collapse). Changed positions are re-ranked in parallel
   between rounds, and a stalled round escalates (all candidates, then a full re-rank) before
   stopping. There is no heap. On the benchmark it matches or beats the exact greedy order on
   every metric (8 assets × 3 ratios: Hausdorff −3%, mean −2%, normals −2%, UV equal),
@@ -321,6 +322,52 @@ What the speed work changed, and what it found:
   reduced concurrently with locked borders (interiors to the final density), then one pass
   handles the border bands. Clusters share the whole mesh's normalization frame. Output is
   identical on any machine and thread count.
+
+### Reducer work per collapse
+
+Why farthing is slower than meshoptimizer: the quality options account for about 1.6×. The
+rest is work per candidate. farthing checks validity eagerly for every ranked candidate,
+builds wedge maps in f64 for each one, and costs every neighbor in full. meshoptimizer works
+in f32, checks flips only when it commits a collapse (about 1.03–1.3 checks per collapse),
+and finishes in 4–6 passes. Two changes cut farthing's share of that work:
+
+- **Bounded ranking.** A position's candidates are first ranked by a geometric lower bound on
+  their cost. Attribute and seam terms only add to the cost, so the attribute quadrics and
+  wedge maps are evaluated cheapest-bound first, and the search stops once the next bound
+  can't beat the best full cost found so far. Ties keep neighbor order. Within one ranking,
+  the wedge map built for costing is reused by the validity and UV-drift checks, and by the
+  collapse itself. Output is bit-identical (all bench-compare hashes match).
+- **Lazy validity.** The batched loop ranks positions by cost alone and checks validity only
+  when a candidate comes up for commit, the way meshoptimizer does. If a candidate's
+  neighborhood hasn't changed since it was ranked, the commit re-runs only the validity check,
+  not the cost. When a candidate fails at commit, its position goes back to eager ranking, so
+  the same invalid collapse can't come back every round. A round that only switches positions
+  to eager ranking doesn't count as a stall.
+
+Work counts over bench-compare's 36 reductions (9 assets × 50/20/5/1%), against the eager
+build. Counts, not times, because this machine is too noisy to time:
+
+| per collapse | before | after | change |
+|---|---|---|---|
+| wedge maps | 35.9 | 23.9 | −33% |
+| full cost evaluations | 27.0 | 22.0 | −18% |
+| attribute-quadric evaluations | 198 | 155 | −21% |
+| validity checks (link + flip) | 8.30 | 4.10 | −50% |
+| UV-drift checks | 7.70 | 4.41 | −43% |
+| rounds (total) | 1803 | 1884 | +4.5% |
+
+Lazy validity changes which collapses get taken, so quality moves by about as much as
+changing the batch fraction from 0.125 to 0.12 or 0.13. Over the run, Hausdorff is +1.4%,
+image-space Hausdorff +2.5%, mean error and UV p90 are equal or better, normals +2%, and more
+cases reach their target (92% vs 89%). Hausdorff by target (geometric mean, after ÷ before,
+only rows with equal triangle counts): 0.98 at 50%, 0.95 at 20%, 1.06 at 5%, 1.22 at 1%.
+The 1% rows keep only 50–200 triangles, so single collapses decide them; batch-fraction noise
+alone moves them by 11–14%.
+
+We also tried evaluating the attribute terms in f32, keeping the sums in f64. Over the run it
+gave +7% Hausdorff, +12% mean error and +19% UV p90. That is at the top of the noise band
+(the batch-fraction runs gave +4–6%, +9% and +13–18%). Mean error was +12% both with and
+without lazy validity. Its speed gain can't be measured here, so it was left out.
 
 ### Large meshes
 

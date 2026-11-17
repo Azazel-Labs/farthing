@@ -376,7 +376,11 @@ struct Scratch {
     nbr_a: Vec<u32>,
     nbr_b: Vec<u32>,
     map: Vec<(u32, u32)>,
-    cands: Vec<(f64, f64, u32)>,
+    /// [`State::best_candidate`]: per neighbor (lower bound, geom2, mean2, importance, q).
+    bounds: Vec<(f64, f64, f64, f64, u32)>,
+    /// [`State::best_candidate`]: costed candidates (cost, mean2, q, map range in `maps`).
+    costed: Vec<(f64, f64, u32, u32, u32)>,
+    maps: Vec<(u32, u32)>,
     corners: Vec<Corner>,
     map2: Vec<(u32, u32)>,
     corners2: Vec<Corner>,
@@ -1450,29 +1454,56 @@ impl<'a> State<'a> {
 
     /// Cost of collapsing p onto q with wedge map `map`: (cost, geometric error²).
     fn cost(&self, p: u32, q: u32, map: &[(u32, u32)], tear: f64) -> (f64, f64) {
+        self.cost_with(p, q, map, tear, self.cost_geom(p, q))
+    }
+
+    /// Error normalization: area^alpha. alpha = 1 is the classic mean distance, which dilutes
+    /// as a vertex absorbs surface; alpha = 0 keeps the area-weighted sum (plus the mean).
+    #[inline(always)]
+    fn norm(&self, w: f64) -> f64 {
+        let alpha = self.alpha;
+        if w <= 0.0 {
+            self.avg_area
+        } else if alpha == 0.0 {
+            // error/avg + error/w: the area-weighted sum plus the mean over the vertex's own
+            // area, so a vertex with little surface (the rim of a thin part) can't drift
+            // much further than its mean distance just because its error is weighted by
+            // its small area.
+            self.avg_area * w / (w + self.avg_area)
+        } else if alpha == 1.0 {
+            w
+        } else {
+            (w / self.avg_area).powf(alpha) * self.avg_area
+        }
+    }
+
+    /// The geometric part of [`State::cost`]: (normalized error², mean squared distance,
+    /// importance). The attribute part only adds to the error², so `geom2.sqrt() * imp` is a
+    /// lower bound on the cost.
+    #[inline(always)]
+    fn cost_geom(&self, p: u32, q: u32) -> (f64, f64, f64) {
+        let qd = &self.quadric[p as usize];
+        let raw = qd.eval_m(&kernels::monomials(self.pos[q as usize]));
+        let geom2 = raw / self.norm(qd.w);
+        let imp =
+            ((self.importance[p as usize] + self.importance[q as usize]) * 0.5).max(1e-3) as f64;
+        // Second value: mean squared distance, for max_error and reporting.
+        let mean2 = if qd.w > 0.0 { raw / qd.w } else { 0.0 };
+        (geom2, mean2, imp)
+    }
+
+    /// [`State::cost`] with its geometric part from [`State::cost_geom`].
+    fn cost_with(
+        &self,
+        p: u32,
+        q: u32,
+        map: &[(u32, u32)],
+        tear: f64,
+        (geom2, mean2, imp): (f64, f64, f64),
+    ) -> (f64, f64) {
         let qp = self.pos[q as usize];
         let (m, h) = (kernels::monomials(qp), kernels::homogeneous(qp));
-        let qd = &self.quadric[p as usize];
-        let raw = qd.eval_m(&m);
-        // Error normalization: area^alpha. alpha = 1 is the classic mean distance, which dilutes
-        // as a vertex absorbs surface; alpha = 0 keeps the area-weighted sum (plus the mean).
-        let alpha = self.alpha;
-        let norm = |w: f64| {
-            if w <= 0.0 {
-                self.avg_area
-            } else if alpha == 0.0 {
-                // error/avg + error/w: the area-weighted sum plus the mean over the vertex's own
-                // area, so a vertex with little surface (the rim of a thin part) can't drift
-                // much further than its mean distance just because its error is weighted by
-                // its small area.
-                self.avg_area * w / (w + self.avg_area)
-            } else if alpha == 1.0 {
-                w
-            } else {
-                (w / self.avg_area).powf(alpha) * self.avg_area
-            }
-        };
-        let geom2 = raw / norm(qd.w);
+        let norm = |w: f64| self.norm(w);
         let (mut en, mut eo, mut w) = (0.0, 0.0, 0.0);
         for &(pw, qw) in map {
             let (n, o, wi) = self.attr_eval_m(pw, &m, &h, qw);
@@ -1487,20 +1518,24 @@ impl<'a> State<'a> {
         } else {
             0.0
         } + self.skin_morph_cost(p, q, map);
-        let imp =
-            ((self.importance[p as usize] + self.importance[q as usize]) * 0.5).max(1e-3) as f64;
-        // Second value: mean squared distance, for max_error and reporting.
-        let mean2 = if qd.w > 0.0 { raw / qd.w } else { 0.0 };
         ((geom2 + attr2).sqrt() * imp, mean2)
     }
 
-    /// Topological and geometric validity of collapsing p onto q.
-    fn valid(&self, p: u32, q: u32) -> bool {
-        self.validity(p, q) == Validity::Ok
+    /// Topological and geometric validity of collapsing p onto q, naming the first rule it
+    /// breaks.
+    fn validity(&self, p: u32, q: u32) -> Validity {
+        self.validity_with(p, q, None, None)
     }
 
-    /// Like [`State::valid`], naming the first rule a collapse breaks.
-    fn validity(&self, p: u32, q: u32) -> Validity {
+    /// [`State::validity`] reusing what the caller already has: p's corners with the wedge map
+    /// onto q (`map_from_corners` succeeded), and p's neighbors.
+    fn validity_with(
+        &self,
+        p: u32,
+        q: u32,
+        wedges: Option<(&[Corner], &[(u32, u32)])>,
+        nbrs: Option<&[u32]>,
+    ) -> Validity {
         if self.locked[p as usize] || !self.pos_alive[q as usize] || !self.pos_alive[p as usize] {
             return Validity::Locked;
         }
@@ -1517,7 +1552,11 @@ impl<'a> State<'a> {
             }
         }
         // Link condition via marker arrays.
-        if !self.link_ok(p, q) {
+        let link = match nbrs {
+            Some(n) => self.link_ok_with(p, q, n),
+            None => self.link_ok(p, q),
+        };
+        if !link {
             return Validity::Link;
         }
         // Flips and degeneracy.
@@ -1541,7 +1580,10 @@ impl<'a> State<'a> {
         }
         if !self.mesh.uvs.is_empty() {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
-            let ok = self.uv_drift(p, q, &mut drift);
+            let ok = match wedges {
+                Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift),
+                None => self.uv_drift(p, q, &mut drift),
+            };
             self.scratch().borrow_mut().drift = drift;
             if !ok {
                 return Validity::Gutter;
@@ -1552,15 +1594,28 @@ impl<'a> State<'a> {
 
     /// The link condition: p and q share no neighbors beyond the triangles they share.
     fn link_ok(&self, p: u32, q: u32) -> bool {
+        let mut nbrs = {
+            let mut s = self.scratch().borrow_mut();
+            let s = &mut *s;
+            let mut nbrs = std::mem::take(&mut s.nbr_a);
+            s.epoch = s.epoch.wrapping_add(1);
+            let e1 = s.epoch;
+            self.neighbors_into(p, &mut nbrs, &mut s.mark, e1);
+            nbrs
+        };
+        let ok = self.link_ok_with(p, q, &nbrs);
+        self.scratch().borrow_mut().nbr_a = std::mem::take(&mut nbrs);
+        ok
+    }
+
+    /// [`State::link_ok`] with p's neighbors given.
+    fn link_ok_with(&self, p: u32, q: u32, nbrs: &[u32]) -> bool {
         let mut s = self.scratch().borrow_mut();
         let s = &mut *s;
         s.epoch = s.epoch.wrapping_add(1);
-        let e1 = s.epoch;
-        self.neighbors_into(p, &mut s.nbr_a, &mut s.mark, e1);
-        s.epoch = s.epoch.wrapping_add(1);
         let e2 = s.epoch;
-        // Re-mark p's neighbors with e2 then count q's neighbors that carry e2.
-        for &x in &s.nbr_a {
+        // Mark p's neighbors with e2 then count q's neighbors that carry e2.
+        for &x in nbrs {
             s.mark[x as usize] = e2;
         }
         let mut common = 0;
@@ -1598,14 +1653,25 @@ impl<'a> State<'a> {
         };
         self.p_corners(p, &mut corners);
         let ok = self.map_from_corners(&corners, q, &mut map).is_some()
-            && map
-                .iter()
-                .filter(|&&(pw, qw)| pw != qw)
-                .all(|&(pw, qw)| self.uv_merge_ok(&corners, q, pw, qw, out));
+            && self.uv_drift_with(&corners, q, &map, out);
         let mut s = self.scratch().borrow_mut();
         s.corners3 = corners;
         s.map3 = map;
         ok
+    }
+
+    /// [`State::uv_drift`] from p's corners and its wedge map onto q.
+    fn uv_drift_with(
+        &self,
+        corners: &[Corner],
+        q: u32,
+        map: &[(u32, u32)],
+        out: &mut Vec<(u32, f32)>,
+    ) -> bool {
+        out.clear();
+        map.iter()
+            .filter(|&&(pw, qw)| pw != qw)
+            .all(|&(pw, qw)| self.uv_merge_ok(corners, q, pw, qw, out))
     }
 
     fn record_drift(&mut self, drift: &[(u32, f32)]) {
@@ -1761,13 +1827,22 @@ impl<'a> State<'a> {
         let mut corners = std::mem::take(&mut self.scratch().borrow_mut().corners2);
         self.p_corners(p, &mut corners);
         let tear = self.map_from_corners(&corners, q, &mut map);
-        self.scratch().borrow_mut().corners2 = corners;
         let r = match tear {
-            Some(t) if self.valid(p, q) => Some(self.cost(p, q, &map, t)),
+            Some(t) if self.validity_with(p, q, Some((&corners, &map)), None) == Validity::Ok => {
+                Some(self.cost(p, q, &map, t))
+            }
             _ => None,
         };
-        self.scratch().borrow_mut().map = map;
+        let mut s = self.scratch().borrow_mut();
+        s.corners2 = corners;
+        s.map = map;
         r
+    }
+
+    /// [`State::evaluate`] for a candidate whose cost is still exact (neither endpoint's
+    /// neighborhood changed since it was costed): only its validity is left to check.
+    fn check(&self, p: u32, c: &Candidate) -> Option<(f64, f64)> {
+        (self.validity(p, c.q) == Validity::Ok).then_some((c.cost, c.geom))
     }
 
     /// Largest removal error (world units) a stalled reduction may still delete a part for
@@ -1828,29 +1903,38 @@ impl<'a> State<'a> {
         removed
     }
 
-    /// Cheapest valid collapse of p: costs first, validity only for the cheapest candidates.
-    fn best_candidate(&self, p: u32) -> Option<Candidate> {
+    /// Cheapest collapse of p: costs first, then (with `validate`) validity for the cheapest
+    /// candidates until one passes. Without, the cheapest is returned unchecked and its
+    /// validity is left to the commit.
+    fn best_candidate(&self, p: u32, validate: bool) -> Option<Candidate> {
         if !self.pos_alive[p as usize] || self.locked[p as usize] {
             return None;
         }
-        let (mut nbrs, mut cands, mut map, mut corners) = {
+        let (mut nbrs, mut bounds, mut costed, mut maps, mut map, mut corners) = {
             let mut s = self.scratch().borrow_mut();
             (
                 std::mem::take(&mut s.nbr_b),
-                std::mem::take(&mut s.cands),
+                std::mem::take(&mut s.bounds),
+                std::mem::take(&mut s.costed),
+                std::mem::take(&mut s.maps),
                 std::mem::take(&mut s.map),
                 std::mem::take(&mut s.corners),
             )
+        };
+        let put_back = |nbrs, bounds, costed, maps, map, corners| {
+            let mut s = self.scratch().borrow_mut();
+            s.nbr_b = nbrs;
+            s.bounds = bounds;
+            s.costed = costed;
+            s.maps = maps;
+            s.map = map;
+            s.corners = corners;
         };
         self.p_corners(p, &mut corners);
         // UV singularities (pole fans: one wedge per triangle) stay as collapse targets only:
         // mapping their many wedges on every re-rank is quadratic and rarely pays off.
         if !self.strict && !self.relaxed && Self::distinct_wedges(&corners) > MAX_SOURCE_WEDGES {
-            let mut s = self.scratch().borrow_mut();
-            s.nbr_b = nbrs;
-            s.cands = cands;
-            s.map = map;
-            s.corners = corners;
+            put_back(nbrs, bounds, costed, maps, map, corners);
             return None;
         }
         {
@@ -1860,34 +1944,76 @@ impl<'a> State<'a> {
             let e = s.epoch;
             self.neighbors_into(p, &mut nbrs, &mut s.mark, e);
         }
-        cands.clear();
+        // The cheapest valid collapse, ties to the earlier neighbor. Candidates are costed in
+        // order of their geometric lower bound and validated in order of cost once no uncosted
+        // candidate can be cheaper; the wedge maps and attribute terms of the rest are never
+        // computed.
+        bounds.clear();
+        costed.clear();
+        maps.clear();
         for &q in &nbrs {
             if self.border[p as usize] && !self.bnbr[p as usize].contains(&q) {
                 continue;
             }
+            let (geom2, mean2, imp) = self.cost_geom(p, q);
+            // A negative or NaN error² (quadric round-off) bounds nothing: cost it first.
+            let lb = if geom2 >= 0.0 {
+                geom2.sqrt() * imp
+            } else {
+                f64::from_bits(u64::MAX)
+            };
+            bounds.push((lb, geom2, mean2, imp, q));
+        }
+        // Stable: equal bounds keep neighbor order.
+        bounds.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Ties between costed candidates go to the earlier neighbor, as a stable sort by cost
+        // over all neighbors would.
+        let rank = |q: u32| nbrs.iter().position(|&x| x == q);
+        let mut next = 0;
+        let best = loop {
+            let cheapest = (0..costed.len()).min_by(|&i, &j| {
+                let (a, b) = (&costed[i], &costed[j]);
+                a.0.total_cmp(&b.0).then_with(|| rank(a.2).cmp(&rank(b.2)))
+            });
+            if let Some(i) = cheapest {
+                let c = costed[i];
+                // Settled once no uncosted candidate can beat or tie it: their costs are at
+                // least their bounds, which are at least `bounds[next].0`.
+                if bounds.get(next).is_none_or(|b| c.0.total_cmp(&b.0).is_lt()) {
+                    costed.swap_remove(i);
+                    if !validate {
+                        break Some(Candidate {
+                            cost: c.0,
+                            geom: c.1,
+                            q: c.2,
+                            checked: false,
+                        });
+                    }
+                    let m = &maps[c.3 as usize..c.4 as usize];
+                    let v = self.validity_with(p, c.2, Some((&corners, m)), Some(&nbrs));
+                    if v == Validity::Ok {
+                        break Some(Candidate {
+                            cost: c.0,
+                            geom: c.1,
+                            q: c.2,
+                            checked: true,
+                        });
+                    }
+                    continue;
+                }
+            }
+            let Some(&(_, geom2, mean2, imp, q)) = bounds.get(next) else {
+                break None;
+            };
+            next += 1;
             if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
-                let (c, g) = self.cost(p, q, &map, tear);
-                cands.push((c, g, q));
+                let (c, g) = self.cost_with(p, q, &map, tear, (geom2, mean2, imp));
+                let start = maps.len() as u32;
+                maps.extend_from_slice(&map);
+                costed.push((c, g, q, start, maps.len() as u32));
             }
-        }
-        cands.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut best = None;
-        for &(c, g, q) in &cands {
-            if self.valid(p, q) {
-                best = Some(Candidate {
-                    cost: c,
-                    geom: g,
-                    q,
-                    checked: true,
-                });
-                break;
-            }
-        }
-        let mut s = self.scratch().borrow_mut();
-        s.nbr_b = nbrs;
-        s.cands = cands;
-        s.map = map;
-        s.corners = corners;
+        };
+        put_back(nbrs, bounds, costed, maps, map, corners);
         best
     }
 
@@ -1910,15 +2036,24 @@ impl<'a> State<'a> {
     /// Collapses `p` onto `q` in place (the serial path; `plan_collapse` + `apply_collapse`
     /// produce the same state).
     fn collapse(&mut self, p: u32, q: u32) -> usize {
+        let (mut map, mut corners) = {
+            let mut s = self.scratch().borrow_mut();
+            (std::mem::take(&mut s.map2), std::mem::take(&mut s.corners2))
+        };
+        self.p_corners(p, &mut corners);
+        let ok = self.map_from_corners(&corners, q, &mut map).is_some();
+        debug_assert!(ok);
         if !self.mesh.uvs.is_empty() {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
-            self.uv_drift(p, q, &mut drift);
+            if ok {
+                self.uv_drift_with(&corners, q, &map, &mut drift);
+            } else {
+                drift.clear();
+            }
             self.record_drift(&drift);
             self.scratch().borrow_mut().drift = drift;
         }
-        let mut map = std::mem::take(&mut self.scratch().borrow_mut().map2);
-        let ok = self.map_wedges(p, q, &mut map);
-        debug_assert!(ok);
+        self.scratch().borrow_mut().corners2 = corners;
         for &(a, b) in &map {
             if a == b {
                 self.vpos[a as usize] = q;
@@ -2002,7 +2137,9 @@ impl<'a> State<'a> {
     /// order as writing them in place would, so applying a plan is bit-identical.
     fn plan_collapse(&self, p: u32, q: u32) -> CollapsePlan {
         let mut map = Vec::new();
-        let ok = self.map_wedges(p, q, &mut map);
+        let mut corners = std::mem::take(&mut self.scratch().borrow_mut().corners2);
+        self.p_corners(p, &mut corners);
+        let ok = self.map_from_corners(&corners, q, &mut map).is_some();
         debug_assert!(ok);
         // Attribute rows of q's wedges after absorbing p's (pairs in order, as `+=` would),
         // stored flat: row k is rows[k * stride..], for wedge row_ids[k].
@@ -2055,9 +2192,10 @@ impl<'a> State<'a> {
         let mut quadric = self.quadric[q as usize];
         quadric.add(&self.quadric[p as usize]);
         let mut drift = Vec::new();
-        if !self.mesh.uvs.is_empty() {
-            self.uv_drift(p, q, &mut drift);
+        if !self.mesh.uvs.is_empty() && ok {
+            self.uv_drift_with(&corners, q, &map, &mut drift);
         }
+        self.scratch().borrow_mut().corners2 = corners;
         CollapsePlan {
             drift,
             p,
@@ -2209,7 +2347,7 @@ impl<'a> State<'a> {
     /// Recomputes x's best collapse and updates its heap entry.
     fn requeue(&mut self, x: u32, heap: &mut IndexedHeap) {
         self.dirty[x as usize] = false;
-        match self.best_candidate(x) {
+        match self.best_candidate(x, true) {
             Some(c) => {
                 self.best[x as usize] = (c.geom, c.q);
                 heap.set(x, c.cost);
@@ -2235,7 +2373,7 @@ fn run_loop(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         (0..shared.pos.len() as u32)
             .into_par_iter()
             .with_min_len(512)
-            .map(|p| shared.best_candidate(p))
+            .map(|p| shared.best_candidate(p, true))
             .collect()
     };
     for (p, c) in first.into_iter().enumerate() {
@@ -2332,9 +2470,12 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         (0..np as u32)
             .into_par_iter()
             .with_min_len(512)
-            .map(|p| shared.best_candidate(p))
+            .map(|p| shared.best_candidate(p, false))
             .collect()
     };
+    // Positions ranked with validity: those whose unchecked cheapest candidate failed at a
+    // commit (otherwise the same invalid candidate would come back every round).
+    let mut validate = vec![false; np];
     let mut full = vec![false; np];
     let mut full_list: Vec<u32> = Vec::new();
     let mut inc: Vec<(u32, u32)> = Vec::new();
@@ -2402,6 +2543,9 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         list.sort_unstable_by(cmp);
         let limit = list[m - 1].0;
         let mut executed = 0;
+        // Positions whose unchecked candidate failed this round: they rank with validity from
+        // now on, so a round with no collapse but some of these still made progress.
+        let mut newly_validated = 0;
         // Evaluate the round's stale candidates in parallel against the state at the start of
         // the round. The serial loop below uses a precomputed result only while neither
         // endpoint has been touched this round, the same condition under which the "fresh"
@@ -2419,10 +2563,15 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                         return None;
                     }
                     let at = checked_ref[p as usize];
-                    if c.checked && touched_ref[p as usize] < at && touched_ref[q as usize] < at {
+                    let unchanged = touched_ref[p as usize] < at && touched_ref[q as usize] < at;
+                    if c.checked && unchanged {
                         return None; // fresh: no evaluation needed
                     }
-                    Some(shared.evaluate(p, q))
+                    Some(if unchanged {
+                        shared.check(p, &c)
+                    } else {
+                        shared.evaluate(p, q)
+                    })
                 })
                 .collect()
         };
@@ -2531,7 +2680,8 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 .map(|(&li, _)| li)
                 .collect();
             let (touched_ref, checked_ref, pre_ref) = (&touched, &checked_at, &pre);
-            let plans: Vec<Option<(f64, CollapsePlan)>> = winners
+            // (invalid, plan): no plan if the candidate is now invalid or dearer.
+            let plans: Vec<(bool, Option<(f64, CollapsePlan)>)> = winners
                 .par_iter()
                 .with_min_len(4)
                 .map(|&li| {
@@ -2539,13 +2689,13 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     let c = cand_ref[p as usize].unwrap();
                     let q = c.q;
                     let at = checked_ref[p as usize];
-                    let fresh =
-                        c.checked && touched_ref[p as usize] < at && touched_ref[q as usize] < at;
-                    let eval = if fresh {
+                    let unchanged = touched_ref[p as usize] < at && touched_ref[q as usize] < at;
+                    let eval = if c.checked && unchanged {
                         Some((c.cost, c.geom))
                     } else if touched_ref[p as usize] != round && touched_ref[q as usize] != round {
                         match pre_ref[li] {
                             Some(e) => e,
+                            None if unchanged => shared.check(p, &c),
                             None => shared.evaluate(p, q),
                         }
                     } else {
@@ -2553,15 +2703,19 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     };
                     match eval {
                         Some((cost, geom)) if cost <= limit * 1.0001 + 1e-12 => {
-                            Some((geom, shared.plan_collapse(p, q)))
+                            (false, Some((geom, shared.plan_collapse(p, q))))
                         }
-                        _ => None,
+                        e => (e.is_none(), None),
                     }
                 })
                 .collect();
             let mut done: Vec<(u32, u32)> = Vec::new();
-            for (&li, plan) in winners.iter().zip(plans) {
+            for (&li, (invalid, plan)) in winners.iter().zip(plans) {
                 let p = list[li].1;
+                if invalid && !validate[p as usize] {
+                    validate[p as usize] = true;
+                    newly_validated += 1;
+                }
                 match plan {
                     Some((geom, plan)) => {
                         let q = plan.q;
@@ -2662,12 +2816,13 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             // Neither endpoint's neighborhood changed since validity was checked at ranking:
             // cost, wedge map and validity are all still exact.
             let at = checked_at[p as usize];
-            let fresh = c.checked && touched[p as usize] < at && touched[q as usize] < at;
-            let eval = if fresh {
+            let unchanged = touched[p as usize] < at && touched[q as usize] < at;
+            let eval = if c.checked && unchanged {
                 Some((c.cost, c.geom))
             } else if touched[p as usize] != round && touched[q as usize] != round {
                 match pre[li] {
                     Some(e) => e,
+                    None if unchanged => st.check(p, &c),
                     None => st.evaluate(p, q),
                 }
             } else {
@@ -2701,8 +2856,13 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                         }
                     }
                 }
-                _ => {
-                    // Stale (now invalid or dearer): re-rank next round.
+                e => {
+                    // Stale (now invalid or dearer): re-rank next round, with validity if it
+                    // failed.
+                    if e.is_none() && !validate[p as usize] {
+                        validate[p as usize] = true;
+                        newly_validated += 1;
+                    }
                     if !full[p as usize] {
                         full[p as usize] = true;
                         full_list.push(p);
@@ -2721,7 +2881,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 executed += 1;
             }
         }
-        if executed == 0 {
+        if executed == 0 && newly_validated == 0 {
             stall += 1;
             // Collapses are stuck above the target: delete the cheapest part and go on.
             if let Some(t) = target.filter(|&t| stall >= 3 && st.parts.is_some() && alive_tris > t)
@@ -2755,17 +2915,18 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     break;
                 }
             }
-        } else {
+        } else if executed > 0 {
             stall = 0;
         }
         // Re-rank changed positions in parallel (deterministic: applied in list order).
         full_list.sort_unstable();
         let ranked: Vec<(u32, Option<Candidate>)> = {
             let shared: &State = st;
+            let validate = &validate;
             full_list
                 .par_iter()
                 .with_min_len(64)
-                .map(|&x| (x, shared.best_candidate(x)))
+                .map(|&x| (x, shared.best_candidate(x, validate[x as usize])))
                 .collect()
         };
         for (x, c) in ranked {
