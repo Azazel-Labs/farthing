@@ -1256,6 +1256,9 @@ little-endian buffers a renderer can upload as they are. Every record is a whole
 
 Each vertex takes 16 bytes. Positions sit on one grid over the whole mesh (16 bits per axis by
 default), so cuts that mix pages stay crack-free. Normals are octahedral and UVs unorm16.
+(Format version 2 later added opt-in tangents, colors, a second UV set and skin weights,
+which grow the vertex past 16 bytes, and made the page planner public as
+`farthing::cluster::plan_pages` for custom formats.)
 
 The clusters one group produced always land in one page. Pages run coarse to fine, so a page's
 dependencies always come earlier in the file. `GpuClusterDag::select` is a CPU reference of the

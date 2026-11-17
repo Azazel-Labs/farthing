@@ -17,17 +17,19 @@ const FOV: f32 = 1.0;
 
 fn dag() -> &'static GpuClusterDag {
     static DAG: OnceLock<GpuClusterDag> = OnceLock::new();
-    DAG.get_or_init(|| {
-        let mesh = bumpy_sphere(384, 192, 1.0);
-        let dag = build_cluster_dag(&mesh, &ClusterOptions::default()).expect("cluster DAG");
-        let opts = GpuOptions {
-            page_size: 32 * 1024,
-            ..GpuOptions::default()
-        };
-        let gpu = GpuClusterDag::from_dag(&dag, &mesh, &opts).expect("packed DAG");
-        // Through the file format, as the demo loads it.
-        GpuClusterDag::from_bytes(&gpu.to_bytes()).expect("decoded DAG")
-    })
+    DAG.get_or_init(|| packed(&ClusterOptions::default()))
+}
+
+fn packed(copts: &ClusterOptions) -> GpuClusterDag {
+    let mesh = bumpy_sphere(384, 192, 1.0);
+    let dag = build_cluster_dag(&mesh, copts).expect("cluster DAG");
+    let opts = GpuOptions {
+        page_size: 32 * 1024,
+        ..GpuOptions::default()
+    };
+    let gpu = GpuClusterDag::from_dag(&dag, &mesh, &opts).expect("packed DAG");
+    // Through the file format, as the demo loads it.
+    GpuClusterDag::from_bytes(&gpu.to_bytes()).expect("decoded DAG")
 }
 
 fn viewer() -> Option<Viewer> {
@@ -142,10 +144,27 @@ fn resident_cut(dag: &GpuClusterDag, resident: &[bool], view: &LodView) -> Vec<u
 
 #[test]
 fn streams_to_the_cpu_cut() {
+    streams_to_cpu_cut(dag());
+}
+
+#[test]
+fn small_clusters_stream_to_the_cpu_cut() {
+    // 64 triangles and 64 vertices per cluster: twice the clusters, the same renderer,
+    // which sizes its buffers from the file.
+    let dag = packed(&ClusterOptions {
+        max_triangles: 64,
+        max_vertices: 64,
+        ..ClusterOptions::default()
+    });
+    let most = dag.clusters.iter().map(|c| c.triangle_count).max();
+    assert_eq!(most, Some(64));
+    streams_to_cpu_cut(&dag);
+}
+
+fn streams_to_cpu_cut(dag: &GpuClusterDag) {
     let Some(mut viewer) = viewer() else {
         return;
     };
-    let dag = dag();
     let mesh = viewer.add_cluster_mesh(dag.clone()).expect("cluster mesh");
     viewer.set_cluster_culling(false, false);
     viewer.set_cluster_streaming(1 << 30, 16);
@@ -260,4 +279,43 @@ fn split_screen_streams_for_both_views() {
     let single = alone.cluster_resident(m).iter().filter(|&&r| r).count();
     eprintln!("split screen: {both} pages resident; one view: {single}");
     assert!(both > single);
+}
+
+#[test]
+fn wide_vertices_draw_the_same() {
+    // A file whose vertices carry attributes the renderer does not read (tangents, colors)
+    // has a wider vertex stride; the pixels must not change.
+    let mut mesh = bumpy_sphere(192, 96, 1.0);
+    let normals = mesh.normals.clone().expect("normals");
+    mesh.tangents = Some(normals.iter().map(|n| n.any_orthonormal_vector().extend(1.0)).collect());
+    mesh.colors = Some(mesh.positions.iter().map(|p| p.abs().extend(1.0)).collect());
+    let dag = build_cluster_dag(&mesh, &ClusterOptions::default()).expect("cluster DAG");
+    let image = |opts: GpuOptions| {
+        let gpu = GpuClusterDag::from_dag(&dag, &mesh, &opts).expect("packed DAG");
+        let gpu = GpuClusterDag::from_bytes(&gpu.to_bytes()).expect("decoded DAG");
+        let stride = gpu.vertex_stride();
+        let mut viewer = viewer()?;
+        let id = viewer.add_cluster_mesh(gpu).expect("cluster mesh");
+        viewer.set_cluster_streaming(1 << 30, 64);
+        let d = draws(id);
+        let views = [View {
+            rect: [0, 0, SIZE, SIZE],
+            camera: camera(Vec3::new(0.3, 0.4, 1.9)),
+            draws: &d,
+        }];
+        settle(&mut viewer, &views, 400);
+        Some((stride, viewer.render_image(SIZE, SIZE, &views)))
+    };
+    let Some((narrow, plain)) = image(GpuOptions::default()) else {
+        return;
+    };
+    let opts = GpuOptions {
+        tangents: true,
+        colors: true,
+        ..GpuOptions::default()
+    };
+    let (wide, rich) = image(opts).expect("viewer");
+    assert_eq!((narrow, wide), (16, 24));
+    assert!(plain.iter().any(|&b| b != 0));
+    assert!(plain == rich, "the wide-vertex file draws differently");
 }

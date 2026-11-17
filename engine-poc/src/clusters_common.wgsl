@@ -47,6 +47,8 @@ struct Mesh {
     cluster_count: u32,
     page_first: u32,
     group_first: u32,
+    // Bit 0: normals, bit 1: UVs (the `.fcld` flags); bits 8 and up: the vertex stride in
+    // words (4 or more: files may carry attributes this renderer does not read).
     flags: u32,
     // Its first bin: slot s draws in bin slot_first + s.
     slot_first: u32,

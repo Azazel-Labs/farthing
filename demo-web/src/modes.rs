@@ -3,7 +3,7 @@
 //! * **Option examples** ([`run_presets`]): one reduction target under several named
 //!   [`SimplifyOptions`] configurations. farthing has no engine presets; these are the option
 //!   differences that matter when targeting one engine or another, given names.
-//! * **Cluster DAG** ([`run_clusters`]): a Nanite-style cluster DAG per mesh and its packed GPU
+//! * **Cluster DAG** ([`run_clusters`]): a cluster DAG per mesh and its packed GPU
 //!   form; the page asks [`Demo::select`] for the view-dependent cut as the camera moves.
 //! * **HLOD tree** ([`run_hlod`]): the scene (optionally tiled into a grid of copies) in a
 //!   cell tree with a merged proxy per cell; [`Demo::select`] picks the cut.
@@ -426,11 +426,9 @@ pub(crate) fn run_clusters(
     } else {
         ClusterOptions::default()
     };
-    if opts.cluster_layout == "meshlet" {
-        // Mesh-shader friendly: 64 vertices, 124 triangles.
-        copts.max_triangles = 124;
-        copts.max_vertices = 64;
-    }
+    // Any pair the page sends; the packed format's u8 micro-indices cap vertices at 256.
+    copts.max_triangles = opts.cluster_max_triangles.clamp(1, 512) as usize;
+    copts.max_vertices = opts.cluster_max_vertices.clamp(3, 256) as usize;
     let t0 = now();
     let scene = &demo.scene;
     let mut dags = Vec::with_capacity(scene.meshes.len());

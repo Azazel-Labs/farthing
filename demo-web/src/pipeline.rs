@@ -205,8 +205,10 @@ pub struct LodOptions {
     pub mode: DemoMode,
     /// Option examples: triangle fraction every configuration reduces to.
     pub preset_ratio: f32,
-    /// Cluster DAG: `"nanite"` (128 triangles, 255 vertices) or `"meshlet"` (124, 64).
-    pub cluster_layout: String,
+    /// Cluster DAG: [`ClusterOptions::max_triangles`](farthing::cluster::ClusterOptions::max_triangles).
+    pub cluster_max_triangles: u32,
+    /// Cluster DAG: [`ClusterOptions::max_vertices`](farthing::cluster::ClusterOptions::max_vertices).
+    pub cluster_max_vertices: u32,
     /// Cluster DAG: [`ClusterOptions::fast`](farthing::cluster::ClusterOptions::fast).
     pub cluster_fast: bool,
     /// HLOD: copies of the scene along x and z (1 = the scene itself).
@@ -256,7 +258,8 @@ impl Default for LodOptions {
             compression_lambda: 0.0,
             mode: DemoMode::Chain,
             preset_ratio: 0.25,
-            cluster_layout: "nanite".into(),
+            cluster_max_triangles: 128,
+            cluster_max_vertices: 255,
             cluster_fast: false,
             hlod_copies: 3,
             hlod_split: 1,

@@ -117,9 +117,9 @@ gains a *Size* column (GLB, PLY or packed GPU bytes).
   (`repair::geometry_only` first), and a pixel-error bound (`screen_size_to_max_error`).
   farthing has no per-engine presets. These are the option differences an engine integration
   would choose between. Hover a row's name to see the exact option.
-- **Cluster DAG.** `build_cluster_dag` per mesh (Nanite or meshlet cluster limits, optionally
-  `ClusterOptions::fast()`), packed with `GpuClusterDag`. The *Cut* row is the view-dependent
-  selection at the current camera: every cluster is drawn or replaced by its coarser parent
+- **Cluster DAG.** `build_cluster_dag` per mesh (any triangle and vertex limits, with
+  presets for common ones; optionally `ClusterOptions::fast()`), packed with
+  `GpuClusterDag`. The *Cut* row is the view-dependent selection at the current camera: every cluster is drawn or replaced by its coarser parent
   depending on its own error on screen, so moving the camera changes it. With WebGPU the
   engine does it all on the GPU each frame (`engine-poc/src/clusters.rs`):
   - A compute pass makes the LOD cut and culls clusters outside the frustum or facing away

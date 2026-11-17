@@ -2079,7 +2079,8 @@ function readOptions() {
     lock_border: f.lock_border.checked,
     mode: f.mode.value,
     preset_ratio: +f.preset_ratio.value,
-    cluster_layout: f.cluster_layout.value,
+    cluster_max_triangles: +f.cluster_max_triangles.value,
+    cluster_max_vertices: +f.cluster_max_vertices.value,
     cluster_fast: f.cluster_fast.checked,
     hlod_copies: +f.hlod_copies.value,
     hlod_split: +f.hlod_split.value,
@@ -2089,6 +2090,23 @@ function readOptions() {
     splat_count: +f.splat_count.value,
     splat_footprints: f.splat_footprints.checked,
   };
+}
+
+/** A cluster layout preset fills in the two limits; it names no engine in the options. */
+function applyClusterPreset() {
+  const f = form.elements;
+  const [tris, verts] = f.cluster_preset.value.split("x");
+  if (verts === undefined) return;
+  f.cluster_max_triangles.value = tris;
+  f.cluster_max_vertices.value = verts;
+}
+
+/** Typed limits show the preset they match, or Custom. */
+function matchClusterPreset() {
+  const f = form.elements;
+  const key = `${+f.cluster_max_triangles.value}x${+f.cluster_max_vertices.value}`;
+  const known = [...f.cluster_preset.options].some((o) => o.value === key);
+  f.cluster_preset.value = known ? key : "custom";
 }
 
 /** Shows the option groups of the chosen example. */
@@ -2251,6 +2269,7 @@ function restoreOptions() {
       else el.value = String(v);
     }
     lastLevels = +f.levels.value;
+    matchClusterPreset();
     syncOutputs();
     if (saved.bake_from !== undefined) f.bake_from.value = String(Math.min(saved.bake_from, lastLevels));
   } else syncOutputs();
@@ -2269,6 +2288,8 @@ form.addEventListener("input", (e) => {
     else if (name === "view_height" && !f.view_density_preset.value.endsWith(`@${f.view_height.value}`))
       f.view_density_preset.value = "custom";
     if (name.startsWith("view_density")) f.view_preset.value = "density";
+    if (name === "cluster_preset") applyClusterPreset();
+    else if (name === "cluster_max_triangles" || name === "cluster_max_vertices") matchClusterPreset();
     if (["view_preset", "view_fov", "view_height"].includes(name) || name.startsWith("view_density")) applyViewPreset();
   }
   syncOutputs();

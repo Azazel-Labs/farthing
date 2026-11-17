@@ -18,6 +18,9 @@
 //! theirs), so the test in [`ClusterDag::select`] — draw a cluster when its own error is
 //! acceptable and its parent's is not — picks a crack-free cut for any camera, and a GPU can
 //! run it per cluster with no traversal. A normal cone per cluster supports back-face culling.
+//!
+//! To stream the DAG, [`plan_pages`] cuts it into pages for any byte layout you describe with
+//! a [`PageLayout`]; [`GpuClusterDag`] is a ready-made packed format built on it.
 
 #![forbid(unsafe_code)]
 
@@ -29,7 +32,9 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 pub mod gpu;
+pub mod pages;
 pub use gpu::{GpuClusterDag, GpuOptions, decode_gpu, encode_gpu};
+pub use pages::{PageLayout, PagePlan, PageTally, PlannedPage, plan_pages};
 
 /// A bounding sphere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -204,10 +209,10 @@ pub struct ClusterGroup {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClusterOptions {
-    /// Triangles per cluster (Nanite uses 128).
+    /// Triangles per cluster.
     pub max_triangles: usize,
-    /// Unique vertices per cluster (255 fits `u8` local indices; mesh-shader pipelines often
-    /// want 64 with 124 triangles).
+    /// Unique vertices per cluster (at most 256 for `u8` local indices and the packed
+    /// [`GpuClusterDag`] format).
     pub max_vertices: usize,
     /// Clusters reduced together. Larger groups lock fewer edges but cost more per level.
     pub group_size: usize,

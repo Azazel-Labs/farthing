@@ -10,7 +10,8 @@
 //! # Pages
 //!
 //! Clusters are packed into pages of at most [`GpuOptions::page_size`] bytes (128 KiB by
-//! default). The unit of packing is a group's output: the clusters one [`ClusterGroup`](super::ClusterGroup)
+//! default) by [`plan_pages`], with this format's sizes ([`FcldLayout`]).
+//! The unit of packing is a group's output: the clusters one [`ClusterGroup`](super::ClusterGroup)
 //! produced share their LOD error and bounds, so they become visible together, and they
 //! always land in one page. Source-level clusters (no producing group) are packed by the group
 //! that consumes them. Units go in coarse-to-fine order (level descending), so the root
@@ -20,6 +21,9 @@
 //! Each page lists its dependencies: the pages holding the clusters its clusters' parent groups
 //! produced (the coarser clusters that are drawn instead of them). A dependency always has a
 //! lower page index; a page may be made resident once its dependencies are.
+//!
+//! For a format of your own, plan with [`plan_pages`] and your own
+//! [`PageLayout`]; see the [`pages`](super::pages) module.
 //!
 //! # Quantization
 //!
@@ -36,24 +40,45 @@
 //!   range: 0.008 texels of a 1024-texel texture over a 0–1 range). The bounds are global for
 //!   the same reason as the position grid.
 //!
-//! Tangents, colors, further UV sets, skins and morph targets are not stored.
+//! These are always stored when the mesh has them. The rest are opt-in ([`GpuOptions`]), each
+//! stored only when asked for and present in the mesh, and each one `u32` word per vertex
+//! unless stated:
+//!
+//! * **Tangents** ([`FLAG_TANGENTS`]): the direction like a normal (oct snorm16 x2), with the
+//!   lowest bit of the y half replaced by the handedness (set: `w = −1`). Decode the direction
+//!   as is; the stolen bit moves it by less than 0.002°.
+//! * **Colors** ([`FLAG_COLORS`], vertex color set 0): RGBA8 unorm, red in the low byte, values
+//!   clamped to 0–1 (as stored in the mesh, which is linear for glTF).
+//! * **UVs, set 1** ([`FLAG_UV1`], needs set 0): unorm16 like set 0, over its own bounds
+//!   (`uv1_min`, `uv1_step`).
+//! * **Skin** ([`FLAG_SKIN`], three words): joints as four `u16` (two words, joint 0 in the low
+//!   half of the first), then weights as RGBA8 unorm, normalized so the four bytes add up to
+//!   exactly 255.
+//!
+//! Further UV and color sets and morph targets are not stored.
 //!
 //! # File layout
 //!
 //! All values are little-endian; `u32`/`f32` unless stated. Every section and every page
-//! starts on a 16-byte boundary, and every record is a whole number of `vec4`/`uvec4`s, so
-//! each array reads as a std430 struct array.
+//! starts on a 16-byte boundary, and every record except the vertex is a whole number of
+//! `vec4`/`uvec4`s, so each array reads as a std430 struct array. Vertices are a whole number
+//! of `u32` words ([`vertex_words`]): 16 bytes with no optional attributes.
 //!
-//! **File header** (96 bytes, offset 0):
+//! **File header** (112 bytes, offset 0):
 //!
 //! | Offset | Field |
 //! |---|---|
-//! | 0 | magic `b"FCLD"` (4 bytes), version (= [`VERSION`]), flags (bit 0: normals, bit 1: UVs), header size (96) |
+//! | 0 | magic `b"FCLD"` (4 bytes), version (= [`VERSION`]), flags, header size (112) |
 //! | 16 | cluster count, group count, page count, dependency count |
-//! | 32 | page size, position bits, vertex stride (16), cluster stride (128) |
+//! | 32 | page size, position bits, vertex stride (bytes), cluster stride (128) |
 //! | 48 | origin.xyz, step |
 //! | 64 | uv_min.xy, uv_step.xy |
 //! | 80 | cluster array offset, group array offset, page table offset, dependency array offset |
+//! | 96 | uv1_min.xy, uv1_step.xy (zero without [`FLAG_UV1`]) |
+//!
+//! Flags: bit 0 normals, bit 1 UVs, bit 2 tangents, bit 3 colors, bit 4 UV set 1, bit 5 skin.
+//! [`GpuClusterDag::from_bytes`] also reads version 1 files, which have the same layout with a
+//! 96-byte header and only bits 0 and 1.
 //!
 //! **Cluster header** (128 bytes each, in page order; [`GpuCluster`]):
 //!
@@ -86,7 +111,7 @@
 //! | 0 | page header: first cluster, cluster count, vertex count, vertex offset (48) |
 //! | 16 | base.xyz (grid units), vertex-index section offset |
 //! | 32 | triangle section offset, material section offset, byte size, page index |
-//! | 48 | vertices, 16 bytes each (`uvec4`): `x` = Δx \| Δy << 21, `y` = Δy >> 11 \| Δz << 10 (21 bits per axis), `z` = normal (oct snorm16 x in the low half, y in the high half), `w` = uv (unorm16 u low, v high) |
+//! | 48 | vertices, `vertex stride` bytes each: word 0 = Δx \| Δy << 21, word 1 = Δy >> 11 \| Δz << 10 (21 bits per axis), word 2 = normal (oct snorm16 x in the low half, y in the high half), word 3 = uv (unorm16 u low, v high), then the optional attributes in flag order: tangent, color, uv1, skin (3 words) |
 //! | vertex-index offset | per cluster, `vertex count` page-local vertex indices (`u32`) |
 //! | triangle offset | per cluster, three `u8` cluster-local vertex indices per triangle (meshlet micro-indices), each cluster's run padded to 4 bytes |
 //! | material offset | per mixed-material cluster, one `u16` material id per triangle, padded to 4 bytes |
@@ -94,17 +119,20 @@
 //! Sections start on 16-byte boundaries; the byte size is a multiple of 16. A triangle's
 //! vertex `k` is `vertices[indices[vertex_offset/4 + tri[k]]]`.
 
-use super::{ClusterDag, Cone, LodView, Sphere};
-use crate::{Error, Mesh, Result};
-use glam::{Vec2, Vec3};
+use super::pages::{PageLayout, PageTally, plan_pages};
+use super::{Cluster, ClusterDag, Cone, LodView, Sphere};
+use crate::{Error, Mesh, Result, Skin};
+use glam::{Vec2, Vec3, Vec4};
 use serde::{Deserialize, Serialize};
 
 /// File magic.
 pub const MAGIC: [u8; 4] = *b"FCLD";
 /// Format version written by [`GpuClusterDag::to_bytes`].
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// File header size in bytes.
-pub const HEADER_SIZE: usize = 96;
+pub const HEADER_SIZE: usize = 112;
+/// File header size of version 1 files.
+pub const HEADER_SIZE_V1: usize = 96;
 /// Cluster header size in bytes.
 pub const CLUSTER_STRIDE: usize = 128;
 /// Group record size in bytes.
@@ -113,17 +141,48 @@ pub const GROUP_STRIDE: usize = 48;
 pub const PAGE_ENTRY_STRIDE: usize = 32;
 /// Page header size in bytes.
 pub const PAGE_HEADER_SIZE: usize = 48;
-/// Vertex record size in bytes.
+/// Size in bytes of a vertex with no optional attributes (position, normal, uv).
 pub const VERTEX_STRIDE: usize = 16;
 
 /// Flag: vertices carry normals.
 pub const FLAG_NORMALS: u32 = 1;
-/// Flag: vertices carry UVs.
+/// Flag: vertices carry UVs (set 0).
 pub const FLAG_UVS: u32 = 2;
+/// Flag: vertices carry tangents (one word).
+pub const FLAG_TANGENTS: u32 = 4;
+/// Flag: vertices carry colors (one word).
+pub const FLAG_COLORS: u32 = 8;
+/// Flag: vertices carry UV set 1 (one word).
+pub const FLAG_UV1: u32 = 16;
+/// Flag: vertices carry joints and weights (three words).
+pub const FLAG_SKIN: u32 = 32;
+/// Every flag this version knows.
+pub const FLAGS_ALL: u32 = 63;
 
 const NONE: u32 = u32::MAX;
 
+/// `u32` words per vertex for `flags`: 4, plus each optional attribute's words.
+pub fn vertex_words(flags: u32) -> usize {
+    4 + [FLAG_TANGENTS, FLAG_COLORS, FLAG_UV1]
+        .iter()
+        .filter(|&&f| flags & f != 0)
+        .count()
+        + if flags & FLAG_SKIN != 0 { 3 } else { 0 }
+}
+
+/// The word within a vertex where the optional attribute `flag` starts (`None` when `flags`
+/// lacks it). Attributes follow the four base words in flag order.
+pub fn attribute_word(flags: u32, flag: u32) -> Option<usize> {
+    if flags & flag == 0 || !matches!(flag, FLAG_TANGENTS | FLAG_COLORS | FLAG_UV1 | FLAG_SKIN) {
+        return None;
+    }
+    Some(vertex_words(
+        flags & (flag - 1) & !(FLAG_NORMALS | FLAG_UVS),
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GpuOptions {
     /// Largest page in bytes (a multiple of 16, at least 4 KiB). Every group's output must fit
     /// in one page: eight full 128-triangle clusters take about 17 KiB, so use 32 KiB or more
@@ -132,6 +191,14 @@ pub struct GpuOptions {
     /// Position grid resolution per axis, 1 to 21 bits over the mesh's largest extent. Every
     /// value costs the same 8 bytes per vertex.
     pub position_bits: u32,
+    /// Store tangents when the mesh has them (4 bytes per vertex).
+    pub tangents: bool,
+    /// Store vertex colors (set 0) when the mesh has them (4 bytes per vertex).
+    pub colors: bool,
+    /// Store UV set 1 when the mesh has two sets (4 bytes per vertex).
+    pub uv1: bool,
+    /// Store joints and weights when the mesh is skinned (12 bytes per vertex).
+    pub skin: bool,
 }
 
 impl Default for GpuOptions {
@@ -139,7 +206,65 @@ impl Default for GpuOptions {
         GpuOptions {
             page_size: 128 * 1024,
             position_bits: 16,
+            tangents: false,
+            colors: false,
+            uv1: false,
+            skin: false,
         }
+    }
+}
+
+impl GpuOptions {
+    /// Default options that store every attribute the format knows.
+    pub fn all_attributes() -> Self {
+        GpuOptions {
+            tangents: true,
+            colors: true,
+            uv1: true,
+            skin: true,
+            ..Default::default()
+        }
+    }
+}
+
+/// The page sizes of this format, for [`plan_pages`]: what [`GpuClusterDag::from_dag`] packs
+/// with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FcldLayout {
+    pub page_size: usize,
+    /// Bytes per vertex: `4 * vertex_words(flags)`.
+    pub vertex_stride: usize,
+}
+
+/// Bytes a run of `n` bytes takes once padded to 4.
+#[inline]
+fn pad4(n: usize) -> usize {
+    n.div_ceil(4) * 4
+}
+
+impl PageLayout for FcldLayout {
+    /// Vertex indices, triangles, and per-triangle materials when mixed.
+    fn cluster_bytes(&self, cluster: &Cluster, vertices: usize) -> [usize; 4] {
+        let t = cluster.triangle_count();
+        let m0 = cluster.material_ids.first();
+        let mixed = cluster.material_ids.iter().any(|m| Some(m) != m0);
+        [
+            4 * vertices,
+            pad4(3 * t),
+            if mixed { pad4(2 * t) } else { 0 },
+            0,
+        ]
+    }
+
+    fn page_bytes(&self, t: &PageTally) -> usize {
+        align16(PAGE_HEADER_SIZE + t.vertices * self.vertex_stride)
+            + align16(t.bytes[0])
+            + align16(t.bytes[1])
+            + align16(t.bytes[2])
+    }
+
+    fn max_page_bytes(&self) -> usize {
+        self.page_size
     }
 }
 
@@ -203,17 +328,24 @@ pub struct GpuPage {
     pub base: [u32; 3],
 }
 
-/// A decoded vertex.
+/// A decoded vertex. Attributes the file lacks are zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuVertex {
     pub position: Vec3,
     pub normal: Vec3,
     pub uv: Vec2,
+    /// Direction and handedness (`w` = ±1).
+    pub tangent: Vec4,
+    pub color: Vec4,
+    pub uv1: Vec2,
+    pub joints: [u16; 4],
+    pub weights: [f32; 4],
 }
 
 /// The packed DAG: the metadata decoded, the pages as raw bytes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuClusterDag {
+    /// The `FLAG_*` attributes the vertices carry.
     pub flags: u32,
     pub page_size: u32,
     pub position_bits: u32,
@@ -221,6 +353,8 @@ pub struct GpuClusterDag {
     pub step: f32,
     pub uv_min: Vec2,
     pub uv_step: Vec2,
+    pub uv1_min: Vec2,
+    pub uv1_step: Vec2,
     pub clusters: Vec<GpuCluster>,
     pub groups: Vec<GpuGroup>,
     pub pages: Vec<GpuPage>,
@@ -332,10 +466,72 @@ impl R<'_> {
     }
 }
 
-/// One packing unit: clusters that always share a page.
-struct Unit {
-    level: u32,
-    clusters: Vec<u32>,
+/// The bounds frame of a unorm16 UV set: `(min, step)`.
+fn uv_frame(u: &[Vec2]) -> (Vec2, Vec2) {
+    if u.is_empty() {
+        return (Vec2::ZERO, Vec2::ZERO);
+    }
+    let lo = u
+        .iter()
+        .copied()
+        .fold(Vec2::splat(f32::INFINITY), Vec2::min);
+    let hi = u
+        .iter()
+        .copied()
+        .fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
+    (lo, (hi - lo) / 65535.0)
+}
+
+/// A UV as unorm16 x2 in its frame.
+fn uv_encode(t: Vec2, lo: Vec2, step: Vec2) -> u32 {
+    let q = |x: f32, lo: f32, s: f32| {
+        if s > 0.0 {
+            ((x - lo) / s).round().clamp(0.0, 65535.0) as u32
+        } else {
+            0
+        }
+    };
+    q(t.x, lo.x, step.x) | (q(t.y, lo.y, step.y) << 16)
+}
+
+fn uv_decode(w: u32, lo: Vec2, step: Vec2) -> Vec2 {
+    lo + Vec2::new((w & 0xFFFF) as f32, (w >> 16) as f32) * step
+}
+
+fn unorm8x4(v: [f32; 4]) -> u32 {
+    v.iter().enumerate().fold(0, |w, (k, &x)| {
+        w | (((x.clamp(0.0, 1.0) * 255.0).round() as u32) << (8 * k))
+    })
+}
+
+fn unorm8x4_decode(w: u32) -> [f32; 4] {
+    [0, 1, 2, 3].map(|k| ((w >> (8 * k)) & 0xFF) as f32 / 255.0)
+}
+
+/// Weights as unorm8 x4 adding up to exactly 255 (all zero when they add up to nothing).
+fn weights_encode(w: [f32; 4]) -> u32 {
+    let w = w.map(|x| if x.is_finite() { x.max(0.0) } else { 0.0 });
+    let sum: f32 = w.iter().sum();
+    if sum <= 0.0 {
+        return 0;
+    }
+    let mut q = w.map(|x| (x / sum * 255.0).round() as i32);
+    // Rounding is off by at most 2; the largest weight absorbs it.
+    let big = (0..4).max_by(|&a, &b| w[a].total_cmp(&w[b])).unwrap_or(0);
+    q[big] += 255 - q.iter().sum::<i32>();
+    q.iter().enumerate().fold(0, |acc, (k, &x)| {
+        acc | ((x.clamp(0, 255) as u32) << (8 * k))
+    })
+}
+
+/// A tangent as oct snorm16 x2, the handedness in bit 16 (set: negative).
+fn tangent_encode(t: Vec4) -> u32 {
+    (oct_encode(t.truncate()) & !0x1_0000) | (u32::from(t.w < 0.0) << 16)
+}
+
+fn tangent_decode(w: u32) -> Vec4 {
+    let s = if w & 0x1_0000 != 0 { -1.0 } else { 1.0 };
+    oct_decode(w).extend(s)
 }
 
 impl GpuClusterDag {
@@ -359,93 +555,6 @@ impl GpuClusterDag {
                 return invalid("cluster material count does not match its triangles");
             }
         }
-        let ng = dag.groups.len();
-        if dag.clusters.iter().any(|c| {
-            (c.group != NONE && c.group as usize >= ng)
-                || (c.parent_group != NONE && c.parent_group as usize >= ng)
-        }) {
-            return invalid("cluster group out of range");
-        }
-
-        // Quantization frames.
-        let b = mesh.bounds();
-        let origin = b.min;
-        let extent = (b.max - b.min).max_element();
-        let qmax = ((1u64 << opts.position_bits) - 1) as f32;
-        let step = if extent > 0.0 && extent.is_finite() {
-            extent / qmax
-        } else {
-            1.0
-        };
-        let normals = mesh.normals.as_ref().filter(|n| n.len() == nv);
-        let uvs = mesh.uvs.first().filter(|u| u.len() == nv);
-        let (uv_min, uv_step) = match uvs {
-            Some(u) if !u.is_empty() => {
-                let lo = u
-                    .iter()
-                    .copied()
-                    .fold(Vec2::splat(f32::INFINITY), Vec2::min);
-                let hi = u
-                    .iter()
-                    .copied()
-                    .fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
-                (lo, (hi - lo) / 65535.0)
-            }
-            _ => (Vec2::ZERO, Vec2::ZERO),
-        };
-        let flags = if normals.is_some() { FLAG_NORMALS } else { 0 }
-            | if uvs.is_some() { FLAG_UVS } else { 0 };
-        let grid = |v: u32| -> [u32; 3] {
-            let p = (mesh.positions[v as usize] - origin) / step;
-            [p.x, p.y, p.z].map(|c| c.round().clamp(0.0, qmax) as u32)
-        };
-        let vertex_attrs = |v: u32| -> (u32, u32) {
-            let n = normals.map_or(0, |n| oct_encode(n[v as usize]));
-            let uv = uvs.map_or(0, |u| {
-                let q = |x: f32, lo: f32, s: f32| {
-                    if s > 0.0 {
-                        ((x - lo) / s).round().clamp(0.0, 65535.0) as u32
-                    } else {
-                        0
-                    }
-                };
-                let t = u[v as usize];
-                q(t.x, uv_min.x, uv_step.x) | (q(t.y, uv_min.y, uv_step.y) << 16)
-            });
-            (n, uv)
-        };
-
-        // Units: each group's output, then source-level clusters by consuming group; coarse
-        // to fine.
-        let mut units: Vec<Unit> = dag
-            .groups
-            .iter()
-            .map(|g| Unit {
-                level: g.level + 1,
-                clusters: g.clusters.clone(),
-            })
-            .collect();
-        let mut by_parent: Vec<Vec<u32>> = vec![Vec::new(); ng + 1];
-        for (i, c) in dag.clusters.iter().enumerate() {
-            if c.group == NONE {
-                let k = if c.parent_group == NONE {
-                    ng
-                } else {
-                    c.parent_group as usize
-                };
-                by_parent[k].push(i as u32);
-            }
-        }
-        for list in by_parent {
-            if !list.is_empty() {
-                units.push(Unit {
-                    level: dag.clusters[list[0] as usize].level,
-                    clusters: list,
-                });
-            }
-        }
-        // Stable: within a level, groups keep their (spatially coherent) build order.
-        units.sort_by_key(|u| std::cmp::Reverse(u.level));
 
         // Meshlet layout per cluster.
         struct Local {
@@ -471,149 +580,106 @@ impl GpuClusterDag {
             });
         }
 
-        // Greedy page packing, sizes counted exactly as written. `in_page[v]` is the page
-        // (+1) that holds source vertex `v`, `seen[v]` the unit (+1) that last counted it.
-        let mut in_page = vec![0u32; nv];
-        let mut seen = vec![0u32; nv];
-        let mut page_units: Vec<Vec<usize>> = Vec::new();
-        let mut open: Vec<usize> = Vec::new();
-        // Vertices, index bytes, triangle bytes and material bytes of the open page.
-        let mut sums = [0usize; 4];
-        let bytes = |s: [usize; 4]| {
-            align16(PAGE_HEADER_SIZE + s[0] * VERTEX_STRIDE)
-                + align16(s[1])
-                + align16(s[2])
-                + align16(s[3])
+        // Quantization frames and the attributes stored.
+        let b = mesh.bounds();
+        let origin = b.min;
+        let extent = (b.max - b.min).max_element();
+        let qmax = ((1u64 << opts.position_bits) - 1) as f32;
+        let step = if extent > 0.0 && extent.is_finite() {
+            extent / qmax
+        } else {
+            1.0
         };
-        let too_big = |n: usize| {
-            invalid(format!(
-                "a group's clusters need {n} bytes, more than page_size {}",
-                opts.page_size
-            ))
+        let normals = mesh.normals.as_ref().filter(|n| n.len() == nv);
+        let uvs = mesh.uvs.first().filter(|u| u.len() == nv);
+        let tangents = mesh
+            .tangents
+            .as_ref()
+            .filter(|t| opts.tangents && t.len() == nv);
+        let colors = mesh
+            .colors
+            .as_ref()
+            .filter(|c| opts.colors && c.len() == nv);
+        let uv1 = mesh
+            .uvs
+            .get(1)
+            .filter(|u| opts.uv1 && uvs.is_some() && u.len() == nv);
+        let skin = mesh
+            .skin
+            .as_ref()
+            .filter(|s| opts.skin && s.joints.len() == nv && s.weights.len() == nv);
+        let (uv_min, uv_step) = uvs.map_or((Vec2::ZERO, Vec2::ZERO), |u| uv_frame(u));
+        let (uv1_min, uv1_step) = uv1.map_or((Vec2::ZERO, Vec2::ZERO), |u| uv_frame(u));
+        let flag = |on: bool, f: u32| if on { f } else { 0 };
+        let flags = flag(normals.is_some(), FLAG_NORMALS)
+            | flag(uvs.is_some(), FLAG_UVS)
+            | flag(tangents.is_some(), FLAG_TANGENTS)
+            | flag(colors.is_some(), FLAG_COLORS)
+            | flag(uv1.is_some(), FLAG_UV1)
+            | flag(skin.is_some(), FLAG_SKIN);
+        let stride = 4 * vertex_words(flags);
+        let grid = |v: u32| -> [u32; 3] {
+            let p = (mesh.positions[v as usize] - origin) / step;
+            [p.x, p.y, p.z].map(|c| c.round().clamp(0.0, qmax) as u32)
         };
-        for u in 0..units.len() {
-            let page = page_units.len() as u32 + 1;
-            let tag = u as u32 + 1;
-            let mut grown = sums;
-            for &c in &units[u].clusters {
-                let l = &local[c as usize];
-                for &v in &l.verts {
-                    let v = v as usize;
-                    if in_page[v] != page && seen[v] != tag {
-                        seen[v] = tag;
-                        grown[0] += 1;
-                    }
-                }
-                grown[1] += 4 * l.verts.len();
-                grown[2] += l.tris.len().div_ceil(4) * 4;
-                if l.material == NONE {
-                    grown[3] += (2 * l.tris.len() / 3).div_ceil(4) * 4;
-                }
+        // Words 2.. of a vertex.
+        let vertex_attrs = |v: u32, w: &mut W| {
+            let v = v as usize;
+            w.u32(normals.map_or(0, |n| oct_encode(n[v])));
+            w.u32(uvs.map_or(0, |u| uv_encode(u[v], uv_min, uv_step)));
+            if let Some(t) = tangents {
+                w.u32(tangent_encode(t[v]));
             }
-            if bytes(grown) > opts.page_size {
-                if open.is_empty() {
-                    return too_big(bytes(grown));
-                }
-                page_units.push(std::mem::take(&mut open));
-                sums = [0; 4];
+            if let Some(c) = colors {
+                w.u32(unorm8x4(c[v].to_array()));
             }
-            let page = page_units.len() as u32 + 1;
-            for &c in &units[u].clusters {
-                let l = &local[c as usize];
-                for &v in &l.verts {
-                    let v = v as usize;
-                    if in_page[v] != page {
-                        in_page[v] = page;
-                        sums[0] += 1;
-                    }
-                }
-                sums[1] += 4 * l.verts.len();
-                sums[2] += l.tris.len().div_ceil(4) * 4;
-                if l.material == NONE {
-                    sums[3] += (2 * l.tris.len() / 3).div_ceil(4) * 4;
-                }
+            if let Some(u) = uv1 {
+                w.u32(uv_encode(u[v], uv1_min, uv1_step));
             }
-            if bytes(sums) > opts.page_size {
-                return too_big(bytes(sums));
+            if let Some(s) = skin {
+                let j = s.joints[v].map(u32::from);
+                w.u32(j[0] | (j[1] << 16));
+                w.u32(j[2] | (j[3] << 16));
+                w.u32(weights_encode(s.weights[v]));
             }
-            open.push(u);
-        }
-        if !open.is_empty() {
-            page_units.push(open);
-        }
+        };
 
-        // Cluster order and pages.
+        let layout = FcldLayout {
+            page_size: opts.page_size,
+            vertex_stride: stride,
+        };
+        let plan = plan_pages(dag, &layout)?;
         let mut gpu_of = vec![NONE; dag.clusters.len()];
-        let mut order: Vec<u32> = Vec::with_capacity(dag.clusters.len());
-        let mut page_of_cluster: Vec<u32> = Vec::with_capacity(dag.clusters.len());
-        for (p, us) in page_units.iter().enumerate() {
-            for &u in us {
-                for &c in &units[u].clusters {
-                    gpu_of[c as usize] = order.len() as u32;
-                    order.push(c);
-                    page_of_cluster.push(p as u32);
-                }
-            }
+        for (i, c) in plan.cluster_order().enumerate() {
+            gpu_of[c as usize] = i as u32;
         }
-        if gpu_of.contains(&NONE) {
-            return invalid("a cluster belongs to no group and is consumed by none");
-        }
-        // A group's page: where its produced clusters are (`u32::MAX` if it produced none).
-        let gpage: Vec<u32> = dag
-            .groups
-            .iter()
-            .map(|g| {
-                g.clusters
-                    .first()
-                    .map_or(NONE, |&c| page_of_cluster[gpu_of[c as usize] as usize])
-            })
-            .collect();
+        let gpage = &plan.group_page;
 
-        let mut clusters: Vec<GpuCluster> = Vec::with_capacity(order.len());
-        let mut pages: Vec<GpuPage> = Vec::with_capacity(page_units.len());
-        let mut page_data: Vec<Vec<u8>> = Vec::with_capacity(page_units.len());
+        let mut clusters: Vec<GpuCluster> = Vec::with_capacity(dag.clusters.len());
+        let mut pages: Vec<GpuPage> = Vec::with_capacity(plan.pages.len());
+        let mut page_data: Vec<Vec<u8>> = Vec::with_capacity(plan.pages.len());
         let mut dependencies: Vec<u32> = Vec::new();
+        // Page-local index of each source vertex, valid for the page being written.
+        let mut vmap = vec![0u32; nv];
         let mut first = 0usize;
-        for (p, us) in page_units.iter().enumerate() {
-            let members: Vec<u32> = us
-                .iter()
-                .flat_map(|&u| units[u].clusters.iter().copied())
-                .collect();
-            // Page-local vertices in first-use order.
-            let mut vmap: std::collections::HashMap<u32, u32> = Default::default();
-            let mut verts: Vec<u32> = Vec::new();
-            for &c in &members {
-                for &v in &local[c as usize].verts {
-                    vmap.entry(v).or_insert_with(|| {
-                        verts.push(v);
-                        verts.len() as u32 - 1
-                    });
-                }
+        for (p, planned) in plan.pages.iter().enumerate() {
+            let members = &planned.clusters;
+            let verts = &planned.vertices;
+            for (i, &v) in verts.iter().enumerate() {
+                vmap[v as usize] = i as u32;
             }
             let q: Vec<[u32; 3]> = verts.iter().map(|&v| grid(v)).collect();
             let base = q.iter().fold([u32::MAX; 3], |a, g| {
                 [a[0].min(g[0]), a[1].min(g[1]), a[2].min(g[2])]
             });
             let base = if q.is_empty() { [0; 3] } else { base };
+            let t = &planned.tally;
             let vertex_offset = PAGE_HEADER_SIZE;
-            let index_offset = align16(vertex_offset + verts.len() * VERTEX_STRIDE);
-            let index_bytes: usize = members
-                .iter()
-                .map(|&c| 4 * local[c as usize].verts.len())
-                .sum();
-            let triangle_offset = index_offset + align16(index_bytes);
-            let tri_bytes: usize = members
-                .iter()
-                .map(|&c| local[c as usize].tris.len().div_ceil(4) * 4)
-                .sum();
-            let material_offset = triangle_offset + align16(tri_bytes);
-            let mat_bytes: usize = members
-                .iter()
-                .filter(|&&c| local[c as usize].material == NONE)
-                .map(|&c| (2 * local[c as usize].tris.len() / 3).div_ceil(4) * 4)
-                .sum();
-            let size = material_offset + align16(mat_bytes);
-            debug_assert!(size <= opts.page_size);
+            let index_offset = align16(vertex_offset + verts.len() * stride);
+            let triangle_offset = index_offset + align16(t.bytes[0]);
+            let material_offset = triangle_offset + align16(t.bytes[1]);
+            let size = material_offset + align16(t.bytes[2]);
+            debug_assert_eq!(size, layout.page_bytes(t));
 
             let mut w = W(Vec::with_capacity(size));
             for v in [
@@ -637,40 +703,37 @@ impl GpuClusterDag {
             }
             for (&v, g) in verts.iter().zip(&q) {
                 let d = [g[0] - base[0], g[1] - base[1], g[2] - base[2]];
-                let (n, uv) = vertex_attrs(v);
                 w.u32(d[0] | (d[1] << 21));
                 w.u32((d[1] >> 11) | (d[2] << 10));
-                w.u32(n);
-                w.u32(uv);
+                vertex_attrs(v, &mut w);
             }
             w.pad16();
             let (mut io, mut to, mut mo) = (index_offset, triangle_offset, material_offset);
-            for &c in &members {
-                let l = &local[c as usize];
-                for &v in &l.verts {
-                    w.u32(vmap[&v]);
+            for &c in members {
+                for &v in &local[c as usize].verts {
+                    w.u32(vmap[v as usize]);
                 }
             }
             w.pad16();
             debug_assert_eq!(w.0.len(), triangle_offset);
-            for &c in &members {
+            for &c in members {
                 w.0.extend_from_slice(&local[c as usize].tris);
-                w.0.resize(w.0.len().div_ceil(4) * 4, 0);
+                w.0.resize(pad4(w.0.len()), 0);
             }
             w.pad16();
-            for &c in &members {
+            for &c in members {
                 if local[c as usize].material == NONE {
                     for &m in &dag.clusters[c as usize].material_ids {
                         w.0.extend_from_slice(&(m as u16).to_le_bytes());
                     }
-                    w.0.resize(w.0.len().div_ceil(4) * 4, 0);
+                    w.0.resize(pad4(w.0.len()), 0);
                 }
             }
             w.pad16();
             debug_assert_eq!(w.0.len(), size);
 
             // Cluster headers.
-            for &c in &members {
+            for &c in members {
                 let s = &dag.clusters[c as usize];
                 let l = &local[c as usize];
                 let mixed = l.material == NONE;
@@ -694,37 +757,23 @@ impl GpuClusterDag {
                     source_cluster: c,
                 });
                 io += 4 * l.verts.len();
-                to += l.tris.len().div_ceil(4) * 4;
+                to += pad4(l.tris.len());
                 if mixed {
-                    mo += (2 * l.tris.len() / 3).div_ceil(4) * 4;
+                    mo += pad4(2 * l.tris.len() / 3);
                 }
             }
-            // Dependencies: pages of the parent groups' clusters.
-            let mut deps: Vec<u32> = members
-                .iter()
-                .map(|&c| dag.clusters[c as usize].parent_group)
-                .filter(|&g| g != NONE)
-                .map(|g| gpage[g as usize])
-                .filter(|&dp| dp != NONE && dp != p as u32)
-                .collect();
-            deps.sort_unstable();
-            deps.dedup();
             pages.push(GpuPage {
                 offset: 0,
                 size: size as u32,
                 cluster_first: first as u32,
                 cluster_count: members.len() as u32,
                 dep_first: dependencies.len() as u32,
-                dep_count: deps.len() as u32,
-                level: members
-                    .iter()
-                    .map(|&c| dag.clusters[c as usize].level)
-                    .max()
-                    .unwrap_or(0),
+                dep_count: planned.dependencies.len() as u32,
+                level: planned.level,
                 vertex_count: verts.len() as u32,
                 base,
             });
-            dependencies.extend(deps);
+            dependencies.extend_from_slice(&planned.dependencies);
             page_data.push(w.0);
             first += members.len();
         }
@@ -749,6 +798,8 @@ impl GpuClusterDag {
             step,
             uv_min,
             uv_step,
+            uv1_min,
+            uv1_step,
             clusters,
             groups,
             pages,
@@ -757,6 +808,11 @@ impl GpuClusterDag {
         };
         out.layout();
         Ok(out)
+    }
+
+    /// Bytes per vertex.
+    pub fn vertex_stride(&self) -> usize {
+        4 * vertex_words(self.flags)
     }
 
     /// Offsets of (clusters, groups, page table, dependencies, first page).
@@ -803,7 +859,7 @@ impl GpuClusterDag {
         for v in [
             self.page_size,
             self.position_bits,
-            VERTEX_STRIDE as u32,
+            self.vertex_stride() as u32,
             CLUSTER_STRIDE as u32,
         ] {
             w.u32(v);
@@ -815,6 +871,14 @@ impl GpuClusterDag {
         }
         for v in [c_off, g_off, p_off, d_off] {
             w.u32(v as u32);
+        }
+        for v in [
+            self.uv1_min.x,
+            self.uv1_min.y,
+            self.uv1_step.x,
+            self.uv1_step.y,
+        ] {
+            w.f32(v);
         }
         debug_assert_eq!(w.0.len(), HEADER_SIZE);
         for c in &self.clusters {
@@ -876,26 +940,43 @@ impl GpuClusterDag {
         w.0
     }
 
-    /// Reads and validates a file written by [`GpuClusterDag::to_bytes`]. Every offset and index
-    /// is checked, so the accessors never index out of bounds.
+    /// Reads and validates a file written by [`GpuClusterDag::to_bytes`] (or a version 1 file).
+    /// Every offset and index is checked, so the accessors never index out of bounds.
     pub fn from_bytes(bytes: &[u8]) -> Result<GpuClusterDag> {
         let r = R(bytes);
-        if bytes.len() < HEADER_SIZE || bytes[..4] != MAGIC {
+        if bytes.len() < HEADER_SIZE_V1 || bytes[..4] != MAGIC {
             return invalid("not a farthing cluster file (bad magic)");
         }
         let version = r.u32(4)?;
-        if version != VERSION {
-            return invalid(format!(
-                "unsupported cluster file version {version} (expected {VERSION})"
-            ));
-        }
+        let (header_size, known) = match version {
+            1 => (HEADER_SIZE_V1, FLAG_NORMALS | FLAG_UVS),
+            VERSION => (HEADER_SIZE, FLAGS_ALL),
+            _ => {
+                return invalid(format!(
+                    "unsupported cluster file version {version} (expected 1 or {VERSION})"
+                ));
+            }
+        };
         let flags = r.u32(8)?;
-        if r.u32(12)? as usize != HEADER_SIZE
-            || r.u32(40)? as usize != VERTEX_STRIDE
+        if flags & !known != 0 || (flags & FLAG_UV1 != 0 && flags & FLAG_UVS == 0) {
+            return invalid("unknown or inconsistent vertex flags");
+        }
+        if bytes.len() < header_size
+            || r.u32(12)? as usize != header_size
+            || r.u32(40)? as usize != 4 * vertex_words(flags)
             || r.u32(44)? as usize != CLUSTER_STRIDE
         {
             return invalid("unexpected header, vertex or cluster size");
         }
+        let stride = 4 * vertex_words(flags);
+        let (uv1_min, uv1_step) = if version == 1 {
+            (Vec2::ZERO, Vec2::ZERO)
+        } else {
+            (
+                Vec2::new(r.f32(96)?, r.f32(100)?),
+                Vec2::new(r.f32(104)?, r.f32(108)?),
+            )
+        };
         let [nc, ng, np, nd] = [16, 20, 24, 28].map(|o| r.u32(o).map(|v| v as usize));
         let (nc, ng, np, nd) = (nc?, ng?, np?, nd?);
         let page_size = r.u32(32)?;
@@ -1015,8 +1096,8 @@ impl GpuClusterDag {
             {
                 return invalid("page header does not match the page table");
             }
-            let vend =
-                (pr.u32(12)? as usize).saturating_add(p.vertex_count as usize * VERTEX_STRIDE);
+            let vend = (pr.u32(12)? as usize)
+                .saturating_add((p.vertex_count as usize).saturating_mul(stride));
             if pr.u32(12)? as usize != PAGE_HEADER_SIZE || vend > size as usize {
                 return invalid("page vertices out of bounds");
             }
@@ -1031,6 +1112,8 @@ impl GpuClusterDag {
             step,
             uv_min,
             uv_step,
+            uv1_min,
+            uv1_step,
             clusters,
             groups,
             pages,
@@ -1098,23 +1181,41 @@ impl GpuClusterDag {
     pub fn vertex(&self, p: usize, v: u32) -> GpuVertex {
         let page = &self.pages[p];
         let r = R(&self.page_data[p]);
-        let o = PAGE_HEADER_SIZE + v as usize * VERTEX_STRIDE;
-        let w = [0, 4, 8, 12].map(|k| r.u32(o + k).unwrap_or(0));
+        let o = PAGE_HEADER_SIZE + v as usize * self.vertex_stride();
+        let word = |k: usize| r.u32(o + 4 * k).unwrap_or(0);
+        let w = [0, 1, 2, 3].map(word);
         let d = [
             w[0] & 0x1F_FFFF,
             (w[0] >> 21) | ((w[1] & 0x3FF) << 11),
             (w[1] >> 10) & 0x1F_FFFF,
         ];
         let g = [0, 1, 2].map(|k| page.base[k].wrapping_add(d[k]) as f32);
-        GpuVertex {
+        let at = |f: u32| attribute_word(self.flags, f);
+        let mut out = GpuVertex {
             position: self.origin + Vec3::from_array(g) * self.step,
             normal: if self.flags & FLAG_NORMALS != 0 {
                 oct_decode(w[2])
             } else {
                 Vec3::ZERO
             },
-            uv: self.uv_min + Vec2::new((w[3] & 0xFFFF) as f32, (w[3] >> 16) as f32) * self.uv_step,
+            uv: uv_decode(w[3], self.uv_min, self.uv_step),
+            ..Default::default()
+        };
+        if let Some(k) = at(FLAG_TANGENTS) {
+            out.tangent = tangent_decode(word(k));
         }
+        if let Some(k) = at(FLAG_COLORS) {
+            out.color = Vec4::from_array(unorm8x4_decode(word(k)));
+        }
+        if let Some(k) = at(FLAG_UV1) {
+            out.uv1 = uv_decode(word(k), self.uv1_min, self.uv1_step);
+        }
+        if let Some(k) = at(FLAG_SKIN) {
+            let (a, b) = (word(k), word(k + 1));
+            out.joints = [a as u16, (a >> 16) as u16, b as u16, (b >> 16) as u16];
+            out.weights = unorm8x4_decode(word(k + 2));
+        }
+        out
     }
 
     /// Cluster `c`'s page-local vertex indices.
@@ -1181,6 +1282,21 @@ impl GpuClusterDag {
         }
         if self.flags & FLAG_UVS != 0 {
             m.uvs = vec![verts.iter().map(|v| v.uv).collect()];
+            if self.flags & FLAG_UV1 != 0 {
+                m.uvs.push(verts.iter().map(|v| v.uv1).collect());
+            }
+        }
+        if self.flags & FLAG_TANGENTS != 0 {
+            m.tangents = Some(verts.iter().map(|v| v.tangent).collect());
+        }
+        if self.flags & FLAG_COLORS != 0 {
+            m.colors = Some(verts.iter().map(|v| v.color).collect());
+        }
+        if self.flags & FLAG_SKIN != 0 {
+            m.skin = Some(Skin {
+                joints: verts.iter().map(|v| v.joints).collect(),
+                weights: verts.iter().map(|v| v.weights).collect(),
+            });
         }
         m
     }
@@ -1473,6 +1589,187 @@ mod tests {
                 assert_eq!(n, 2, "edge {e:?} used {n} times");
             }
         }
+    }
+
+    /// `mesh_with_uvs` plus tangents, colors, a second UV set and a skin.
+    fn mesh_with_everything(n: i32) -> Mesh {
+        let mut m = mesh_with_uvs(n);
+        let normals = m.normals.clone().unwrap();
+        m.tangents = Some(
+            normals
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let t = n.any_orthonormal_vector();
+                    t.extend(if i % 3 == 0 { -1.0 } else { 1.0 })
+                })
+                .collect(),
+        );
+        m.colors = Some(
+            m.positions
+                .iter()
+                .map(|p| (p.abs().min(Vec3::ONE)).extend(0.5))
+                .collect(),
+        );
+        let uv1 = m
+            .positions
+            .iter()
+            .map(|p| Vec2::new(p.z * 3.0 - 1.0, p.x * 7.0))
+            .collect();
+        m.uvs.push(uv1);
+        let nv = m.vertex_count();
+        m.skin = Some(Skin {
+            joints: (0..nv)
+                .map(|i| [i as u16, (i * 7) as u16, 300, u16::MAX])
+                .collect(),
+            weights: (0..nv)
+                .map(|i| {
+                    let a = (i % 10) as f32;
+                    [a, 10.0 - a, 1.0, 0.0]
+                })
+                .collect(),
+        });
+        m
+    }
+
+    #[test]
+    fn optional_attributes_round_trip() {
+        let m = mesh_with_everything(30);
+        let dag = build_cluster_dag(&m, &ClusterOptions::default()).unwrap();
+        let plain = GpuClusterDag::from_dag(&dag, &m, &GpuOptions::default()).unwrap();
+        assert_eq!(plain.flags, FLAG_NORMALS | FLAG_UVS);
+        assert_eq!(plain.vertex_stride(), VERTEX_STRIDE);
+        let gpu = GpuClusterDag::from_dag(&dag, &m, &GpuOptions::all_attributes()).unwrap();
+        assert_eq!(gpu.flags, FLAGS_ALL);
+        assert_eq!(gpu.vertex_stride(), 40);
+        let bytes = gpu.to_bytes();
+        let back = decode_gpu(&bytes).unwrap();
+        assert_eq!(back, gpu);
+        // Same clusters, more pages: the vertices are bigger.
+        assert_eq!(gpu.clusters.len(), plain.clusters.len());
+        assert!(gpu.file_size() > plain.file_size());
+
+        let tans = m.tangents.as_ref().unwrap();
+        let cols = m.colors.as_ref().unwrap();
+        let skin = m.skin.as_ref().unwrap();
+        for (i, c) in gpu.clusters.iter().enumerate() {
+            let (verts, _) = dag.clusters[c.source_cluster as usize].meshlet();
+            for (k, &pv) in gpu.cluster_vertices(i).iter().enumerate() {
+                let d = gpu.vertex(c.page as usize, pv);
+                let v = verts[k] as usize;
+                // The base attributes decode as in the plain file.
+                let p = plain
+                    .clusters
+                    .iter()
+                    .position(|x| x.source_cluster == c.source_cluster);
+                let pc = &plain.clusters[p.unwrap()];
+                let pd = plain.vertex(pc.page as usize, plain.cluster_vertices(p.unwrap())[k]);
+                assert_eq!(
+                    (d.position, d.normal, d.uv),
+                    (pd.position, pd.normal, pd.uv)
+                );
+                assert_eq!(pd.tangent, Vec4::ZERO);
+
+                assert_eq!(d.tangent.w, tans[v].w);
+                assert!(d.tangent.truncate().dot(tans[v].truncate()) > 1e-3f32.cos());
+                assert!((d.color - cols[v]).abs().max_element() <= 0.5 / 255.0 + 1e-6);
+                let e = (d.uv1 - m.uvs[1][v]).abs();
+                assert!(e.x <= gpu.uv1_step.x * 0.5 + 1e-6 && e.y <= gpu.uv1_step.y * 0.5 + 1e-6);
+                assert_eq!(d.joints, skin.joints[v]);
+                let sum: f32 = skin.weights[v].iter().sum();
+                let qsum: u32 = d.weights.iter().map(|w| (w * 255.0).round() as u32).sum();
+                assert_eq!(qsum, 255);
+                for (a, b) in d.weights.iter().zip(skin.weights[v]) {
+                    assert!(
+                        (a - b / sum).abs() <= 2.0 / 255.0 + 1e-6,
+                        "{:?} {:?}",
+                        d.weights,
+                        skin.weights[v]
+                    );
+                }
+            }
+        }
+        let all: Vec<u32> = (0..gpu.clusters.len() as u32).collect();
+        let mesh = gpu.to_mesh(&all);
+        assert!(mesh.tangents.is_some() && mesh.colors.is_some() && mesh.skin.is_some());
+        assert_eq!(mesh.uvs.len(), 2);
+
+        // Only what is asked for and present.
+        let opts = GpuOptions {
+            colors: true,
+            skin: true,
+            ..Default::default()
+        };
+        let mut no_skin = m.clone();
+        no_skin.skin = None;
+        let g = GpuClusterDag::from_dag(&dag, &no_skin, &opts).unwrap();
+        assert_eq!(g.flags, FLAG_NORMALS | FLAG_UVS | FLAG_COLORS);
+        assert_eq!(attribute_word(g.flags, FLAG_COLORS), Some(4));
+        assert_eq!(attribute_word(gpu.flags, FLAG_SKIN), Some(7));
+        assert_eq!(attribute_word(g.flags, FLAG_SKIN), None);
+    }
+
+    #[test]
+    fn layout_matches_written_pages() {
+        let m = mesh_with_everything(40);
+        let dag = build_cluster_dag(&m, &ClusterOptions::default()).unwrap();
+        for opts in [GpuOptions::default(), GpuOptions::all_attributes()] {
+            let opts = GpuOptions {
+                page_size: 32 * 1024,
+                ..opts
+            };
+            let gpu = GpuClusterDag::from_dag(&dag, &m, &opts).unwrap();
+            let layout = FcldLayout {
+                page_size: opts.page_size,
+                vertex_stride: gpu.vertex_stride(),
+            };
+            let plan = plan_pages(&dag, &layout).unwrap();
+            assert_eq!(plan.pages.len(), gpu.pages.len());
+            for (pp, gp) in plan.pages.iter().zip(&gpu.pages) {
+                assert_eq!(layout.page_bytes(&pp.tally), gp.size as usize);
+                assert_eq!(pp.vertices.len(), gp.vertex_count as usize);
+            }
+            let order: Vec<u32> = plan.cluster_order().collect();
+            let src: Vec<u32> = gpu.clusters.iter().map(|c| c.source_cluster).collect();
+            assert_eq!(order, src);
+        }
+    }
+
+    /// Rewrites a version 2 file without optional attributes as version 1.
+    fn as_v1(v2: &[u8]) -> Vec<u8> {
+        let u = |at: usize| u32::from_le_bytes(v2[at..at + 4].try_into().unwrap());
+        let shift = (HEADER_SIZE - HEADER_SIZE_V1) as u32;
+        let mut out = v2[..HEADER_SIZE_V1].to_vec();
+        out[4..8].copy_from_slice(&1u32.to_le_bytes());
+        out[12..16].copy_from_slice(&(HEADER_SIZE_V1 as u32).to_le_bytes());
+        for at in [80, 84, 88, 92] {
+            out[at..at + 4].copy_from_slice(&(u(at) - shift).to_le_bytes());
+        }
+        out.extend_from_slice(&v2[HEADER_SIZE..]);
+        // Page table file offsets.
+        let (p_off, np) = ((u(88) - shift) as usize, u(24) as usize);
+        for i in 0..np {
+            let at = p_off + i * PAGE_ENTRY_STRIDE;
+            let o = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+            out[at..at + 4].copy_from_slice(&(o - shift).to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn reads_version_1() {
+        let m = mesh_with_uvs(20);
+        let dag = build_cluster_dag(&m, &ClusterOptions::default()).unwrap();
+        let gpu = GpuClusterDag::from_dag(&dag, &m, &GpuOptions::default()).unwrap();
+        let v1 = as_v1(&gpu.to_bytes());
+        let back = decode_gpu(&v1).unwrap();
+        assert_eq!(back.clusters, gpu.clusters);
+        assert_eq!(back.page_data, gpu.page_data);
+        assert_eq!(back.to_bytes(), gpu.to_bytes());
+        // Version 1 knows no optional attributes.
+        let mut bad = v1.clone();
+        bad[8] |= FLAG_COLORS as u8;
+        assert!(decode_gpu(&bad).is_err());
     }
 
     #[test]

@@ -106,7 +106,7 @@ fn vs_cluster(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) 
         k = 3u - k;
     }
     let v = pool[base + (cw(c, 25u) >> 2u) + pool_byte(base, cw(c, 26u) + 3u * t + k)];
-    let o = base + 12u + 4u * v;
+    let o = base + 12u + (m.flags >> 8u) * v;
     let w = vec4u(pool[o], pool[o + 1u], pool[o + 2u], pool[o + 3u]);
     let d = vec3u(w.x & 0x1fffffu, (w.x >> 21u) | ((w.y & 0x3ffu) << 11u), (w.y >> 10u) & 0x1fffffu);
     let grid = vec3u(pool[base + 4u], pool[base + 5u], pool[base + 6u]) + d;

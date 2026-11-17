@@ -68,11 +68,19 @@
 
       <fieldset data-modes="clusters">
         <legend>Cluster DAG</legend>
-        <label class="select" title="Cluster size limits">Layout
-          <select name="cluster_layout">
-            <option value="nanite" selected>Nanite: 128 tris, 255 verts</option>
-            <option value="meshlet">Meshlet: 124 tris, 64 verts</option>
+        <label class="select" title="Cluster size limits some engines use; any other pair works too">Layout
+          <select name="cluster_preset">
+            <option value="128x255" selected>Nanite: 128 tris, 255 verts</option>
+            <option value="124x64">Meshlet: 124 tris, 64 verts</option>
+            <option value="64x64">Lumina: 64 tris, 64 verts</option>
+            <option value="custom">Custom</option>
           </select>
+        </label>
+        <label class="select" title="ClusterOptions::max_triangles: triangles per cluster">Max triangles
+          <span><input type="number" name="cluster_max_triangles" min="1" max="512" step="1" value="128" style="width: 5em"></span>
+        </label>
+        <label class="select" title="ClusterOptions::max_vertices: distinct vertices per cluster (the packed format's u8 micro-indices allow at most 256)">Max vertices
+          <span><input type="number" name="cluster_max_vertices" min="3" max="256" step="1" value="255" style="width: 5em"></span>
         </label>
         <label class="check" title="ClusterOptions::fast(): quicker build, coarser simplification"><input type="checkbox" name="cluster_fast"> Fast build</label>
       </fieldset>

@@ -709,7 +709,7 @@ impl ClusterRenderer {
                 d.clusters.len() as u32,
                 b.page_first[r],
                 b.group_first[r],
-                d.flags & (FLAG_NORMALS | FLAG_UVS),
+                d.flags & (FLAG_NORMALS | FLAG_UVS) | (d.vertex_stride() as u32 / 4) << 8,
                 slot_first,
                 m.slot_count,
                 double_mask,
