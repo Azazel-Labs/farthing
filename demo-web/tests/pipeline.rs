@@ -7,7 +7,8 @@ use farthing::{Mesh, Scene};
 use farthing_demo_web::cook::TextureCompression;
 use farthing_demo_web::modes::ViewRequest;
 use farthing_demo_web::pipeline::{
-    Buffer, Demo, DemoMode, Event, LevelInfo, LevelKind, LodOptions, TextureMode, TextureShrink,
+    Buffer, Demo, DemoMode, Event, LevelInfo, LevelKind, LevelSpacing, LodOptions, TextureMode,
+    TextureShrink, scene_payload,
 };
 use glam::{Vec2, Vec3, Vec4};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -116,6 +117,10 @@ fn zipped_gltf_reduces_and_bakes() {
     assert_eq!(info.triangles, 48 * 24 * 2);
     assert_eq!(info.textured_materials, 1);
     load_gltf_slice(&demo.original_glb().unwrap()).unwrap();
+    let original = demo.level_scene(0).unwrap();
+    assert_eq!(payload_triangles(&original), 48 * 24 * 2);
+    assert_eq!(payload_textures(&original), 1);
+    assert!(original.0["materials"][0]["base_color_texture"] == 0);
 
     let opts = LodOptions {
         levels: 3,
@@ -131,7 +136,7 @@ fn zipped_gltf_reduces_and_bakes() {
         &|| t0.elapsed().as_secs_f64() * 1e3,
         &mut |e| match e {
             Event::Stage(_) => stages += 1,
-            Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+            Event::Level { info, scene } => levels.push((info.clone(), payload(scene))),
             Event::Texture {
                 channel,
                 width,
@@ -149,12 +154,13 @@ fn zipped_gltf_reduces_and_bakes() {
 
     assert!(stages > 3);
     assert_eq!(levels.len(), 4, "LOD0..LOD3");
-    assert!(levels[0].1.is_empty());
+    assert!(levels[0].1.is_none());
     for w in levels.windows(2) {
         assert!(w[1].0.triangles < w[0].0.triangles, "{:?}", w[1].0);
     }
-    for (info, glb) in &levels[1..] {
-        let (s, _) = load_gltf_slice(glb).unwrap();
+    for (info, p) in &levels[1..] {
+        assert_eq!(payload_triangles(p.as_ref().unwrap()), info.triangles);
+        let (s, _) = load_gltf_slice(&demo.level_glb(info.level, true).unwrap()).unwrap();
         assert_eq!(s.triangle_count(), info.triangles);
         assert!(info.error > 0.0 && info.relative_error < 0.2, "{info:?}");
     }
@@ -178,7 +184,7 @@ fn zipped_gltf_reduces_and_bakes() {
 /// Measured levels (all but LOD0) report a mean and RMS distance between zero and the error,
 /// a normal deviation unless baked, and switch where the error is a pixel even on the side of
 /// the model nearest the camera: the error at the reference scale plus half the diagonal.
-fn check_measured(levels: &[(LevelInfo, Vec<u8>)], diagonal: f32) {
+fn check_measured<T>(levels: &[(LevelInfo, T)], diagonal: f32) {
     let ppr = 1080.0 / (2.0 * 30f32.to_radians().tan());
     let original = &levels[0].0;
     assert_eq!(original.switch_distance_1px, 0.0);
@@ -220,7 +226,7 @@ fn shared_atlas_carries_the_original_materials() {
             &opts,
             &|| t0.elapsed().as_secs_f64() * 1e3,
             &mut |e| match e {
-                Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+                Event::Level { info, scene } => levels.push((info.clone(), payload(scene))),
                 Event::Texture {
                     level,
                     channel,
@@ -250,9 +256,9 @@ fn shared_atlas_carries_the_original_materials() {
         // Three textures (base color, normal, ORM) with mips.
         assert_eq!(one.texture_bytes, Some(3 * ((w * h) as usize * 16 / 3)));
 
-        // Level 1's GLB carries the atlas; level 2 reuses it, but downloads embed it.
-        assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
-        assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
+        // Level 1 brings the atlas to the viewer; level 2 reuses it, but downloads embed it.
+        assert_eq!(payload_textures(levels[1].1.as_ref().unwrap()), 3);
+        assert_eq!(payload_textures(levels[2].1.as_ref().unwrap()), 0);
         assert!(
             demo.level_glb(2, false)
                 .unwrap()
@@ -287,7 +293,7 @@ fn recut_keeps_every_triangle_then_reduces() {
     assert_eq!(opts.textures, TextureMode::Recut);
     let (mut levels, mut textures) = (vec![], vec![]);
     demo.run(&opts, &|| 0.0, &mut |e| match e {
-        Event::Level { info, glb } => levels.push((info.clone(), glb.to_vec())),
+        Event::Level { info, scene } => levels.push((info.clone(), payload(scene))),
         Event::Texture { level, .. } => textures.push(level),
         _ => {}
     })
@@ -320,8 +326,8 @@ fn recut_keeps_every_triangle_then_reduces() {
     let (mean, p99) = (lod0.texture_error.unwrap(), lod0.texture_error_p99.unwrap());
     assert!(mean > 0.0 && mean < 12.0 && p99 < 160.0, "{lod0:?}");
     assert!(levels[2..].iter().all(|l| l.0.texture_error.is_none()));
-    assert!(levels[1].1.windows(9).any(|w| w == b"image/png"));
-    assert!(!levels[2].1.windows(9).any(|w| w == b"image/png"));
+    assert_eq!(payload_textures(levels[1].1.as_ref().unwrap()), 3);
+    assert_eq!(payload_textures(levels[2].1.as_ref().unwrap()), 0);
 
     // A LOD0 error of 2% of the diagonal: LOD0 drops triangles until it deviates about that,
     // and texels finer than it (the checker's 18 a unit, against 14 at 2%) are dropped too.
@@ -583,6 +589,52 @@ fn chains_stop_past_the_error_limit() {
         for (a, b) in capped.iter().zip(&full) {
             assert_eq!(a.triangles, b.triangles, "{textures:?}");
         }
+    }
+}
+
+/// Spaced by error, a chain's reduced levels deviate about the limit at the last and half as
+/// much at each one before, whatever their triangle counts come to.
+#[test]
+fn error_spacing_sets_each_levels_deviation() {
+    let mut demo = Demo::load(vec![("sphere.glb".into(), textured_sphere())]).unwrap();
+    let limit = 0.02;
+    for textures in [
+        TextureMode::Recut,
+        TextureMode::Original,
+        TextureMode::Shared,
+    ] {
+        let opts = LodOptions {
+            levels: 4,
+            max_error: limit,
+            spacing: LevelSpacing::Error,
+            error_ratio: 2.0,
+            shared_size: 512,
+            atlas: 128,
+            textures,
+            ..Default::default()
+        };
+        let (levels, _) = chain_levels(&mut demo, &opts);
+        // The original, a recut's LOD0, then the four spaced levels.
+        let reduced = &levels[1 + usize::from(textures == TextureMode::Recut)..];
+        let summary: Vec<_> = reduced
+            .iter()
+            .map(|l| (l.triangles, l.relative_error))
+            .collect();
+        eprintln!("{textures:?}: {summary:?}");
+        assert_eq!(reduced.len(), 4, "{textures:?}: {summary:?}");
+        for (k, l) in reduced.iter().enumerate() {
+            let goal = limit / 2f32.powi(3 - k as i32);
+            assert!(
+                l.relative_error <= 1.3 * goal && l.relative_error >= 0.5 * goal,
+                "{textures:?} level {k}: goal {goal}, {summary:?}"
+            );
+        }
+        assert!(
+            reduced
+                .windows(2)
+                .all(|w| 10 * w[1].triangles < 9 * w[0].triangles),
+            "{textures:?}: {summary:?}"
+        );
     }
 }
 
@@ -885,17 +937,51 @@ fn samples_reduce_and_bake() {
     }
 }
 
+/// A level event's viewer payload: none for the original.
+type Payload = Option<(serde_json::Value, Vec<Buffer>)>;
+
+fn payload(scene: Option<(&Scene, &ExportTextures)>) -> Payload {
+    scene.map(|(s, t)| scene_payload(s, t))
+}
+
+/// Triangles a viewer payload draws: each instance's mesh's.
+fn payload_triangles((json, buffers): &(serde_json::Value, Vec<Buffer>)) -> usize {
+    let meshes = json["meshes"].as_array().unwrap();
+    json["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let m = &meshes[i["mesh"].as_u64().unwrap() as usize];
+            let indices = u32s(&buffers[m["indices"].as_u64().unwrap() as usize]);
+            let parts: u64 = m["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p[1].as_u64().unwrap())
+                .sum();
+            assert_eq!(parts as usize, indices.len());
+            indices.len() / 3
+        })
+        .sum()
+}
+
+fn payload_textures(p: &(serde_json::Value, Vec<Buffer>)) -> usize {
+    p.0["textures"].as_array().unwrap().len()
+}
+
 /// What a run reported.
 #[derive(Default)]
 struct Run {
-    levels: Vec<(LevelInfo, usize)>,
+    /// Each level, and whether it brought a scene for the viewer.
+    levels: Vec<(LevelInfo, bool)>,
     data: Vec<(String, serde_json::Value, Vec<Buffer>)>,
 }
 
 fn run_mode(demo: &mut Demo, mode: DemoMode, opts: LodOptions) -> Run {
     let mut run = Run::default();
     demo.run(&LodOptions { mode, ..opts }, &|| 0.0, &mut |e| match e {
-        Event::Level { info, glb } => run.levels.push((info.clone(), glb.len())),
+        Event::Level { info, scene } => run.levels.push((info.clone(), scene.is_some())),
         Event::Data {
             kind,
             json,
@@ -925,10 +1011,13 @@ fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
         DemoMode::Chain => {}
         DemoMode::Presets => {
             assert_eq!(run.levels.len(), 11, "original + 10 configurations");
-            for (info, glb) in &run.levels[1..] {
+            for (info, has_scene) in &run.levels[1..] {
                 assert!(info.label.is_some() && info.note.is_some(), "{info:?}");
                 assert!(info.triangles < original, "{info:?}");
-                assert_eq!(info.bytes, Some(*glb));
+                assert!(has_scene);
+                // The compact GLB without textures: no more than the download, which embeds them.
+                let bytes = info.bytes.unwrap();
+                assert!(bytes > 0 && bytes <= demo.level_glb(info.level, true).unwrap().len());
                 assert!(info.relative_error < 0.5, "{info:?}");
                 demo.level_glb(info.level, false).unwrap();
             }
@@ -959,6 +1048,10 @@ fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
         }
         DemoMode::Hlod => {
             let nodes = run.data.iter().filter(|d| d.0 == "hlod_node").count();
+            for (_, json, buffers) in run.data.iter().filter(|d| d.0 == "hlod_node") {
+                let p = (json["scene"].clone(), buffers.clone());
+                assert!(payload_triangles(&p) > 0, "{json}");
+            }
             let (kind, json, _) = run.data.last().unwrap();
             assert_eq!(kind, "hlod_tree");
             assert_eq!(nodes, json["nodes"].as_array().unwrap().len(), "{json}");

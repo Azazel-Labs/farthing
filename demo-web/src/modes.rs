@@ -15,7 +15,7 @@
 
 use crate::pipeline::{
     Buffer, Demo, Event, LevelInfo, LevelKind, LodOptions, MaterialHost, compact_glb,
-    original_textures, reference_ppr, switch_distance,
+    original_textures, reference_ppr, scene_payload, switch_distance,
 };
 use farthing::bake::BakeOptions;
 use farthing::cluster::{
@@ -212,7 +212,7 @@ fn emit_original(demo: &Demo, emit: &mut dyn FnMut(Event)) {
     };
     emit(Event::Level {
         info: &info,
-        glb: &[],
+        scene: None,
     });
 }
 
@@ -376,7 +376,8 @@ pub(crate) fn run_presets(
         };
         // Like the chain: the page gets geometry (it reuses the original's materials), the
         // download gets the original's textures.
-        let glb = compact_glb(&s, &ExportTextures::default()).map_err(err)?;
+        let none = ExportTextures::default();
+        let glb = compact_glb(&s, &none).map_err(err)?;
         let ms = now() - t0;
         let mut info = LevelInfo {
             triangles: s.triangle_count(),
@@ -391,7 +392,7 @@ pub(crate) fn run_presets(
         info.measure(&source, &s, diag);
         emit(Event::Level {
             info: &info,
-            glb: &glb,
+            scene: Some((&s, &none)),
         });
         demo.levels.push((s, original_textures(&demo.materials)));
     }
@@ -655,6 +656,7 @@ pub(crate) fn run_hlod(
         let mut s = Scene::from_mesh(p.mesh);
         s.materials[0].name = format!("hlod_{idx}");
         let glb = compact_glb(&s, &tex)?;
+        let (scene_json, buffers) = scene_payload(&s, &tex);
         built += 1;
         emit(Event::Stage(&format!("HLOD: {built} proxies")));
         emit(Event::Data {
@@ -669,9 +671,10 @@ pub(crate) fn run_hlod(
                 "baked": baked,
                 "coverage": coverage,
                 "bytes": glb.len(),
+                "scene": scene_json,
             })
             .to_string(),
-            buffers: vec![Buffer::U8(glb)],
+            buffers,
         });
         Ok(())
     })
@@ -715,7 +718,6 @@ pub(crate) fn run_hlod(
         "instance_triangles": instance_triangles.iter().sum::<usize>(),
         "cell_size": topts.cell_size,
         "focus": { "center": b.center().to_array(), "radius": b.diagonal() * 0.5 },
-        "joint_nodes": demo.scene.skeletons.iter().map(|s| s.joints.len()).sum::<usize>(),
         "baked": opts.hlod_bake,
         "ms": now() - t0,
         "visibility": {

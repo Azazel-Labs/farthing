@@ -82,7 +82,9 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: demo-web
+          workspaces: |
+            demo-web
+            engine-poc
           cache-on-failure: true
       # Must match the `wasm-bindgen = "=…"` pin in demo-web/Cargo.toml.
       - uses: taiki-e/install-action@v2
@@ -112,6 +114,20 @@ jobs:
           tar xzf "binaryen-$BINARYEN-x86_64-linux.tar.gz"
           echo "$RUNNER_TEMP/binaryen-$BINARYEN/bin" >> "$GITHUB_PATH"
       - run: sh demo-web/build.sh
+      # The PoC engine, which draws the page's viewer: on WebGPU, and the WebGL2 build the page
+      # fetches where there is no WebGPU.
+      - run: sh engine-poc/build-web.sh
+      - run: sh engine-poc/build-web.sh webgl
+      # Size budgets, in bytes after wasm-opt: the WebGPU build is what every visitor downloads.
+      - name: Check the engine's size
+        run: |
+          check() {
+            size=$(cat "demo-web/web/$1/wasm-size.txt")
+            echo "$1: $size bytes (budget $2)"
+            [ "$size" -le "$2" ] || { echo "::error::$1 wasm is $size bytes, over its $2-byte budget"; exit 1; }
+          }
+          check engine 600000
+          check engine-gl 4500000
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v5
         with:

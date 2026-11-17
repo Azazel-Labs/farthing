@@ -68,6 +68,19 @@ Stretch is a near tie: farthing is lower on 5 assets, and every result is within
 isometric ([data](docs/BENCHMARKS.md#uv-atlases)). The packer is available on its own as
 [`snugly`](https://crates.io/crates/snugly).
 
+## One atlas for the whole chain
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/recut-dark.png">
+  <img alt="FlightHelmet recut: the original (94,722 triangles, 6 materials) next to LOD0 to LOD3 at 94,722, 33,152, 11,603 and 4,061 triangles, 0.24%, 0.71% and 2.2% off. Each is half shaded and half overlaid with its UV seams in one row and its triangles in the other. All four levels draw with one 2048 by 2048 atlas." src="docs/images/recut-light.png">
+</picture>
+
+The browser demo's default chain starts with a recut. It merges the model into one mesh,
+unwraps it afresh with charts that hold up under mipmapping, and bakes every material into one
+atlas at the artist's texel density. LOD0 keeps every triangle. Each later level is reduced
+from the one before and keeps the same UVs, so the whole chain is one draw call with one
+texture set, which the GPU mips as usual.
+
 ## Impostors for the far distance
 
 <picture>
@@ -79,6 +92,29 @@ Past a hundred pixels or so, a whole model becomes one card. farthing plans the 
 engine renders them with its real materials, and farthing assembles a relightable atlas sized
 for one texel per screen pixel. It ships with a reference shader that blends between views
 and marches depth for parallax.
+
+## Cluster LOD that follows the pixels
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/clusters-dark.png">
+  <img alt="FlightHelmet's cluster DAG (1,496 clusters in 8 levels), one color per cluster, cut for the helmet 800, 200 and 50 pixels tall on a 1080p screen at a one-pixel error: 73,677, 29,359 and 10,818 triangles from 577, 233 and 87 clusters. Insets show each cut at its real size." src="docs/images/clusters-light.png">
+</picture>
+
+For Nanite-style renderers, farthing builds a cluster DAG with borders that always match. Each
+part of the model picks the coarsest clusters whose error stays under a pixel, so detail goes
+where the screen can show it. The select test is per cluster and needs no traversal. Its
+packed form is ready to upload to the GPU.
+
+## Surfels and Gaussian splats
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/splats-dark.png">
+  <img alt="FlightHelmet as a 94,722-triangle mesh, as 20,000 surfels drawn as discs, and as 20,000 3D Gaussian splats shaped by the surface each one covers, with close-ups of the goggles. As 3DGS PLY files, 20,000, 5,000 and 1,250 splats are 1,329, 332 and 83 KB." src="docs/images/splats-light.png">
+</picture>
+
+A progressive surfel cloud covers the whole surface at any prefix length, so coarser levels are
+just shorter prefixes. farthing exports it as 3D Gaussian splats in `.ply`, each shaped to
+the surface patch it stands for, so any splat renderer can draw it.
 
 ## What's in the box
 

@@ -10,6 +10,9 @@ let session = null;
 
 const post = (msg, transfer = []) => self.postMessage(msg, transfer);
 
+/// `[json, ...typed arrays]` from the session as a scene for the viewer, and what to transfer.
+const scene = ([json, ...buffers]) => [{ ...JSON.parse(json), buffers }, buffers.map((b) => b.buffer)];
+
 self.onmessage = async ({ data }) => {
   if (data.type === "engine") return start(init({ module_or_path: data.module }));
   try {
@@ -22,15 +25,18 @@ self.onmessage = async ({ data }) => {
       const info = JSON.parse(session.info());
       info.load_ms = performance.now() - t0;
       if (data.quiet) return post({ type: "loaded", quiet: true, info });
-      const glb = session.originalGlb();
-      post({ type: "loaded", info, glb: glb.buffer }, [glb.buffer]);
+      const [original, transfer] = scene(session.originalScene());
+      post({ type: "loaded", info, scene: original }, transfer);
     } else if (data.type === "run") {
       const { runId } = data;
       session.run(JSON.stringify(data.options), (kind, json, payload) => {
         // Every payload is a fresh JS copy, so its buffers can be transferred.
         if (kind === "stage") post({ type: "stage", runId, label: json });
-        else if (kind === "level")
-          post({ type: "level", runId, info: JSON.parse(json), glb: payload.buffer }, [payload.buffer]);
+        else if (kind === "level") {
+          // The original's payload is null: the page has it already.
+          const [s, transfer] = payload ? scene(payload) : [null, []];
+          post({ type: "level", runId, info: JSON.parse(json), scene: s }, transfer);
+        }
         else if (kind === "texture")
           post({ type: "texture", runId, ...JSON.parse(json), rgba: payload.buffer }, [payload.buffer]);
         else {

@@ -7,10 +7,14 @@ mod gpu;
 pub mod modes;
 pub mod pipeline;
 
+// Only the `readme` example draws with the engine; the library just carries the dependency.
+#[cfg(all(feature = "readme", not(target_arch = "wasm32")))]
+use farthing_poc_engine as _;
+
 #[cfg(target_arch = "wasm32")]
 mod web {
     use crate::modes::ViewRequest;
-    use crate::pipeline::{Buffer, Demo, Event, LodOptions};
+    use crate::pipeline::{Buffer, Demo, Event, LodOptions, scene_payload};
     use js_sys::{Array, Float32Array, Function, Uint8Array, Uint32Array};
     use wasm_bindgen::prelude::*;
 
@@ -25,6 +29,16 @@ mod web {
             Buffer::U32(v) => Uint32Array::from(v.as_slice()).into(),
             Buffer::U8(v) => Uint8Array::from(v.as_slice()).into(),
         }
+    }
+
+    /// `[json, ...typed arrays]`.
+    fn json_and_buffers(json: String, buffers: &[Buffer]) -> Array {
+        let out = Array::new();
+        out.push(&json.into());
+        for b in buffers {
+            out.push(&typed(b));
+        }
+        out
     }
 
     fn js_err(e: String) -> JsError {
@@ -56,10 +70,12 @@ mod web {
             serde_json::to_string(&self.0.info()).unwrap_or_default()
         }
 
-        /// The original as GLB, with the materials as farthing reads them.
-        #[wasm_bindgen(js_name = originalGlb)]
-        pub fn original_glb(&self) -> Result<Vec<u8>, JsError> {
-            self.0.original_glb().map_err(js_err)
+        /// The original as the viewer takes it, with the materials as farthing reads them:
+        /// `[json, ...typed arrays]` (see `scene_payload`).
+        #[wasm_bindgen(js_name = originalScene)]
+        pub fn original_scene(&self) -> Result<Array, JsError> {
+            let (json, buffers) = self.0.level_scene(0).map_err(js_err)?;
+            Ok(json_and_buffers(json.to_string(), &buffers))
         }
 
         /// A level of the last run as a self-contained GLB: compact (as the viewer loads it) or
@@ -88,16 +104,12 @@ mod web {
             let view: ViewRequest =
                 serde_json::from_str(view).map_err(|e| JsError::new(&e.to_string()))?;
             let (json, buffers) = self.0.select(&view).map_err(js_err)?;
-            let out = Array::new();
-            out.push(&json.into());
-            for b in &buffers {
-                out.push(&typed(b));
-            }
-            Ok(out)
+            Ok(json_and_buffers(json, &buffers))
         }
 
         /// Runs `options.mode`. `options` is JSON (see `LodOptions`); `on_event(kind, json,
-        /// payload)` is called with `"stage"`, `"level"` (payload = GLB bytes), `"texture"`
+        /// payload)` is called with `"stage"`, `"level"` (payload = `[scene json, ...typed
+        /// arrays]`, or null for the original), `"texture"`
         /// (RGBA8 bytes), and mode data (`"clusters"`, `"hlod_node"`, `"hlod_tree"`,
         /// `"splats"`; payload = an array of typed arrays).
         pub fn run(&mut self, options: &str, on_event: &Function) -> Result<(), JsError> {
@@ -107,13 +119,15 @@ mod web {
             let call = |kind: &str, json: String, payload: JsValue| {
                 let _ = on_event.call3(&JsValue::NULL, &kind.into(), &json.into(), &payload);
             };
-            let bytes = |b: &[u8]| -> JsValue { Uint8Array::from(b).into() };
             let mut emit = |e: Event| match e {
                 Event::Stage(s) => call("stage", s.to_owned(), JsValue::NULL),
-                Event::Level { info, glb } => call(
+                Event::Level { info, scene } => call(
                     "level",
                     serde_json::to_string(info).unwrap_or_default(),
-                    bytes(glb),
+                    scene.map_or(JsValue::NULL, |(s, t)| {
+                        let (json, buffers) = scene_payload(s, t);
+                        json_and_buffers(json.to_string(), &buffers).into()
+                    }),
                 ),
                 Event::Texture {
                     level,
@@ -130,7 +144,7 @@ mod web {
                         "height": height,
                     })
                     .to_string(),
-                    bytes(rgba),
+                    Uint8Array::from(rgba).into(),
                 ),
                 Event::Data {
                     kind,

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>farthing clusters</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,400..700,0..100,0..1;1,9..144,400..600,0..100,0..1&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=block" rel="stylesheet">
+<link rel="stylesheet" href="fig.css">
+<style>
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); column-gap: 22px; margin-top: 28px; }
+  .cell { position: relative; }
+  canvas.p { display: block; border-radius: 8px; }
+  .inset { position: absolute; left: 12px; top: 12px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+  .inset canvas { display: block; border-radius: 4px; outline: 1px solid var(--rule); }
+  .inset span { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--faint); }
+  .lvl { margin-top: 12px; font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--muted); line-height: 1.55; }
+  .lvl .big { font-family: Fraunces, serif; font-weight: 600; font-size: 30px; color: var(--ink); line-height: 1; display: block; margin-bottom: 6px; font-variation-settings: "opsz" 96; }
+  .lvl .big small { font-size: 17px; color: var(--muted); font-weight: 500; }
+</style>
+</head>
+<body>
+<h1>Detail only <em>where the pixels are.</em></h1>
+<p class="sub" id="sub"></p>
+<div class="grid" id="grid"></div>
+<div class="foot" id="foot"></div>
+<script type="module">
+import { stats, img, canvas, int, pct, ready } from "./sheet.js";
+const c = stats.clusters;
+const W = (1280 - 96 - 2 * 22) / 3;
+const grid = document.getElementById("grid");
+for (const [k, cut] of c.cuts.entries()) {
+  const [panel, actual] = await Promise.all([img(`out/clusters_${k}.png`), img(`out/clusters_${k}_actual.png`)]);
+  const [pc, pg] = canvas(W, W);
+  pg.drawImage(panel, 0, 0, pc.width, pc.height);
+  const cell = document.createElement("div");
+  cell.className = "cell";
+  cell.append(pc);
+  if (k > 0) {
+    // The cut at its size on screen, to the scale of the first panel (about one device pixel
+    // of the sheet per screen pixel).
+    const s = actual.width / devicePixelRatio;
+    const [ic, ig] = canvas(s, s);
+    ig.drawImage(actual, 0, 0, ic.width, ic.height);
+    const inset = document.createElement("div");
+    inset.className = "inset";
+    inset.append(ic);
+    inset.insertAdjacentHTML("beforeend", "<span>to scale</span>");
+    cell.append(inset);
+  }
+  const levels = cut.per_level.map((n, l) => (n ? `L${l}` : null)).filter(Boolean).join(" ");
+  cell.insertAdjacentHTML("beforeend",
+    `<div class="lvl"><span class="big">${int(cut.screen_px)}<small> px tall</small></span>` +
+    `${int(cut.triangles)} of ${int(cut.full_triangles)} triangles<br>${int(cut.clusters)} clusters from DAG levels ${levels}</div>`);
+  grid.append(cell);
+}
+document.getElementById("sub").innerHTML =
+  `A <b>cluster DAG</b> groups the mesh into clusters of at most ${c.info.max_triangles} triangles, then merges and simplifies groups of them, level by level, ` +
+  `with borders that always match. To draw, each part of the model picks the coarsest clusters whose error stays <b>under a pixel</b>. ` +
+  `One color per cluster. The three cuts are for the helmet ${c.cuts.map((x) => x.screen_px).join(", ").replace(/, (?=[^,]*$)/, " and ")} pixels tall on a 1080p screen, magnified to the same size here; the insets show them to scale.`;
+document.getElementById("foot").innerHTML =
+  `${stats.model} (Khronos glTF sample, CC0) · ${int(c.info.clusters)} clusters in ${c.info.levels} DAG levels, ${int(c.info.all_level_triangles)} triangles in all · ` +
+  `cut for a 60° view 1080 pixels high, 1 px error threshold · ` +
+  (c.cuts.every((x) => x.gpu_agrees) ? `the same cut on the CPU and through the packed GPU form · ` : ``) +
+  `drawn with the web demo's engine viewer.<br>Reproduce: demo-web/readme/build.sh`;
+await ready();
+</script>
+</body>
+</html>

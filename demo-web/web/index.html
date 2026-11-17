@@ -5,14 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Farthing LOD Demo</title>
   <link rel="stylesheet" href="style.css">
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
-        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
-      }
-    }
-  </script>
   <script type="module" src="app.js"></script>
 </head>
 <body>
@@ -126,13 +118,24 @@
         <label class="range" title="The most levels after the original; the chain stops sooner at the error limit below">Levels, up to <output name="levels_out"></output>
           <input type="range" name="levels" min="1" max="8" value="4">
         </label>
-        <label class="select" title="The chain stops at the first level that deviates more than this from the original, as a percentage of the model's bounding-box diagonal: that level and the ones after it are left out. Past about 2% most models look plainly wrong. The first level is always kept; 0 builds every level.">
-          Stop past error
+        <label class="select" title="By triangles: each level keeps a fixed fraction of the triangles, and the chain stops at the first level past the error limit. By error: the last level is reduced until it deviates the error limit, and each level before deviates the ratio less, so the switch distances grow by that ratio; the triangle counts follow from the model.">
+          Levels by
+          <select name="spacing">
+            <option value="triangles" selected>Triangles</option>
+            <option value="error">Error</option>
+          </select>
+        </label>
+        <label class="select" id="max-error" title="How far a level may deviate from the original, as a percentage of the model's bounding-box diagonal. Past about 2% most models look plainly wrong. By triangles, the chain stops at the first level past it (the first level is always kept; 0 builds every level). By error, the last level is reduced to it.">
+          <span class="by-triangles">Stop past error</span><span class="by-error">Last level's error</span>
           <span><input type="number" name="max_error" min="0" max="10" step="0.1" value="2" style="width: 5em"> %</span>
         </label>
-        <label class="range" title="Each level keeps this fraction of the original's triangles, compounded: LODn = step^n">
+        <label class="range by-triangles" title="Each level keeps this fraction of the original's triangles, compounded: LODn = step^n">
           Step <output name="step_out"></output>
           <input type="range" name="step" min="0.2" max="0.8" step="0.05" value="0.5">
+        </label>
+        <label class="range by-error" title="Each level may deviate this many times as much as the one before, so it switches in this many times farther away">
+          Error ratio <output name="error_ratio_out"></output>
+          <input type="range" name="error_ratio" min="1.5" max="4" step="0.25" value="2">
         </label>
         <label class="select" title="Recut skin: the whole scene's skin is cut afresh and every texel resampled into one atlas at the artist's texel density. LOD0 keeps every triangle, and each further level is reduced from it and drawn with the same atlas and normal map (no bake, so far levels shade flatter). Original materials: each mesh reduced with its own UVs and materials until the baked proxy. Shared atlas: the artist's UV islands repacked into one atlas for the levels before the baked proxy.">
           Textures
@@ -324,6 +327,7 @@
       <div id="empty">
         <div>
           <p>Drop a model (glTF, FBX, OBJ, USD, 3MF, STL, PLY…) or a .zip anywhere, or pick a sample</p>
+          <p id="no-gpu" role="alert" hidden></p>
           <div id="engine" hidden role="status" aria-live="polite">
             <div class="meter"><span></span></div>
             <span class="nums"></span>

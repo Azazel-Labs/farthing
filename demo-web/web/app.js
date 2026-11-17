@@ -1,16 +1,6 @@
 // farthing LOD demo: page logic. The wasm runs in worker.js; this file handles input, the
-// options, the three.js viewer, the level table and the example modes (cluster cuts, HLOD
-// cuts, splats).
-import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
-import { LineMaterial } from "three/addons/lines/LineMaterial.js";
-import { Wireframe } from "three/addons/lines/Wireframe.js";
-import { WireframeGeometry2 } from "three/addons/lines/WireframeGeometry2.js";
-import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
-import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+// options, the viewer (farthing's PoC engine, engine-poc), the level table and the example
+// modes (cluster cuts, HLOD cuts, splats).
 
 const $ = (s) => document.querySelector(s);
 const form = $("#opts");
@@ -25,7 +15,7 @@ const STORE_VERSION = 2;
 
 let files = null; // [{ name, bytes: ArrayBuffer }], kept so a respawned worker can reload
 let assetInfo = null;
-let original = null; // { object, materials: Material[], cache: Map, center, radius }
+let original = null; // { model, center: [x, y, z], radius }
 let worker = null;
 let busy = false; // the worker is loading or running
 let runId = 0;
@@ -34,210 +24,269 @@ let runOpts = null; // options of the current run
 let selected = 0;
 let texPinned = false; // the texture panel stays on the selected level, which the user picked
 let texShown = -1; // the level the texture panel was last asked for
-let texMaterial = -1; // the original's glTF material the panel shows, when it has several
+let texMaterial = -1; // the original's material slot the panel shows, when it has several
 let mode = "single";
 let wireOn = false;
 let seamOn = false;
-/** levels[n] = { info, object, tex: { channel: ImageData }, stale } */
+/** levels[n] = { info, model (anything with draws() and dispose()), tex: { channel: ImageData }, stale } */
 let levels = [];
 let pendingDownload = null;
 let stoppedAt = null; // the last chain level when the run stopped short at the error limit
 
 // ---------------------------------------------------------------- viewer
+//
+// farthing's PoC engine draws the view: engine-poc built for the web, on WebGPU, or on WebGL2
+// (the engine-gl build) where there is no WebGPU. Its shaders are the ones in its
+// editor_visualizations folder, which also draw the README's images. The page hands it the
+// worker's scenes as vertices, materials and textures, and forwards the pointer to its orbit
+// camera; it has no 3D code of its own.
 
 const view = $("#view");
-const canvas = $("#gl");
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-const scene = new THREE.Scene();
-const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
-camera.position.set(2, 1.5, 3);
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true;
-const root = new THREE.Group(); // one child per level (single and compare modes)
-const lod = new THREE.LOD(); // auto mode: clones of the levels
-lod.visible = false;
-scene.add(root, lod);
+let canvas = $("#gl");
+let gpu = null; // the engine's EngineView
+let orbit = null; // its orbit camera
+const dpr = () => Math.min(devicePixelRatio, 2);
+const EMPTY = new Float32Array(0);
 
-// Wireframe: screen-space "fat" lines (plain GL lines are 1 device pixel, too thin to read on a
-// high-DPI screen), drawn over surfaces that polygonOffset pushes back so the two don't z-fight.
-// Its resolution must match the viewport, so render() sets it for each one.
-const dark = matchMedia("(prefers-color-scheme: dark)");
-const wireMat = new LineMaterial({ linewidth: 1.25, transparent: true, depthWrite: false });
-// UV seams: thicker lines in a warm color, over the wireframe.
-const seamMat = new LineMaterial({ linewidth: 2.5, transparent: true, depthWrite: false });
-const setWireColor = () => {
-  wireMat.color.set(dark.matches ? 0x8fbcff : 0x1453c4);
-  wireMat.opacity = dark.matches ? 0.75 : 0.7;
-  seamMat.color.set(dark.matches ? 0xffa94d : 0xe8590c);
-};
-setWireColor();
-dark.addEventListener("change", setWireColor);
+const viewerReady = (async () => {
+  const builds = navigator.gpu ? ["engine", "engine-gl"] : ["engine-gl"];
+  for (const dir of builds) {
+    try {
+      const mod = await import(`./${dir}/farthing_poc_engine.js`);
+      await mod.default();
+      gpu = await mod.createView(canvas);
+      orbit = new mod.Orbit();
+      listen(canvas);
+      console.info(`viewer: farthing's engine on ${gpu.backend}`);
+      return;
+    } catch (e) {
+      console.warn(`viewer: the ${dir} build could not start:`, e);
+      // A canvas keeps the first kind of context asked of it: the next build gets a fresh one.
+      const fresh = canvas.cloneNode(false);
+      canvas.replaceWith(fresh);
+      canvas = fresh;
+    }
+  }
+  throw new Error("This browser has neither WebGPU nor WebGL2, so the viewer can't draw.");
+})();
+viewerReady.catch((e) => {
+  const p = $("#no-gpu");
+  p.textContent = e.message;
+  p.hidden = false;
+  setStatus(e.message, "error");
+});
 
-// farthing's GLBs are quantized (KHR_mesh_quantization) and meshopt-compressed.
-const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
+/** Forwards the pointer and wheel to the orbit camera. */
+function listen(c) {
+  c.addEventListener("pointerdown", (e) => {
+    c.setPointerCapture(e.pointerId);
+    orbit.pointerDown(e.pointerId, e.clientX, e.clientY, e.button, e.shiftKey || e.ctrlKey || e.metaKey);
+  });
+  c.addEventListener("pointermove", (e) => orbit.pointerMove(e.pointerId, e.clientX, e.clientY));
+  const up = (e) => orbit.pointerUp(e.pointerId);
+  c.addEventListener("pointerup", up);
+  c.addEventListener("pointercancel", up);
+  c.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      orbit.wheel(e.deltaY, e.deltaMode, e.ctrlKey);
+    },
+    { passive: false },
+  );
+  c.addEventListener("contextmenu", (e) => e.preventDefault());
+  c.addEventListener("dblclick", () => home());
+}
 
-/** The camera distance that fits a sphere of `radius` in view. */
-const homeDistance = (radius) => (radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2))) * 1.05;
-
-function frame(object) {
-  const box = new THREE.Box3().setFromObject(object);
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1e-6);
-  controls.maxDistance = radius * 400;
-  home({ center, radius });
-  return { center, radius };
+/** Tells the camera which sphere to keep in reach and fit its planes around. */
+function syncFocus() {
+  const f = focus();
+  if (f && orbit) orbit.setFocus(f.center[0], f.center[1], f.center[2], f.radius);
 }
 
 /** Points the camera at the model from the default angle (also: F, double-click, Reset view). */
-function home(at = focus()) {
-  if (!at) return;
-  const dir = new THREE.Vector3(0.6, 0.35, 1).normalize();
-  camera.position.copy(at.center).addScaledVector(dir, homeDistance(at.radius));
-  controls.target.copy(at.center);
-  controls.update();
+function home() {
+  if (!orbit || !focus()) return;
+  syncFocus();
+  orbit.home();
 }
+
+// Line overlays: colors are sRGB like CSS, the engine wants linear ones; widths are CSS pixels.
+const dark = matchMedia("(prefers-color-scheme: dark)");
+const toLinear = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+const linear = (hex, a) => new Float32Array([(hex >> 16) & 255, (hex >> 8) & 255, hex & 255].map((v) => toLinear(v / 255)).concat(a));
+function lineStyles() {
+  const k = dpr();
+  gpu.setLineStyle(0, dark.matches ? linear(0x8fbcff, 0.75) : linear(0x1453c4, 0.7), 1.25 * k);
+  gpu.setLineStyle(1, dark.matches ? linear(0xffa94d, 1) : linear(0xe8590c, 1), 2.5 * k);
+}
+
+/** HSL (all 0-1) to RGB, taken as linear values, as three.js's setHSL gave them. */
+function hsl(h, s, l) {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+/** A color per DAG or tree level. */
+const levelColor = (l) => hsl((0.58 + l * 0.137) % 1, 0.62, 0.55);
+/** A stable random color per cluster. */
+function clusterColor(id) {
+  let h = Math.imul(id ^ 0x9e3779b9, 0x85ebca6b);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35);
+  h ^= h >>> 16;
+  return hsl((h >>> 0) / 4294967296, 0.5 + ((h >>> 8) & 63) / 250, 0.45 + ((h >>> 16) & 63) / 400);
+}
+
+/** A plain material: `rgb` linear, matte unless said otherwise. */
+function colorMaterial(rgb, roughness = 0.8) {
+  return gpu.addMaterial(new Float32Array([...rgb, 1, 0, roughness, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0]), Int32Array.of(-1, -1, -1, -1, -1));
+}
+let fallbackMaterial = -1;
+/** For parts whose material is gone or never came. */
+const fallback = () => (fallbackMaterial >= 0 ? fallbackMaterial : (fallbackMaterial = colorMaterial([0.8, 0.8, 0.8])));
+
+/** A payload material (glTF metallic-roughness) in the engine; texture indices into `textures`. */
+function payloadMaterial(m, textures) {
+  const tex = (i) => (i >= 0 && textures[i] ? textures[i].id : -1);
+  const mask = m.cutoff != null;
+  // Payloads don't say which materials are double-sided: draw both sides of everything.
+  const factors = [...m.base_color, m.metallic, m.roughness, 1, 1, 1, 0, 0, 0, mask ? 1 : 0, m.cutoff ?? 0, 1, 0];
+  const ids = [tex(m.base_color_texture), tex(m.metallic_roughness_texture), tex(m.normal_texture), -1, -1];
+  return gpu.addMaterial(new Float32Array(factors), Int32Array.from(ids));
+}
+
+const IDENTITY = Float32Array.of(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1);
 
 /**
- * Per frame: keep the orbit target within reach of the model, so panning can't lose it, and fit
- * near/far tightly around the model's bounding sphere for depth precision at any distance.
+ * A scene from the worker (the original, a level, an HLOD proxy) in the engine: its textures,
+ * materials, vertices and one engine mesh per material part. Scenes that come without their
+ * own materials (reduced levels, shared levels after the one carrying the atlas) get theirs
+ * from `borrow(slot)`. `draws(tint)` lists what to draw: [model matrix, engine mesh, overlays];
+ * a tint material id draws every part with it instead.
  */
-function constrainCamera() {
-  const { center, radius } = focus();
-  const off = controls.target.clone().sub(center);
-  if (off.length() > radius * 1.5) {
-    const shift = off.clone().setLength(radius * 1.5).sub(off);
-    controls.target.add(shift);
-    camera.position.add(shift);
+function buildModel(scene, borrow = null) {
+  const b = scene.buffers;
+  const textures = borrow
+    ? []
+    : scene.textures.map((t) => ({
+        id: gpu.addTexture(t.width, t.height, b[t.rgba], t.srgb),
+        width: t.width,
+        height: t.height,
+        rgba: b[t.rgba],
+        canvas: null,
+      }));
+  const materials = borrow ? [] : scene.materials.map((m) => payloadMaterial(m, textures));
+  const material = (slot) => (borrow ? borrow(slot) : materials[slot]) ?? fallback();
+  const meshes = scene.meshes.map((m) => {
+    const positions = b[m.positions];
+    const uvs = m.uvs >= 0 ? b[m.uvs] : null;
+    const indices = b[m.indices];
+    const geometry = gpu.addGeometry(positions, b[m.normals], uvs ?? EMPTY, m.colors >= 0 ? b[m.colors] : EMPTY);
+    const parts = m.parts.map(([start, count, slot]) => ({
+      start,
+      count,
+      slot,
+      mesh: gpu.addMesh(geometry, indices.subarray(start, start + count), material(slot)),
+    }));
+    const lo = [Infinity, Infinity, Infinity];
+    const hi = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < positions.length; i += 3)
+      for (let a = 0; a < 3; a++) {
+        lo[a] = Math.min(lo[a], positions[i + a]);
+        hi[a] = Math.max(hi[a], positions[i + a]);
+      }
+    return { geometry, parts, uvs, indices, box: [lo, hi], tinted: new Map() };
+  });
+  const instances = scene.instances.map((i) => ({ mesh: i.mesh, matrix: Float32Array.from(i.matrix) }));
+  return {
+    meshes,
+    instances,
+    materials,
+    textures,
+    json: scene.materials,
+    draws(tint = null, out = [], offset = null) {
+      for (const inst of instances) {
+        const m = meshes[inst.mesh];
+        let matrix = inst.matrix;
+        if (offset) {
+          matrix = matrix.slice();
+          matrix[12] += offset[0];
+          matrix[13] += offset[1];
+          matrix[14] += offset[2];
+        }
+        if (tint === null) for (const p of m.parts) out.push([matrix, p.mesh, true]);
+        else {
+          let ids = m.tinted.get(tint);
+          if (!ids) m.tinted.set(tint, (ids = m.parts.map((p) => gpu.addMesh(m.geometry, m.indices.subarray(p.start, p.start + p.count), tint))));
+          for (const id of ids) out.push([matrix, id, true]);
+        }
+      }
+      return out;
+    },
+    dispose() {
+      for (const m of meshes) {
+        for (const p of m.parts) gpu.removeMesh(p.mesh);
+        for (const ids of m.tinted.values()) for (const id of ids) gpu.removeMesh(id);
+        gpu.removeGeometry(m.geometry);
+      }
+      for (const id of materials) gpu.removeMaterial(id);
+      for (const t of textures) gpu.removeTexture(t.id);
+    },
+  };
+}
+
+/** A model's world bounds: center and bounding-sphere radius. */
+function bounds(model) {
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (const inst of model.instances) {
+    const [a, b] = model.meshes[inst.mesh].box;
+    if (!(a[0] <= b[0])) continue;
+    const e = inst.matrix;
+    for (let c = 0; c < 8; c++) {
+      const p = [c & 1 ? b[0] : a[0], c & 2 ? b[1] : a[1], c & 4 ? b[2] : a[2]];
+      for (let k = 0; k < 3; k++) {
+        const v = e[k] * p[0] + e[4 + k] * p[1] + e[8 + k] * p[2] + e[12 + k];
+        lo[k] = Math.min(lo[k], v);
+        hi[k] = Math.max(hi[k], v);
+      }
+    }
   }
-  const dist = camera.position.distanceTo(center);
-  camera.near = Math.max(radius / 500, (dist - radius) * 0.5);
-  camera.far = dist + radius * 2;
+  if (!(lo[0] <= hi[0])) return { center: [0, 0, 0], radius: 1 };
+  const center = lo.map((v, k) => (v + hi[k]) / 2);
+  return { center, radius: Math.max(Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / 2, 1e-6) };
 }
 
-const OVERLAYS = new Set(["__wire", "__seam"]);
-
-/** Shows or hides the wireframe and UV seam overlays on `object`'s meshes, building them as needed. */
-function setWire(object) {
-  object.traverse((o) => {
-    if (!o.isMesh || OVERLAYS.has(o.name) || o.userData.noWire) return;
-    let w = o.children.find((c) => c.name === "__wire");
-    if (!w && wireOn) {
-      w = new Wireframe(wireFor(o.geometry), wireMat);
-      w.name = "__wire";
-      w.renderOrder = 1;
-      o.add(w);
-    }
-    if (w) w.visible = wireOn;
-    let sm = o.children.find((c) => c.name === "__seam");
-    const sg = !sm && seamOn ? seamFor(o.geometry) : null;
-    if (sg) {
-      sm = new LineSegments2(sg, seamMat);
-      sm.name = "__seam";
-      sm.renderOrder = 2;
-      o.add(sm);
-    }
-    if (sm) sm.visible = seamOn;
-    for (const m of [o.material].flat()) {
-      m.polygonOffset = wireOn || seamOn;
-      m.polygonOffsetFactor = 1;
-      m.polygonOffsetUnits = 1;
-    }
-  });
-}
-
-function dispose(object, ownMaterials) {
-  object?.traverse((o) => {
-    dropWire(o.geometry);
-    o.geometry?.dispose();
-    if (ownMaterials && o.material && o.material !== wireMat && o.material !== seamMat) {
-      for (const k of ["map", "normalMap"]) o.material[k]?.dispose();
-      o.material.dispose();
-    }
-  });
-  object?.removeFromParent();
-}
-
-/** The original's material for glTF material `index`, in the variant `like` needs. */
-function originalMaterial(index, like) {
-  const key = `${index}:${!!like.vertexColors}:${!!like.flatShading}`;
-  let m = original.cache.get(key);
-  if (!m) {
-    const base = original.materials[index];
-    if (!base) return like;
-    m = base.clone();
-    m.vertexColors = like.vertexColors;
-    m.flatShading = like.flatShading;
-    original.cache.set(key, m);
+/** A payload texture as a canvas for the texture panel, made the first time it is shown. */
+function drawable(t) {
+  if (!t.canvas) {
+    t.canvas = new OffscreenCanvas(t.width, t.height);
+    const rgba = new Uint8ClampedArray(t.rgba.buffer, t.rgba.byteOffset, t.rgba.byteLength);
+    t.canvas.getContext("2d").putImageData(new ImageData(rgba, t.width, t.height), 0, 0);
   }
-  return m;
+  return t.canvas;
 }
 
-/** Reduced levels are exported without textures: give them the original's materials. */
-function adoptMaterials(gltf) {
-  gltf.scene.traverse((o) => {
-    if (!o.isMesh) return;
-    const index = gltf.parser.associations.get(o.material)?.materials;
-    if (index === undefined) return;
-    const mine = o.material;
-    o.material = originalMaterial(index, mine);
-    if (o.material !== mine) mine.dispose();
-  });
-}
-
-/** Shared levels after the first are exported without the atlas: draw them with its material. */
-function adoptShared(gltf, src) {
-  let material = null;
-  src?.traverse((o) => {
-    if (o.isMesh) material ??= o.material;
-  });
-  if (!material) return;
-  gltf.scene.traverse((o) => {
-    if (!o.isMesh || o.material === material) return;
-    o.material.dispose();
-    o.material = material;
-  });
-}
-
-/** Whether a level's object owns its materials (and their textures). */
-const ownsMaterials = (info) =>
-  info?.kind === "baked" || (info?.kind === "shared" && info.shared_textures === info.level);
-
-async function showOriginal(glb) {
-  const gltf = await loader.parseAsync(glb, "");
-  const materials = await gltf.parser.getDependencies("material");
-  const nodes = await gltf.parser.getDependencies("node");
-  original = { object: gltf.scene, materials, cache: new Map(), nodes, assoc: gltf.parser.associations };
-  gltf.scene.traverse((o) => {
-    if (!o.isMesh) return;
-    const index = gltf.parser.associations.get(o.material)?.materials;
-    if (index !== undefined)
-      original.cache.set(`${index}:${!!o.material.vertexColors}:${!!o.material.flatShading}`, o.material);
-  });
-  Object.assign(original, frame(gltf.scene));
-  root.add(gltf.scene);
-  setWire(gltf.scene);
-  levels[0] = { info: null, object: gltf.scene, tex: {}, stale: false };
+function showOriginal(scene) {
+  const model = buildModel(scene);
+  original = { model, ...bounds(model) };
+  orbit.maxDistance = original.radius * 400;
+  home();
+  levels[0] = { info: null, model, tex: {}, stale: false };
 }
 
 function resetViewer() {
   extra?.dispose();
   for (const [i, l] of levels.entries()) if (i > 0) disposeLevel(l);
+  dropIncoming();
   extra = null;
-  hlodIncoming = null;
   focusOverride = null;
   shownMode = "";
-  if (original) {
-    dispose(original.object, true);
-    for (const m of original.cache.values()) m.dispose();
-  }
-  for (const w of wires.values()) w.dispose();
-  wires.clear();
-  for (const g of seams.values()) g?.dispose();
-  seams.clear();
-  lod.clear();
+  original?.model.dispose();
   levels = [];
   original = null;
   selected = 0;
@@ -246,65 +295,57 @@ function resetViewer() {
   syncCutPanel();
 }
 
-// Auto mode: THREE.LOD with each level's 1-pixel switch distance, scaled from the 1080p the
-// numbers are computed for to this canvas's height.
-let lodKey = "";
-function syncLod() {
-  const h = renderer.getDrawingBufferSize(new THREE.Vector2()).y;
-  const ready = levels.filter((l) => l?.object && l.info && !l.stale);
-  const key = ready.map((l) => l.object.uuid).join() + h + wireOn + seamOn + lodVersion;
-  if (key === lodKey) return;
-  lodKey = key;
-  lod.clear();
-  lod.levels.length = 0;
-  if (!original) return;
-  lod.position.copy(original.center);
-  // Switch distances are the bounding radius plus a part for the run's view (info.ppr pixels
-  // per radian); that part is rescaled to this canvas and camera.
-  const ppr = h / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2));
+/**
+ * Auto mode's levels: each ready level and the camera distance from the model's center it
+ * switches in at. That is the level's 1-pixel switch distance: the bounding radius plus a part
+ * for the run's view (info.ppr pixels per radian), rescaled from there to this canvas.
+ */
+function autoLevels() {
+  const ppr = canvas.height / (2 * Math.tan((orbit.fov * Math.PI) / 360));
   const r = diag() / 2;
   let d = 0;
-  for (const l of ready) {
+  const out = [];
+  for (const l of levels) {
+    if (!l?.model || !l.info || l.stale) continue;
     const s = l.info.switch_distance_1px;
     d = Math.max(d, s > 0 ? r + ((s - r) * ppr) / (l.info.ppr || REF_PPR) : 0);
-    const g = new THREE.Group();
-    g.position.copy(original.center).negate();
-    // The level may be hidden in root (show() hides all but one); the clone copies that flag.
-    const copy = l.object.clone();
-    copy.visible = true;
-    g.add(copy);
-    g.userData.level = l.info.level;
-    lod.addLevel(g, d);
+    out.push({ level: l.info.level, distance: d, model: l.model });
   }
-  // Room to zoom out past the last switch, wherever it is.
-  controls.maxDistance = Math.max(original.radius * 400, d * 2);
-  drawTicks();
+  return out;
+}
+
+let autoKey = "";
+/** Room to zoom out past the last switch, wherever it is, and the slider's ticks. */
+function syncAuto(list) {
+  const key = list.map((l) => `${l.level}@${l.distance}`).join() + original.radius;
+  if (key === autoKey) return;
+  autoKey = key;
+  orbit.maxDistance = Math.max(original.radius * 400, (list.at(-1)?.distance ?? 0) * 2);
+  drawTicks(list);
 }
 
 // Auto mode's distance slider: logarithmic, from close up to the zoom limit.
 const distEl = $("#dist");
 function distRange() {
-  return [homeDistance(original.radius) * 0.5, controls.maxDistance];
+  return [orbit.homeDistance(original.radius) * 0.5, orbit.maxDistance];
 }
 function distToSlider(d) {
   const [lo, hi] = distRange();
   return (1000 * Math.log(Math.max(d, lo) / lo)) / Math.log(hi / lo);
 }
-function drawTicks() {
-  $("#ticks").innerHTML = lod.levels
+function drawTicks(list) {
+  $("#ticks").innerHTML = list
     .slice(1)
     .map((l) => {
       const t = Math.min(distToSlider(l.distance) / 1000, 1);
-      return `<i style="--t:${t}" title="${esc(lodName(l.object.userData.level))} from ${l.distance.toPrecision(3)}"></i>`;
+      return `<i style="--t:${t}" title="${esc(lodName(l.level))} from ${l.distance.toPrecision(3)}"></i>`;
     })
     .join("");
 }
 distEl.addEventListener("input", () => {
-  if (!original) return;
+  if (!original || !orbit) return;
   const [lo, hi] = distRange();
-  const d = lo * (hi / lo) ** (+distEl.value / 1000);
-  const dir = camera.position.clone().sub(controls.target).normalize();
-  camera.position.copy(controls.target).addScaledVector(dir, d);
+  orbit.setDistance(lo * (hi / lo) ** (+distEl.value / 1000));
 });
 
 // Auto mode's magnifier: far away the model is a few pixels, so this crops the frame just drawn
@@ -313,39 +354,29 @@ const magEl = $("#mag");
 const magCanvas = magEl.querySelector("canvas");
 const magCtx = magCanvas.getContext("2d");
 function magnify() {
-  const size = Math.round(160 * renderer.getPixelRatio());
-  const buf = renderer.getDrawingBufferSize(new THREE.Vector2());
-  const p = original.center.clone().project(camera);
-  const dist = camera.position.distanceTo(original.center);
-  const rpx = (original.radius / (dist * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * (buf.y / 2);
+  const size = Math.round(160 * dpr());
+  const [bw, bh] = [canvas.width, canvas.height];
+  const v = orbit.viewMatrix;
+  const c = original.center;
+  const p = [0, 1, 2].map((k) => v[k] * c[0] + v[4 + k] * c[1] + v[8 + k] * c[2] + v[12 + k]);
+  const f = 1 / Math.tan((orbit.fov * Math.PI) / 360);
+  const depth = -p[2];
+  const x = depth > 0 ? (f * bh * p[0]) / (bw * depth) : 9;
+  const y = depth > 0 ? (f * p[1]) / depth : 9;
+  const rpx = depth > 0 ? ((original.radius * f) / Math.hypot(...p)) * (bh / 2) : 0;
   const zoom = Math.floor(size / Math.max(2 * rpx * 1.15, 4));
-  const onScreen = Math.abs(p.x) < 1.2 && Math.abs(p.y) < 1.2 && p.z < 1;
-  magEl.hidden = zoom < 2 || !onScreen;
+  magEl.hidden = zoom < 2 || Math.abs(x) > 1.2 || Math.abs(y) > 1.2;
   if (magEl.hidden) return;
   if (magCanvas.width !== size) magCanvas.width = magCanvas.height = size;
   const src = size / zoom;
-  const x = ((p.x + 1) / 2) * buf.x - src / 2;
-  const y = ((1 - p.y) / 2) * buf.y - src / 2;
   magCtx.imageSmoothingEnabled = false;
   magCtx.clearRect(0, 0, size, size);
-  magCtx.drawImage(canvas, x, y, src, src, 0, 0, size, size);
+  magCtx.drawImage(canvas, ((x + 1) / 2) * bw - src / 2, ((1 - y) / 2) * bh - src / 2, src, src, 0, 0, size, size);
   magEl.querySelector("figcaption").textContent = `${zoom}× · rendered pixels`;
 }
 
 function displayed(level) {
-  return levels[level]?.object ?? levels[0]?.object;
-}
-
-function show(object) {
-  for (const c of root.children) c.visible = c === object;
-}
-
-function resize() {
-  const w = view.clientWidth;
-  const h = view.clientHeight;
-  const size = renderer.getSize(new THREE.Vector2());
-  if (size.x !== w || size.y !== h) renderer.setSize(w, h, false);
-  return [w, h];
+  return levels[level]?.model ? level : 0;
 }
 
 let hudText = "";
@@ -370,63 +401,72 @@ function label(level) {
   return `${name} · ${KIND_TEXT[i.kind] ?? i.kind} · ${fmtInt(i.triangles)} tris${more}${stale}`;
 }
 
+/** Queues `model`'s draws as a view across device pixels x0 to x1. */
+function drawView(model, x0, x1, camera) {
+  const draws = model?.draws() ?? [];
+  const models = new Float32Array(draws.length * 16);
+  draws.forEach(([m], i) => models.set(m, i * 16));
+  const ids = Uint32Array.from(draws, (d) => d[1]);
+  const overlays = Uint8Array.from(draws, (d) => (d[2] ? 1 : 0));
+  gpu.view(x0, 0, x1 - x0, canvas.height, ids, models, overlays, ...camera);
+}
+
+let cleared = false;
 function render() {
   requestAnimationFrame(render);
-  controls.update();
-  const [w, h] = resize();
+  if (!gpu) return;
+  const [w, h] = [view.clientWidth, view.clientHeight];
+  const k = dpr();
+  const [bw, bh] = [Math.max(1, Math.round(w * k)), Math.max(1, Math.round(h * k))];
+  if (canvas.width !== bw || canvas.height !== bh) [canvas.width, canvas.height] = [bw, bh];
+  $("#divider").hidden = mode !== "compare" || !original;
   if (!original) {
     hud("");
     magEl.hidden = true;
-    renderer.clear();
+    if (!cleared) {
+      gpu.beginFrame(bw, bh);
+      gpu.endFrame();
+      cleared = true;
+    }
     return;
   }
-  constrainCamera();
+  cleared = false;
+  syncFocus();
+  orbit.update(h);
   requestCut();
   sortSplats();
-  root.visible = mode !== "auto";
-  lod.visible = mode === "auto";
-  if (mode !== "auto") magEl.hidden = true;
+  lineStyles();
+  gpu.setOverlays(wireOn, seamOn);
+  gpu.setSplatShape($("#splat-draw").value === "gauss");
+  gpu.beginFrame(bw, bh);
+  const camera = [orbit.viewMatrix, orbit.fov, orbit.near, orbit.far];
   if (mode === "compare") {
-    const half = Math.floor(w / 2);
-    camera.aspect = half / h;
-    camera.updateProjectionMatrix();
-    wireMat.resolution.set(half, h);
-    seamMat.resolution.set(half, h);
-    renderer.setScissorTest(true);
-    show(displayed(0));
-    renderer.setViewport(0, 0, half, h);
-    renderer.setScissor(0, 0, half, h);
-    renderer.render(scene, camera);
-    show(displayed(selected));
-    renderer.setViewport(half, 0, w - half, h);
-    renderer.setScissor(half, 0, w - half, h);
-    renderer.render(scene, camera);
-    renderer.setScissorTest(false);
-    renderer.setViewport(0, 0, w, h);
+    const half = Math.round(Math.floor(w / 2) * k);
+    drawView(levels[displayed(0)].model, 0, half, camera);
+    drawView(levels[displayed(selected)].model, half, bw, camera);
+    gpu.endFrame();
+    magEl.hidden = true;
     hud(label(0), label(selected));
+  } else if (mode === "auto") {
+    const list = autoLevels();
+    syncAuto(list);
+    const dist = orbit.distance;
+    const i = Math.max(0, list.findLastIndex((l) => dist >= l.distance));
+    drawView(list[i]?.model, 0, bw, camera);
+    gpu.endFrame();
+    magnify();
+    const cur = list[i]?.level ?? 0;
+    const next = list[i + 1];
+    if (document.activeElement !== distEl) distEl.value = String(distToSlider(dist));
+    const ahead = next ? ` · ${lodName(next.level)} at ${next.distance.toPrecision(3)}` : "";
+    hud(`Auto: ${label(cur)}`, `distance ${dist.toPrecision(3)}${ahead}`);
   } else {
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
-    wireMat.resolution.set(w, h);
-    seamMat.resolution.set(w, h);
-    if (mode === "auto") {
-      syncLod();
-      renderer.render(scene, camera);
-      magnify();
-      const i = lod.getCurrentLevel();
-      const cur = lod.levels[i]?.object.userData.level ?? 0;
-      const next = lod.levels[i + 1];
-      const dist = camera.position.distanceTo(original.center);
-      if (document.activeElement !== distEl) distEl.value = String(distToSlider(dist));
-      const ahead = next ? ` · ${lodName(next.object.userData.level)} at ${next.distance.toPrecision(3)}` : "";
-      hud(`Auto: ${label(cur)}`, `distance ${dist.toPrecision(3)}${ahead}`);
-    } else {
-      show(displayed(selected));
-      renderer.render(scene, camera);
-      hud(label(levels[selected]?.object ? selected : 0));
-    }
+    const shown = displayed(selected);
+    drawView(levels[shown].model, 0, bw, camera);
+    gpu.endFrame();
+    magEl.hidden = true;
+    hud(label(shown));
   }
-  $("#divider").hidden = mode !== "compare";
 }
 
 const divider = document.createElement("div");
@@ -440,8 +480,8 @@ requestAnimationFrame(render);
 // ---------------------------------------------------------------- example modes
 //
 // Besides the classic chain, the page runs four other examples (the Example picker):
-// option configurations (GLB levels, like the chain), a cluster DAG and an HLOD tree (one
-// "Cut" level the worker re-selects as the camera moves) and Gaussian splats (drawn here).
+// option configurations (levels, like the chain), a cluster DAG and an HLOD tree (one "Cut"
+// level the worker re-selects as the camera moves) and Gaussian splats (drawn here).
 
 const MODE_KIND = { presets: "reduced", clusters: "clusters", hlod: "hlod", splats: "splats" };
 const MODE_LEVELS = { presets: 10, clusters: 1, hlod: 1, splats: 3 };
@@ -458,20 +498,13 @@ const MODE_HINTS = {
 const AUTO_MODES = new Set(["chain", "splats"]);
 
 let shownMode = ""; // the example whose results are on screen ("" before the first run)
-/** Cluster or HLOD state: { kind, group, info, cut(sel, buffers), stats(), dispose(), full? } */
+/** Cluster or HLOD state: { kind, model, info, cut(sel, buffers), stats(), dispose(), full? } */
 let extra = null;
-let hlodIncoming = null; // HLOD proxies parsed while the tree builds
+let hlodIncoming = null; // HLOD proxies built while the tree builds
 let focusOverride = null; // HLOD: the tiled grid's bounds replace the model's for the camera
 let cutSeq = 0;
 let cutInflight = false;
 let cutKey = "";
-let lodVersion = 0;
-const wires = new Map(); // geometry -> its wireframe, shared by every mesh drawing it
-const seams = new Map(); // geometry -> its UV seam lines (null: none), likewise
-const plain = { vertexColors: false, flatShading: false };
-const tmpV2 = new THREE.Vector2();
-const tmpV3 = new THREE.Vector3();
-const tmpV4 = new THREE.Vector4();
 
 function focus() {
   return focusOverride ?? original;
@@ -484,103 +517,18 @@ const fmtPx = (p) => (p < 1 ? p.toFixed(2) : p.toPrecision(2));
 const diag = () => assetInfo?.diagonal || 1;
 /** Pixels per radian of the reference view (1080 pixels high, 60° vertical FOV). */
 const REF_PPR = 1080 / (2 * Math.tan(Math.PI / 6));
-
-function wireFor(geometry) {
-  let w = wires.get(geometry);
-  if (!w) {
-    w = new WireframeGeometry2(geometry);
-    wires.set(geometry, w);
-  }
-  return w;
-}
-function dropWire(geometry) {
-  const w = geometry && wires.get(geometry);
-  if (w) {
-    w.dispose();
-    wires.delete(geometry);
-  }
-  if (geometry && seams.has(geometry)) {
-    seams.get(geometry)?.dispose();
-    seams.delete(geometry);
-  }
-}
-
-function seamFor(geometry) {
-  if (!seams.has(geometry)) seams.set(geometry, seamGeometry(geometry));
-  return seams.get(geometry);
-}
-
-/**
- * The UV seams of `geometry` as line segments, or null when it has none: edges whose triangles
- * meet in position but not in texture coordinates. Open borders are not seams.
- */
-function seamGeometry(geometry) {
-  const pos = geometry.attributes.position;
-  const uv = geometry.attributes.uv;
-  if (!pos || !uv) return null;
-  // Vertices split along a seam share a position: number the distinct positions.
-  const ids = new Map();
-  const pid = new Uint32Array(pos.count);
-  for (let v = 0; v < pos.count; v++) {
-    const k = `${pos.getX(v)},${pos.getY(v)},${pos.getZ(v)}`;
-    let id = ids.get(k);
-    if (id === undefined) ids.set(k, (id = ids.size));
-    pid[v] = id;
-  }
-  const n = ids.size;
-  const index = geometry.index;
-  const corners = index ? index.count : pos.count;
-  const at = index ? (i) => index.getX(i) : (i) => i;
-  const same = (a, b) =>
-    a === b || (Math.abs(uv.getX(a) - uv.getX(b)) < 1e-5 && Math.abs(uv.getY(a) - uv.getY(b)) < 1e-5);
-  const first = new Map(); // edge (lower position id first) -> the vertices of its first triangle
-  const seam = new Set();
-  for (let t = 0; t + 2 < corners; t += 3) {
-    for (let e = 0; e < 3; e++) {
-      let a = at(t + e);
-      let b = at(t + ((e + 1) % 3));
-      if (pid[a] === pid[b]) continue;
-      if (pid[a] > pid[b]) [a, b] = [b, a];
-      const key = pid[a] * n + pid[b];
-      const f = first.get(key);
-      if (!f) first.set(key, [a, b]);
-      else if (!same(f[0], a) || !same(f[1], b)) seam.add(key);
-    }
-  }
-  if (!seam.size) return null;
-  const out = new Float32Array(seam.size * 6);
-  let o = 0;
-  for (const key of seam) {
-    for (const v of first.get(key)) {
-      out[o++] = pos.getX(v);
-      out[o++] = pos.getY(v);
-      out[o++] = pos.getZ(v);
-    }
-  }
-  return new LineSegmentsGeometry().setPositions(out);
-}
-
-const tint = new THREE.Color();
-/** A color per DAG or tree level (shared object: read it right away). */
-function levelColor(l) {
-  return tint.setHSL((0.58 + l * 0.137) % 1, 0.62, 0.55);
-}
-/** A stable random color per cluster (shared object: read it right away). */
-function clusterColor(id) {
-  let h = Math.imul(id ^ 0x9e3779b9, 0x85ebca6b);
-  h ^= h >>> 13;
-  h = Math.imul(h, 0xc2b2ae35);
-  h ^= h >>> 16;
-  return tint.setHSL((h >>> 0) / 4294967296, 0.5 + ((h >>> 8) & 63) / 250, 0.45 + ((h >>> 16) & 63) / 400);
-}
+/** Pixels per radian of this canvas. */
+const canvasPpr = () => canvas.height / (2 * Math.tan((orbit.fov * Math.PI) / 360));
 
 function disposeLevel(l) {
-  if (!l?.object) return;
-  if (l.object.userData.dispose) {
-    l.object.userData.dispose();
-    l.object.removeFromParent();
-  } else dispose(l.object, ownsMaterials(l.info));
-  l.object = null;
+  if (!l?.model) return;
+  if (l.model !== original?.model) l.model.dispose();
+  l.model = null;
+}
+
+function dropIncoming() {
+  for (const p of hlodIncoming?.proxies.values() ?? []) p.model.dispose();
+  hlodIncoming = null;
 }
 
 /** Drops everything a mode put on screen; level 0 is the original again. */
@@ -589,17 +537,17 @@ function clearModeState() {
   levels.length = Math.min(levels.length, 1);
   extra?.dispose();
   extra = null;
-  hlodIncoming = null;
-  if (levels[0] && original) levels[0].object = original.object;
+  dropIncoming();
+  if (levels[0] && original) levels[0].model = original.model;
   if (focusOverride) {
     focusOverride = null;
     if (original) {
-      controls.maxDistance = original.radius * 400;
+      orbit.maxDistance = original.radius * 400;
       home();
     }
   }
   cutKey = "";
-  lodKey = "";
+  autoKey = "";
 }
 
 function switchMode(m) {
@@ -632,15 +580,14 @@ function cutStats() {
 /** Asks the worker for the cut at the current camera, when it changed and none is pending. */
 function requestCut() {
   if (!extra || busy || cutInflight || extra.failed || $("#freeze").checked) return;
-  const h = renderer.getDrawingBufferSize(tmpV2).y;
-  const ppr = h / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
+  const ppr = canvasPpr();
   const threshold = 2 ** +$("#threshold").value;
-  const p = camera.position;
-  const key = `${p.x.toPrecision(5)},${p.y.toPrecision(5)},${p.z.toPrecision(5)}|${ppr.toFixed(0)}|${threshold}`;
+  const p = orbit.eye;
+  const key = `${p[0].toPrecision(5)},${p[1].toPrecision(5)},${p[2].toPrecision(5)}|${ppr.toFixed(0)}|${threshold}`;
   if (key === cutKey) return;
   cutKey = key;
   cutInflight = true;
-  worker.postMessage({ type: "select", seq: ++cutSeq, view: { eye: [p.x, p.y, p.z], ppr, threshold } });
+  worker.postMessage({ type: "select", seq: ++cutSeq, view: { eye: [...p], ppr, threshold } });
 }
 
 function onSelect(m) {
@@ -662,16 +609,12 @@ function installExtra(x) {
   extra = x;
   x.minSeq = cutSeq + 1;
   const l1 = entry(1);
-  Object.assign(l1, { info: x.info, object: x.group, stale: false, tex: {} });
-  root.add(x.group);
-  setWire(x.group);
+  Object.assign(l1, { info: x.info, model: x.model, stale: false, tex: {} });
   if (x.full) {
     const l0 = entry(0);
-    l0.object = x.full;
+    l0.model = x.full;
     l0.info = { ...(l0.info ?? { level: 0, kind: "original" }), ...x.fullInfo };
     l0.stale = false;
-    root.add(x.full);
-    setWire(x.full);
   }
   cutKey = "";
   syncCutPanel();
@@ -679,32 +622,24 @@ function installExtra(x) {
   drawTextures(selected);
 }
 
-async function onData(m) {
+function onData(m) {
   const { kind, info, buffers } = m;
   const id = m.runId;
   if (kind === "clusters") installExtra(buildClusters(info, buffers));
   else if (kind === "hlod_node") {
-    if (hlodIncoming?.runId !== id) hlodIncoming = { runId: id, proxies: new Map(), pending: [] };
-    const inc = hlodIncoming;
-    const u8 = buffers[0];
-    inc.pending.push(
-      loader.parseAsync(u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength), "").then((gltf) => {
-        if (id !== runId) return dispose(gltf.scene, true);
-        inc.proxies.set(info.node, { object: gltf.scene, info });
-      }),
-    );
+    if (hlodIncoming?.runId !== id) {
+      dropIncoming();
+      hlodIncoming = { runId: id, proxies: new Map() };
+    }
+    hlodIncoming.proxies.set(info.node, { model: buildModel({ ...info.scene, buffers }), info });
   } else if (kind === "hlod_tree") {
-    const inc = hlodIncoming?.runId === id ? hlodIncoming : { proxies: new Map(), pending: [] };
-    await Promise.all(inc.pending);
-    if (id !== runId) return;
+    const proxies = hlodIncoming?.runId === id ? hlodIncoming.proxies : new Map();
     hlodIncoming = null;
-    installExtra(buildHlod(info, inc.proxies));
+    installExtra(buildHlod(info, proxies));
   } else if (kind === "splats") {
     const l = entry(info.level);
     disposeLevel(l);
-    const mesh = buildSplats(buffers[0]);
-    Object.assign(l, { info, object: mesh, stale: false, tex: {} });
-    root.add(mesh);
+    Object.assign(l, { info, model: buildSplats(buffers[0]), stale: false, tex: {} });
     renderRows();
     cutStats();
   }
@@ -717,45 +652,21 @@ function buildClusters(info, buffers) {
   const [xf, instMesh, ...rest] = buffers;
   const meshes = info.meshes.map((json, i) => {
     const [pos, nrm, uv, idx, triStart, mats, clusterLevel] = rest.slice(7 * i, 7 * i + 7);
-    const position = new THREE.BufferAttribute(pos, 3);
-    let normal = nrm.length ? new THREE.BufferAttribute(nrm, 3) : null;
-    if (!normal) {
-      // Smooth normals from the full-detail clusters.
-      const g = new THREE.BufferGeometry();
-      g.setAttribute("position", position);
-      const full = [];
-      for (let c = 0; c < clusterLevel.length; c++)
-        if (clusterLevel[c] === 0)
-          for (let t = triStart[c]; t < triStart[c + 1]; t++) full.push(idx[3 * t], idx[3 * t + 1], idx[3 * t + 2]);
-      g.setIndex(full);
-      g.computeVertexNormals();
-      normal = g.getAttribute("normal");
-    }
+    const normal = nrm.length ? nrm : smoothNormals(pos, idx, triStart, clusterLevel);
     const slots = [...new Set(mats)].sort((a, b) => a - b);
     const slotOf = new Map(slots.map((s, k) => [s, k]));
     const tk = Uint32Array.from(mats, (s) => slotOf.get(s));
-    const sphere = new THREE.Box3().setFromBufferAttribute(position).getBoundingSphere(new THREE.Sphere());
-    const uvA = uv.length ? new THREE.BufferAttribute(uv, 2) : null;
-    return { json, position, normal, uv: uvA, idx, triStart, tk, clusterLevel, slots, sphere };
+    // The vertices stay in the engine for the materials view; cuts index them.
+    const geometry = gpu.addGeometry(pos, normal, uv, EMPTY);
+    return { json, pos, normal, geometry, idx, triStart, tk, clusterLevel, slots, scratch: new Uint32Array(idx.length) };
   });
-  const group = new THREE.Group();
-  const colorMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.7, metalness: 0 });
-  const instances = Array.from(instMesh, (mi, i) => {
-    const holder = new THREE.Group();
-    holder.matrixAutoUpdate = false;
-    holder.matrix.fromArray(xf, 16 * i);
-    group.add(holder);
-    return { mesh: meshes[mi], holder, object: null, indexed: null, flat: null, sel: new Uint32Array(0) };
-  });
-  group.userData.dispose = () => {
-    for (const inst of instances) {
-      for (const g of [inst.indexed, inst.flat]) {
-        dropWire(g);
-        g?.dispose();
-      }
-    }
-    colorMat.dispose();
-  };
+  const colorMat = gpu.addMaterial(new Float32Array([1, 1, 1, 1, 0, 0.7, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0]), Int32Array.of(-1, -1, -1, -1, -1));
+  const instances = Array.from(instMesh, (mi, i) => ({
+    mesh: meshes[mi],
+    matrix: xf.slice(16 * i, 16 * i + 16),
+    ids: [], // engine meshes of this instance's cut
+    sel: new Uint32Array(0),
+  }));
   const cutInfo = {
     level: 1,
     kind: "clusters",
@@ -780,43 +691,37 @@ function buildClusters(info, buffers) {
         inst.sel = ids.subarray(at + 1, at + 1 + n);
         at += 1 + n;
       }
+      for (const id of inst.ids) gpu.removeMesh(id);
+      inst.ids = [];
       const m = inst.mesh;
-      let g;
       if (shading === "materials") {
-        g = inst.indexed;
-        if (!g) {
-          g = inst.indexed = new THREE.BufferGeometry();
-          g.setAttribute("position", m.position);
-          g.setAttribute("normal", m.normal);
-          if (m.uv) g.setAttribute("uv", m.uv);
-          g.setIndex(new THREE.BufferAttribute(new Uint32Array(m.idx.length), 1));
-          g.boundingSphere = m.sphere;
+        for (const [k, start, count] of indexedParts(m, inst.sel)) {
+          const material = original?.model.materials[m.slots[k]] ?? fallback();
+          inst.ids.push(gpu.addMesh(m.geometry, m.scratch.subarray(start, start + count), material));
         }
-        fillIndexed(g, m, inst.sel);
       } else {
-        dropWire(inst.flat);
-        inst.flat?.dispose();
-        g = inst.flat = flatGeometry(m, inst.sel, shading);
-      }
-      const material = shading === "materials" ? m.slots.map((s) => originalMaterial(s, plain)) : colorMat;
-      if (!inst.object) {
-        inst.object = new THREE.Mesh(g, material);
-        inst.holder.add(inst.object);
-      } else {
-        inst.object.geometry = g;
-        inst.object.material = material;
-      }
-      // New triangles: the wireframe and seams are rebuilt.
-      for (const c of inst.object.children.filter((c) => OVERLAYS.has(c.name))) {
-        inst.object.remove(c);
-        dropWire(g);
+        const flat = flatGeometry(m, inst.sel, shading);
+        if (flat) {
+          inst.ids.push(gpu.addMesh(flat.geometry, flat.indices, colorMat));
+          gpu.removeGeometry(flat.geometry); // the mesh keeps it
+        }
       }
     }
-    if (wireOn || seamOn) setWire(group);
   };
   return {
     kind: "clusters",
-    group,
+    model: {
+      draws() {
+        const out = [];
+        for (const inst of instances) for (const id of inst.ids) out.push([inst.matrix, id, true]);
+        return out;
+      },
+      dispose() {
+        for (const inst of instances) for (const id of inst.ids) gpu.removeMesh(id);
+        for (const m of meshes) gpu.removeGeometry(m.geometry);
+        gpu.removeMaterial(colorMat);
+      },
+    },
     info: cutInfo,
     cut(sel, [ids]) {
       last = sel;
@@ -845,48 +750,66 @@ function buildClusters(info, buffers) {
         ["Built in", `${(info.ms / 1000).toFixed(2)} s`],
       ];
     },
-    dispose() {}, // level 1 owns the group
+    dispose() {}, // level 1 owns the model
   };
 }
 
-/** Fills the indexed cut: triangles of the selected clusters, grouped by material. */
-function fillIndexed(g, m, sel) {
-  const { triStart, tk, idx, slots } = m;
+/** Area-weighted vertex normals from the full-detail (DAG level 0) clusters. */
+function smoothNormals(pos, idx, triStart, clusterLevel) {
+  const out = new Float32Array(pos.length);
+  for (let c = 0; c < clusterLevel.length; c++) {
+    if (clusterLevel[c] !== 0) continue;
+    for (let t = triStart[c]; t < triStart[c + 1]; t++) {
+      const [a, b, d] = [3 * idx[3 * t], 3 * idx[3 * t + 1], 3 * idx[3 * t + 2]];
+      const u = [pos[b] - pos[a], pos[b + 1] - pos[a + 1], pos[b + 2] - pos[a + 2]];
+      const v = [pos[d] - pos[a], pos[d + 1] - pos[a + 1], pos[d + 2] - pos[a + 2]];
+      const n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+      for (const o of [a, b, d]) for (let k = 0; k < 3; k++) out[o + k] += n[k];
+    }
+  }
+  for (let o = 0; o < out.length; o += 3) {
+    const l = Math.hypot(out[o], out[o + 1], out[o + 2]) || 1;
+    for (let k = 0; k < 3; k++) out[o + k] /= l;
+  }
+  return out;
+}
+
+/**
+ * Writes the triangles of the selected clusters into the mesh's scratch indices, grouped by
+ * material; returns the groups as [slot index, start, count].
+ */
+function indexedParts(m, sel) {
+  const { triStart, tk, idx, slots, scratch } = m;
   const start = new Uint32Array(slots.length + 1);
   for (const c of sel) for (let t = triStart[c]; t < triStart[c + 1]; t++) start[tk[t] + 1]++;
   for (let k = 0; k < slots.length; k++) start[k + 1] += start[k];
   const fill = start.slice(0, slots.length);
-  const out = g.index.array;
   for (const c of sel)
     for (let t = triStart[c]; t < triStart[c + 1]; t++) {
       const o = 3 * fill[tk[t]]++;
-      out[o] = idx[3 * t];
-      out[o + 1] = idx[3 * t + 1];
-      out[o + 2] = idx[3 * t + 2];
+      scratch[o] = idx[3 * t];
+      scratch[o + 1] = idx[3 * t + 1];
+      scratch[o + 2] = idx[3 * t + 2];
     }
-  g.clearGroups();
+  const out = [];
   for (let k = 0; k < slots.length; k++)
-    if (start[k + 1] > start[k]) g.addGroup(3 * start[k], 3 * (start[k + 1] - start[k]), k);
-  const n = 3 * start[slots.length];
-  g.index.clearUpdateRanges();
-  g.index.addUpdateRange(0, n);
-  g.index.needsUpdate = true;
-  g.setDrawRange(0, n);
+    if (start[k + 1] > start[k]) out.push([k, 3 * start[k], 3 * (start[k + 1] - start[k])]);
+  return out;
 }
 
-/** The cut as unshared triangles with a color per cluster or per DAG level. */
+/** The cut as unshared triangles with a color per cluster or per DAG level, in the engine. */
 function flatGeometry(m, sel, shading) {
   let tris = 0;
   for (const c of sel) tris += m.triStart[c + 1] - m.triStart[c];
+  if (!tris) return null;
   const pos = new Float32Array(9 * tris);
   const nrm = new Float32Array(9 * tris);
   const col = new Float32Array(9 * tris);
-  const P = m.position.array;
-  const N = m.normal.array;
+  const P = m.pos;
+  const N = m.normal;
   let o = 0;
   for (const c of sel) {
-    const k = shading === "levels" ? levelColor(m.clusterLevel[c]) : clusterColor(c);
-    const [r, g, b] = [k.r, k.g, k.b];
+    const [r, g, b] = shading === "levels" ? levelColor(m.clusterLevel[c]) : clusterColor(c);
     for (let t = m.triStart[c]; t < m.triStart[c + 1]; t++)
       for (let j = 0; j < 3; j++) {
         const v = 3 * m.idx[3 * t + j];
@@ -902,85 +825,54 @@ function flatGeometry(m, sel, shading) {
         o += 3;
       }
   }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  geo.setAttribute("normal", new THREE.BufferAttribute(nrm, 3));
-  geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
-  geo.boundingSphere = m.sphere.clone();
-  return geo;
+  const indices = Uint32Array.from({ length: 3 * tris }, (_, i) => i);
+  return { geometry: gpu.addGeometry(pos, nrm, EMPTY, col), indices };
 }
 
 // ---- HLOD
 
-/** The meshes glTF node `node` draws itself (not its child nodes). */
-function nodeMeshes(node) {
-  const out = node.isMesh ? [node] : [];
-  for (const c of node.children)
-    if (c.isMesh && !OVERLAYS.has(c.name) && original.assoc.get(c)?.nodes === undefined) out.push(c);
-  return out;
-}
-
 function buildHlod(info, proxies) {
-  original.object.updateMatrixWorld(true);
   const src = info.source_instances;
-  const T = new THREE.Matrix4();
-  // One group per tiled instance (copy-major, as the worker numbers them), sharing the original's
-  // geometry and materials. Skinned meshes are drawn in their bind pose.
-  const makeInstances = () => {
-    const out = [];
-    for (const o of info.offsets) {
-      T.makeTranslation(o[0], o[1], o[2]);
-      for (let s = 0; s < src; s++) {
-        const g = new THREE.Group();
-        const node = original.nodes[info.joint_nodes + s];
-        for (const mesh of node ? nodeMeshes(node) : []) {
-          const c = new THREE.Mesh(mesh.geometry, mesh.material);
-          c.matrixAutoUpdate = false;
-          c.matrix.multiplyMatrices(T, mesh.matrixWorld);
-          g.add(c);
-        }
-        out.push(g);
-      }
+  // The tiled instances, copy-major as the worker numbers them: the original's instances
+  // moved by each copy's offset, drawn with its meshes and materials.
+  const tiled = info.offsets.map((o) => {
+    const draws = original.model.draws(null, [], o);
+    const perSource = Array.from({ length: src }, () => []);
+    // draws() walks the original's instances in order, its parts within each.
+    let at = 0;
+    for (const [s, inst] of original.model.instances.entries()) {
+      const n = original.model.meshes[inst.mesh].parts.length;
+      if (s < src) perSource[s].push(...draws.slice(at, at + n));
+      at += n;
     }
-    return out;
+    return perSource;
+  });
+  const cutInst = tiled.flat(); // draws of tiled instance i
+  const full = {
+    draws: () => cutInst.flat(),
+    dispose() {}, // borrows the original's meshes
   };
-  const full = new THREE.Group();
-  full.add(...makeInstances());
-  full.userData.dispose = () => {};
-  const group = new THREE.Group();
-  const cutInst = makeInstances();
-  group.add(...cutInst);
-  const tints = new Map();
-  for (const p of proxies.values()) {
-    p.object.visible = false;
-    p.object.traverse((o) => {
-      if (o.isMesh) o.userData.base = o.material;
-    });
-    group.add(p.object);
-  }
-  group.userData.dispose = () => {
-    for (const p of proxies.values()) {
-      p.object.traverse((o) => {
-        if (o.isMesh) o.material = o.userData.base;
-      });
-      dispose(p.object, true);
-    }
-    for (const m of tints.values()) m.dispose();
+  let shownProxies = [];
+  let shownInst = [];
+  const tints = new Map(); // tree level -> material
+  const tintFor = (level) => {
+    if (!$("#tint").checked) return null;
+    let m = tints.get(level);
+    if (m === undefined) tints.set(level, (m = colorMaterial(levelColor(level))));
+    return m;
   };
-  const applyTint = () => {
-    const on = $("#tint").checked;
-    for (const p of proxies.values()) {
-      let m = tints.get(p.info.level);
-      if (on && !m) {
-        m = new THREE.MeshStandardMaterial({ color: levelColor(p.info.level).clone(), roughness: 0.8 });
-        tints.set(p.info.level, m);
-      }
-      p.object.traverse((o) => {
-        if (o.isMesh) o.material = on ? m : o.userData.base;
-      });
-    }
+  const model = {
+    draws() {
+      const out = [];
+      for (const i of shownInst) for (const d of cutInst[i] ?? []) out.push(d);
+      for (const p of shownProxies) p.model.draws(tintFor(p.info.level), out);
+      return out;
+    },
+    dispose() {
+      for (const p of proxies.values()) p.model.dispose();
+      for (const m of tints.values()) gpu.removeMaterial(m);
+    },
   };
-  applyTint();
   // The bake panel shows the root proxy's textures (the coarsest one).
   let texProxy = null;
   for (const p of proxies.values()) if (p.info.baked && (!texProxy || p.info.level > texProxy.info.level)) texProxy = p;
@@ -1001,23 +893,21 @@ function buildHlod(info, proxies) {
     bytes: proxyBytes,
   };
   const prev = focusOverride;
-  focusOverride = { center: new THREE.Vector3(...info.focus.center), radius: info.focus.radius };
-  controls.maxDistance = focusOverride.radius * 400;
+  focusOverride = { center: info.focus.center, radius: info.focus.radius };
+  orbit.maxDistance = focusOverride.radius * 400;
   if (!prev || Math.abs(prev.radius - focusOverride.radius) > 1e-6 * prev.radius) home();
   let last = null;
   return {
     kind: "hlod",
-    group,
+    model,
     full,
     fullInfo: { label: `Full (${info.copies} ${info.copies === 1 ? "copy" : "copies"})`, triangles: total, full_triangles: total },
     info: cutInfo,
     texProxy,
     cut(sel, [nodes, inst]) {
       last = sel;
-      const ns = new Set(nodes);
-      const is = new Set(inst);
-      for (const [n, p] of proxies) p.object.visible = ns.has(n);
-      cutInst.forEach((g, i) => (g.visible = is.has(i)));
+      shownProxies = [...nodes].map((n) => proxies.get(n)).filter(Boolean);
+      shownInst = [...inst];
       Object.assign(cutInfo, {
         triangles: sel.triangles,
         full_triangles: sel.full_triangles,
@@ -1026,7 +916,6 @@ function buildHlod(info, proxies) {
         hud: `${sel.proxies} ${sel.proxies === 1 ? "proxy" : "proxies"}, ${sel.instances} ${sel.instances === 1 ? "instance" : "instances"}`,
       });
     },
-    tint: applyTint,
     stats() {
       const rows = [];
       if (last) {
@@ -1040,13 +929,14 @@ function buildHlod(info, proxies) {
       } else rows.push(["Cut", "waiting for the camera…"]);
       // Where the closest leaf cell gives way to its proxy (LodView::projected, solved for
       // distance), so dense models whose proxies only show far away still explain themselves.
-      const ppr = renderer.getDrawingBufferSize(tmpV2).y / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
+      const ppr = canvasPpr();
       const t = 2 ** +$("#threshold").value;
+      const eye = orbit.eye;
       let near = null;
       for (const n of info.nodes) {
         if (n.level !== 0 || !(n.error > 0)) continue;
         const [x, y, z, r] = n.sphere;
-        const d = camera.position.distanceTo(tmpV3.set(x, y, z));
+        const d = Math.hypot(eye[0] - x, eye[1] - y, eye[2] - z);
         if (!near || d < near.d) near = { d, at: (n.error * ppr) / t + r };
       }
       if (near)
@@ -1066,8 +956,7 @@ function buildHlod(info, proxies) {
       return rows;
     },
     dispose() {
-      full.removeFromParent();
-      if (levels[0] && original) levels[0].object = original.object;
+      if (levels[0] && original) levels[0].model = original.model;
     },
   };
 }
@@ -1083,154 +972,52 @@ function visibilityText(v) {
 function drawHlodTextures() {
   const bake = $("#bake");
   const p = extra?.kind === "hlod" ? extra.texProxy : null;
-  let mat = null;
-  p?.object.traverse((o) => {
-    if (o.isMesh && !mat) mat = o.userData.base ?? o.material;
-  });
-  const maps = { base_color: mat?.map, normal: mat?.normalMap, orm: mat?.roughnessMap };
-  bake.classList.toggle("empty", !maps.base_color?.image);
+  const m = p?.model.json[0];
+  const tex = (i) => (i >= 0 ? p.model.textures[i] : null);
+  const maps = m ? { base_color: tex(m.base_color_texture), normal: tex(m.normal_texture), orm: tex(m.metallic_roughness_texture) } : {};
+  bake.classList.toggle("empty", !maps.base_color);
   $("#bake-title").textContent = p ? `Proxy textures · node ${p.info.node} (tree level ${p.info.level})` : "Proxy textures";
-  if (!maps.base_color?.image) {
+  if (!maps.base_color) {
     setStats(extra?.kind === "hlod" ? "Proxies are geometry only (Bake proxy textures is off)." : "");
     return;
   }
-  for (const [ch, t] of Object.entries(maps)) {
-    const c = $(`#tex-${ch}`);
-    const img = t?.image;
-    if (!c || !img) continue;
-    c.width = img.width;
-    c.height = img.height;
-    const ctx = c.getContext("2d");
-    ctx.clearRect(0, 0, c.width, c.height);
-    ctx.drawImage(img, 0, 0);
-  }
+  for (const [ch, t] of Object.entries(maps)) if (t) putTexture(ch, drawable(t));
   setStats(`${fmtInt(p.info.triangles)} tris · ${fmtBytes(p.info.bytes)} · ${fmtPct(p.info.coverage)} covered`);
 }
 
 // ---- splats
 
-// Each splat is a screen-space quad around its center, shaped by projecting the 3D covariance
-// (EWA splatting, as 3D Gaussian splatting viewers do). Payload per splat: position, covariance
-// (xx xy xz yy yz zz), linear RGBA, normal.
-const SPLAT_VS = /* glsl */ `
-attribute vec3 center;
-attribute vec3 covA;
-attribute vec3 covB;
-attribute vec4 rgba;
-attribute vec3 nrm;
-uniform vec2 viewport;
-uniform vec2 focal;
-varying vec4 vColor;
-varying vec2 vPos;
-void main() {
-  vec4 cam = modelViewMatrix * vec4(center, 1.0);
-  vec4 clip = projectionMatrix * cam;
-  if (cam.z > -1e-6 || abs(clip.x) > 1.3 * clip.w || abs(clip.y) > 1.3 * clip.w) {
-    gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-    return;
-  }
-  mat3 V = mat3(covA.x, covA.y, covA.z, covA.y, covB.x, covB.y, covA.z, covB.y, covB.z);
-  mat3 W = mat3(modelViewMatrix);
-  float iz = 1.0 / cam.z;
-  mat3 J = mat3(-focal.x * iz, 0.0, 0.0,
-                0.0, -focal.y * iz, 0.0,
-                focal.x * cam.x * iz * iz, focal.y * cam.y * iz * iz, 0.0);
-  mat3 T = J * W;
-  mat3 S = T * V * transpose(T);
-  float a = S[0][0] + 0.3;
-  float b = S[0][1];
-  float c = S[1][1] + 0.3;
-  float mid = 0.5 * (a + c);
-  float rad = length(vec2(0.5 * (a - c), b));
-  float l1 = mid + rad;
-  float l2 = max(mid - rad, 0.1);
-  vec2 d1 = abs(b) > 1e-9 ? normalize(vec2(b, l1 - a)) : (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0));
-  vec2 major = min(sqrt(2.0 * l1), 1024.0) * d1;
-  vec2 minor = min(sqrt(2.0 * l2), 1024.0) * vec2(-d1.y, d1.x); // (major, minor) keeps the quad counter-clockwise
-  vPos = position.xy * 2.0;
-  vec2 off = (vPos.x * major + vPos.y * minor) * 2.0 / viewport;
-  gl_Position = vec4((clip.xy / clip.w + off) * clip.w, clip.z, clip.w);
-  vec3 n = normalize(mat3(modelViewMatrix) * nrm);
-  float lit = 0.55 + 0.45 * abs(dot(n, normalize(cam.xyz)));
-  vColor = vec4(rgba.rgb * lit, rgba.a);
-}`;
-const SPLAT_FS = /* glsl */ `
-varying vec4 vColor;
-varying vec2 vPos;
-void main() {
-  float r2 = dot(vPos, vPos);
-#ifdef DISC
-  if (r2 > 2.0) discard;
-  gl_FragColor = vec4(vColor.rgb, 1.0);
-#else
-  if (r2 > 4.0) discard;
-  float alpha = vColor.a * exp(-r2);
-  if (alpha < 1.0 / 255.0) discard;
-  gl_FragColor = vec4(vColor.rgb, alpha);
-#endif
-  #include <colorspace_fragment>
-}`;
+// The engine draws each splat as a screen-space quad shaped by its projected 3D covariance (EWA
+// splatting, as 3D Gaussian splatting viewers do), as blended Gaussians or opaque discs.
+// Payload per splat: position, covariance (xx xy xz yy yz zz), linear RGBA, normal.
 
-const splatMats = {};
-function splatMaterial(kind) {
-  if (splatMats[kind]) return splatMats[kind];
-  const disc = kind === "disc";
-  const m = new THREE.ShaderMaterial({
-    uniforms: { viewport: { value: new THREE.Vector2(1, 1) }, focal: { value: new THREE.Vector2(1, 1) } },
-    vertexShader: SPLAT_VS,
-    fragmentShader: SPLAT_FS,
-    defines: disc ? { DISC: 1 } : {},
-    transparent: !disc,
-    depthWrite: disc,
-  });
-  // Per viewport (compare mode draws two): its size and focal length in pixels.
-  m.onBeforeRender = (r, s, cam) => {
-    r.getCurrentViewport(tmpV4);
-    m.uniforms.viewport.value.set(tmpV4.z, tmpV4.w);
-    const e = cam.projectionMatrix.elements;
-    m.uniforms.focal.value.set((e[0] * tmpV4.z) / 2, (e[5] * tmpV4.w) / 2);
-    m.uniformsNeedUpdate = true;
-  };
-  return (splatMats[kind] = m);
-}
-
-const splatData = new WeakMap(); // geometry -> { payload, buf, k, key, depth, keys, order }
+/** A splat cloud as a level's model; `splat` holds what sorting it needs. */
 function buildSplats(payload) {
   const k = payload.length / 16;
-  const geom = new THREE.InstancedBufferGeometry();
-  geom.setAttribute("position", new THREE.Float32BufferAttribute([-1, -1, 0, 1, -1, 0, 1, 1, 0, -1, 1, 0], 3));
-  geom.setIndex([0, 1, 2, 0, 2, 3]);
-  const buf = new THREE.InstancedInterleavedBuffer(new Float32Array(payload), 16, 1);
-  buf.setUsage(THREE.DynamicDrawUsage);
-  for (const [name, size, offset] of [
-    ["center", 3, 0],
-    ["covA", 3, 3],
-    ["covB", 3, 6],
-    ["rgba", 4, 9],
-    ["nrm", 3, 13],
-  ])
-    geom.setAttribute(name, new THREE.InterleavedBufferAttribute(buf, size, offset));
-  geom.instanceCount = k;
-  splatData.set(geom, { payload, buf, k, key: "", depth: new Float32Array(k), keys: new Uint16Array(k), order: new Uint32Array(k) });
-  const mesh = new THREE.Mesh(geom, splatMaterial($("#splat-draw").value));
-  mesh.frustumCulled = false;
-  mesh.userData.noWire = true;
-  mesh.userData.dispose = () => geom.dispose();
-  return mesh;
+  const id = gpu.addSplats(payload);
+  return {
+    splat: { id, payload, k, key: "", depth: new Float32Array(k), keys: new Uint16Array(k), order: new Uint32Array(k), sorted: new Float32Array(payload.length) },
+    draws: () => [[IDENTITY, id, false]],
+    dispose: () => gpu.removeMesh(id),
+  };
 }
 
 let sortCounts = null;
 /** Blended Gaussians are drawn back to front: re-sort (counting sort on depth) when the view turns. */
 function sortSplats() {
   if ($("#splat-draw").value !== "gauss") return;
-  camera.updateMatrixWorld();
-  const e = camera.matrixWorldInverse.elements;
-  const key = `${e[2].toFixed(4)},${e[6].toFixed(4)},${e[10].toFixed(4)},${e[14].toPrecision(5)}`;
+  let e = null;
+  let key = "";
   for (const l of levels) {
-    const s = l?.object?.geometry && splatData.get(l.object.geometry);
-    if (!s || s.key === key) continue;
+    const s = l?.model?.splat;
+    if (!s) continue;
+    if (!e) {
+      e = orbit.viewMatrix;
+      key = `${e[2].toFixed(4)},${e[6].toFixed(4)},${e[10].toFixed(4)},${e[14].toPrecision(5)}`;
+    }
+    if (s.key === key) continue;
     s.key = key;
-    const { payload, k, depth, keys, order } = s;
+    const { payload, k, depth, keys, order, sorted } = s;
     let lo = Infinity;
     let hi = -Infinity;
     for (let i = 0; i < k; i++) {
@@ -1251,13 +1038,8 @@ function sortSplats() {
     }
     for (let b = 0; b < B; b++) counts[b + 1] += counts[b];
     for (let i = 0; i < k; i++) order[counts[keys[i]]++] = i; // farthest (most negative z) first
-    const out = s.buf.array;
-    for (let j = 0; j < k; j++) {
-      const from = 16 * order[j];
-      const to = 16 * j;
-      for (let c = 0; c < 16; c++) out[to + c] = payload[from + c];
-    }
-    s.buf.needsUpdate = true;
+    for (let j = 0; j < k; j++) sorted.set(payload.subarray(16 * order[j], 16 * order[j] + 16), 16 * j);
+    gpu.setSplats(s.id, sorted);
   }
 }
 
@@ -1279,16 +1061,8 @@ $("#threshold").addEventListener("input", () => {
 });
 $("#freeze").addEventListener("change", () => (cutKey = ""));
 $("#shading").addEventListener("change", () => extra?.reshade?.());
-$("#tint").addEventListener("change", () => extra?.tint?.());
 $("#splat-draw").addEventListener("change", () => {
-  const m = splatMaterial($("#splat-draw").value);
-  for (const l of levels) {
-    const s = l?.object?.geometry && splatData.get(l.object.geometry);
-    if (!s) continue;
-    l.object.material = m;
-    s.key = "";
-  }
-  lodVersion++;
+  for (const l of levels) if (l?.model?.splat) l.model.splat.key = "";
   cutStats();
 });
 
@@ -1439,7 +1213,8 @@ async function onWorker(m) {
       applyViewPreset();
       showInfo(m.info);
       try {
-        await showOriginal(m.glb);
+        await viewerReady;
+        showOriginal(m.scene);
       } catch (e) {
         hideLoading();
         return setStatus(`Could not display the model: ${e.message ?? e}`, "error");
@@ -1459,10 +1234,10 @@ async function onWorker(m) {
       break;
     }
     case "level":
-      await onLevel(m.info, m.glb, m.runId);
+      onLevel(m.info, m.scene, m.runId);
       break;
     case "data":
-      await onData(m);
+      onData(m);
       break;
     case "select":
       onSelect(m);
@@ -1488,9 +1263,13 @@ async function onWorker(m) {
         splats: `${n} splat levels`,
       }[shownMode];
       const live = shownMode === "clusters" || shownMode === "hlod" ? "; the cut follows the camera" : "";
-      const stop =
-        stoppedAt != null
-          ? `; stopped there, as the next level deviates more than ${+(runOpts.max_error * 100).toFixed(2)}%`
+      const limit = `${+((runOpts.max_error || 0.02) * 100).toFixed(2)}%`;
+      const byError = runOpts.spacing === "error";
+      const stop = byError
+        ? `; spaced by error, ${runOpts.error_ratio}× apart up to ${limit}` +
+          (stoppedAt != null ? ` (no room for more above LOD0's error)` : "")
+        : stoppedAt != null
+          ? `; stopped there, as the next level deviates more than ${limit}`
           : "";
       setStatus(`Built ${what} in ${((performance.now() - runStart) / 1000).toFixed(2)} s${stop}${live}`);
       cutKey = "";
@@ -1539,33 +1318,32 @@ async function onWorker(m) {
 }
 
 function entry(level) {
-  return (levels[level] ??= { info: null, object: null, tex: {}, stale: true });
+  return (levels[level] ??= { info: null, model: null, tex: {}, stale: true });
 }
 
-async function onLevel(info, glb, id) {
+function onLevel(info, scene, id) {
+  if (id !== runId) return;
   const l = entry(info.level);
   if (info.level === 0) {
     l.info = info;
     l.stale = false;
     return renderRows();
   }
-  const parsed = loader.parseAsync(glb, "");
-  l.loading = parsed;
-  // A shared level reuses the atlas of the level that carries it, which may still be decoding.
+  // Reduced levels keep the original's materials; a shared level after the one carrying the
+  // atlas draws with that level's. Both come without materials of their own.
   const src = info.kind === "shared" && info.shared_textures !== info.level ? info.shared_textures : null;
-  const gltf = await parsed;
-  if (src !== null) await levels[src]?.loading;
-  if (id !== runId) return dispose(gltf.scene, ownsMaterials(info));
-  if (info.kind === "reduced") adoptMaterials(gltf);
-  if (src !== null) adoptShared(gltf, levels[src]?.object);
+  let borrow = null;
+  if (info.kind === "reduced") borrow = (slot) => original?.model.materials[slot];
+  else if (src !== null) {
+    const from = levels[src]?.model?.materials ?? [];
+    borrow = (slot) => from[slot] ?? from[0];
+  }
   disposeLevel(l);
   if (src !== null) l.tex = levels[src]?.tex ?? {};
   else if (info.kind !== "baked" && info.kind !== "shared") l.tex = {};
-  l.object = gltf.scene;
+  l.model = scene ? buildModel(scene, borrow) : null;
   l.info = info;
   l.stale = false;
-  root.add(gltf.scene);
-  setWire(gltf.scene);
   renderRows();
   if (info.kind !== "reduced" ? followTextures(info.level) : selected === info.level) drawTextures(info.level);
 }
@@ -1869,17 +1647,20 @@ function roughMetalOnly(ctx, c) {
 }
 
 /**
- * Draws the UV triangles of `object`'s meshes whose material passes `keep` over canvas `c`,
- * each triangle moved into the 0-1 tile it starts in. Returns how many triangles there are.
+ * Draws the UV triangles of `model`'s parts whose material slot passes `keep` over canvas `c`,
+ * each triangle moved into the 0-1 tile it starts in. Returns how many triangles there are
+ * (each instance's).
  */
-function drawUvs(c, object, keep = () => true) {
-  const meshes = [];
-  object?.traverse((o) => {
-    const material = [o.material].flat()[0];
-    if (o.isMesh && material && o.geometry?.attributes.uv && keep(material)) meshes.push(o);
-  });
-  const count = (g) => (g.index ? g.index.count : g.attributes.position.count) / 3;
-  const tris = meshes.reduce((n, o) => n + count(o.geometry), 0);
+function drawUvs(c, model, keep = () => true) {
+  const parts = (m) => (m.uvs ? m.parts.filter((p) => keep(p.slot)) : []);
+  const used = new Set();
+  let tris = 0;
+  for (const inst of model?.instances ?? []) {
+    const m = model.meshes[inst.mesh];
+    const n = parts(m).reduce((a, p) => a + p.count / 3, 0);
+    tris += n;
+    if (n) used.add(m);
+  }
   if (!c || !$("#uv-wire").checked || !tris || tris > UV_MAX_TRIANGLES) return tris;
   const { width: w, height: h } = c;
   const ctx = c.getContext("2d");
@@ -1889,29 +1670,18 @@ function drawUvs(c, object, keep = () => true) {
   ctx.strokeStyle = "#fff";
   ctx.globalCompositeOperation = "difference";
   ctx.beginPath();
-  for (const o of meshes) {
-    const g = o.geometry;
-    const channel = [o.material].flat()[0].map?.channel ?? 0;
-    const uv = (channel && g.attributes[`uv${channel}`]) || g.attributes.uv;
-    const idx = g.index;
-    const n = count(g) * 3;
-    for (let t = 0; t < n; t += 3) {
-      const a = idx ? idx.getX(t) : t;
-      const b = idx ? idx.getX(t + 1) : t + 1;
-      const d = idx ? idx.getX(t + 2) : t + 2;
-      const u0 = uv.getX(a);
-      const v0 = uv.getY(a);
-      const u1 = uv.getX(b);
-      const v1 = uv.getY(b);
-      const u2 = uv.getX(d);
-      const v2 = uv.getY(d);
-      const ou = Math.floor(Math.min(u0, u1, u2));
-      const ov = Math.floor(Math.min(v0, v1, v2));
-      ctx.moveTo((u0 - ou) * w, (v0 - ov) * h);
-      ctx.lineTo((u1 - ou) * w, (v1 - ov) * h);
-      ctx.lineTo((u2 - ou) * w, (v2 - ov) * h);
-      ctx.closePath();
-    }
+  for (const m of used) {
+    const { uvs, indices } = m;
+    for (const p of parts(m))
+      for (let t = p.start; t < p.start + p.count; t += 3) {
+        const [a, b, d] = [2 * indices[t], 2 * indices[t + 1], 2 * indices[t + 2]];
+        const ou = Math.floor(Math.min(uvs[a], uvs[b], uvs[d]));
+        const ov = Math.floor(Math.min(uvs[a + 1], uvs[b + 1], uvs[d + 1]));
+        ctx.moveTo((uvs[a] - ou) * w, (uvs[a + 1] - ov) * h);
+        ctx.lineTo((uvs[b] - ou) * w, (uvs[b + 1] - ov) * h);
+        ctx.lineTo((uvs[d] - ou) * w, (uvs[d + 1] - ov) * h);
+        ctx.closePath();
+      }
   }
   ctx.stroke();
   ctx.restore();
@@ -1920,9 +1690,15 @@ function drawUvs(c, object, keep = () => true) {
 
 /** The original's materials that have textures, by glTF material index. */
 function texturedOriginals() {
-  return (original?.materials ?? [])
-    .map((m, index) => ({ m, index }))
-    .filter(({ m }) => m && (m.map || m.normalMap || m.roughnessMap || m.metalnessMap));
+  const t = original?.model.textures ?? [];
+  const tex = (i) => (i >= 0 ? (t[i] ?? null) : null);
+  return (original?.model.json ?? [])
+    .map((m, index) => ({
+      m,
+      index,
+      maps: { base_color: tex(m.base_color_texture), normal: tex(m.normal_texture), orm: tex(m.metallic_roughness_texture) },
+    }))
+    .filter(({ maps }) => maps.base_color || maps.normal || maps.orm);
 }
 
 const CHANNEL_NAMES = { base_color: "base color", normal: "normal", orm: "rough / metal" };
@@ -1948,15 +1724,16 @@ function drawOriginalTextures(level) {
     setStats("No textures: plain-color materials.", ["The original has no textures: its materials are plain colors."]);
     return;
   }
-  const m = e.m;
-  const maps = { base_color: m.map, normal: m.normalMap, orm: m.roughnessMap ?? m.metalnessMap };
-  const mine = new Set(Object.values(maps).filter(Boolean));
+  const maps = e.maps;
   const drawn = {};
-  for (const [ch, t] of Object.entries(maps)) drawn[ch] = putTexture(ch, t?.image ?? null);
-  // Levels reuse the original's textures (material clones share them), so meshes match by texture.
-  const keep = (mat) => [mat.map, mat.normalMap, mat.roughnessMap, mat.metalnessMap].some((t) => t && mine.has(t));
-  const tris = drawUvs(drawn.base_color ?? drawn.normal ?? drawn.orm, l?.object, keep);
-  const img = (m.map ?? m.normalMap ?? m.roughnessMap ?? m.metalnessMap)?.image;
+  for (const [ch, t] of Object.entries(maps)) drawn[ch] = putTexture(ch, t ? drawable(t) : null);
+  // Levels draw with the original's materials by slot: keep the slots sharing a texture with this one.
+  const texIds = (m) => [m.base_color_texture, m.normal_texture, m.metallic_roughness_texture].filter((i) => i >= 0);
+  const mine = new Set(texIds(e.m));
+  const json = original.model.json;
+  const keep = (slot) => !!json[slot] && texIds(json[slot]).some((i) => mine.has(i));
+  const tris = drawUvs(drawn.base_color ?? drawn.normal ?? drawn.orm, l?.model, keep);
+  const img = maps.base_color ?? maps.normal ?? maps.orm;
   const short = [];
   const details = [label(e)];
   if (img?.width) {
@@ -2025,7 +1802,7 @@ function drawTextures(level) {
     return;
   }
   for (const [ch, img] of Object.entries(l.tex)) putTexture(ch, img);
-  drawUvs($("#tex-base_color"), l.object);
+  drawUvs($("#tex-base_color"), l.model);
   const i = l.info;
   const shared = i?.kind === "shared";
   // A recut's levels carry labels; a shared chain's do not.
@@ -2089,7 +1866,6 @@ document.addEventListener("keydown", (e) => {
 });
 
 $("#home").addEventListener("click", () => home());
-canvas.addEventListener("dblclick", () => home());
 
 function setMode(m) {
   mode = m;
@@ -2098,11 +1874,12 @@ function setMode(m) {
   // Auto mode orbits the model's center: switch distances are measured from there, and zooming
   // out around a panned-away target would leave the model behind.
   const auto = m === "auto";
-  controls.enablePan = !auto;
-  if (auto && original) {
-    const shift = original.center.clone().sub(controls.target);
-    controls.target.add(shift);
-    camera.position.add(shift);
+  if (orbit) {
+    orbit.panEnabled = !auto;
+    if (auto && original) {
+      syncFocus();
+      orbit.recenter();
+    }
   }
   $("#dist-wrap").hidden = !auto;
 }
@@ -2110,11 +1887,9 @@ for (const b of document.querySelectorAll("[data-mode]")) b.addEventListener("cl
 
 $("#wire").addEventListener("change", (e) => {
   wireOn = e.target.checked;
-  for (const l of levels) if (l?.object) setWire(l.object);
 });
 $("#seams").addEventListener("change", (e) => {
   seamOn = e.target.checked;
-  for (const l of levels) if (l?.object) setWire(l.object);
 });
 
 // ---------------------------------------------------------------- options
@@ -2124,6 +1899,8 @@ function readOptions() {
   return {
     levels: +f.levels.value,
     step: +f.step.value,
+    spacing: f.spacing.value,
+    error_ratio: +f.error_ratio.value,
     bake_from: +f.bake_from.value,
     atlas: +f.atlas.value,
     supersample: +f.supersample.value,
@@ -2223,7 +2000,7 @@ function syncViewHint() {
       "screen or half of it; scenery that stays in the distance a tenth or less.";
     return;
   }
-  const ppu = h / (2 * d * Math.tan(THREE.MathUtils.degToRad(fov) / 2));
+  const ppu = h / (2 * d * Math.tan(((fov * Math.PI) / 180) / 2));
   const px = assetInfo ? assetInfo.diagonal * ppu : 0;
   if (density) {
     const there = assetInfo
@@ -2249,7 +2026,7 @@ function syncViewHint() {
 function applyViewPreset() {
   const f = form.elements;
   if (f.view_preset.value === "custom") return;
-  const tan = Math.tan(THREE.MathUtils.degToRad(+f.view_fov.value) / 2);
+  const tan = Math.tan(((+f.view_fov.value * Math.PI) / 180) / 2);
   if (f.view_preset.value === "density") {
     // The distance at which a screen pixel covers one texel of that density.
     const ppm = +f.view_density.value;
@@ -2296,6 +2073,10 @@ function syncOutputs() {
   lastLevels = n;
   f.levels_out.value = String(n);
   f.step_out.value = `${Math.round(+f.step.value * 100)}%`;
+  f.error_ratio_out.value = `${+f.error_ratio.value}×`;
+  const byError = f.spacing.value === "error";
+  for (const el of form.querySelectorAll(".by-error")) el.hidden = !byError;
+  for (const el of form.querySelectorAll(".by-triangles")) el.hidden = byError;
   f.supersample_out.value = `${f.supersample.value}×${f.supersample.value}`;
   f.preset_ratio_out.value = `${Math.round(+f.preset_ratio.value * 100)}%`;
   f.texture_sharpen_out.value = f.texture_sharpen.value === "0" ? "off" : f.texture_sharpen.value;

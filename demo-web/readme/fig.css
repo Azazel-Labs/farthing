@@ -1,0 +1,22 @@
+/* Shared look for the README figures: the palette and type of the hero. */
+:root {
+  --bg: #111013; --panel: #19171a; --ink: #f3efe7; --muted: #a29c94; --faint: #6d6862;
+  --accent: #d68a4c; --cool: #7f9bb8; --rule: rgba(243, 239, 231, 0.12);
+}
+:root.light {
+  --bg: #f5f1e9; --panel: #ece6db; --ink: #1c1a18; --muted: #6b655d; --faint: #9a938a;
+  --accent: #a8561f; --cool: #4f6d8c; --rule: rgba(28, 26, 24, 0.14);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--bg); color: var(--ink); font-family: Inter, system-ui, sans-serif; overflow: hidden;
+  padding: 40px 48px 32px; }
+h1 { font-family: Fraunces, serif; font-weight: 600; font-size: 40px; line-height: 1.05; letter-spacing: -0.02em;
+  margin: 0; font-variation-settings: "opsz" 96; }
+h1 em { font-style: italic; font-weight: 500; color: var(--accent); font-variation-settings: "opsz" 96, "WONK" 0; }
+.sub { color: var(--muted); font-size: 17px; line-height: 1.45; margin: 10px 0 0; max-width: 1060px; }
+.sub b { color: var(--ink); font-weight: 500; }
+.foot { margin-top: 30px; padding-top: 14px; border-top: 1px solid var(--rule); color: var(--faint);
+  font-family: "JetBrains Mono", monospace; font-size: 12px; line-height: 1.5; }
+.mono { font-family: "JetBrains Mono", monospace; }
+.hl { color: var(--accent); }

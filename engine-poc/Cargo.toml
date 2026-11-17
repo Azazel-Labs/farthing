@@ -1,6 +1,6 @@
 [package]
 name = "farthing-poc-engine"
-description = "Proof-of-concept wgpu engine: a RenderHost with its own material system, used to prove the farthing boundary end to end."
+description = "Proof-of-concept wgpu engine: a RenderHost with its own material system, used to prove the farthing boundary end to end, and the web demo's viewer."
 version = "0.17.0"
 edition = "2024"
 license = "MIT-0"
@@ -9,15 +9,51 @@ publish = false
 # Deliberately its own workspace: it may only use farthing's public API.
 [workspace]
 
+[lib]
+name = "farthing_poc_engine"
+# cdylib: the web viewer (`build-web.sh`); rlib: the native binary.
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "farthing-poc-engine"
+path = "src/main.rs"
+required-features = ["native"]
+
+[features]
+default = ["native"]
+# The headless modes: baking, impostors, scoring, the README images.
+native = ["dep:pollster", "dep:serde_json", "farthing/io"]
+# The canvas viewer the web demo draws with (wasm32 only). WebGPU only, unless `webgl` too.
+web = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
+webgl = ["web", "wgpu/webgl"]
+
 [dependencies]
-farthing = { path = "../crates/farthing" }
-wgpu = "30"
-pollster = "0.4"
+farthing = { path = "../crates/farthing", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1"
-serde_json = "1"
+pollster = { version = "0.4", optional = true }
+serde_json = { version = "1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wgpu = "30"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# WebGPU through the browser: no wgpu-core or naga in the module.
+wgpu = { version = "30", default-features = false, features = ["std", "wgsl", "webgpu"] }
+# Must match the installed wasm-bindgen CLI exactly, as the demo's pin does.
+wasm-bindgen = { version = "=0.2.129", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["HtmlCanvasElement"] }
 
 [profile.dev]
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
+
+# The web viewer's build: small over fast.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

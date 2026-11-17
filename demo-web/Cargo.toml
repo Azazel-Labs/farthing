@@ -25,6 +25,17 @@ serde_json = "1"
 # Decompression only (zipped .gltf + .bin + textures); pure Rust, builds for wasm32.
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The README figures (`examples/readme.rs`): the engine the page draws with, offscreen.
+farthing-poc-engine = { path = "../engine-poc", optional = true }
+
+[features]
+readme = ["dep:farthing-poc-engine"]
+
+[[example]]
+name = "readme"
+required-features = ["readme"]
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Must match the installed wasm-bindgen CLI exactly (`wasm-bindgen --version`).
 wasm-bindgen = "=0.2.129"

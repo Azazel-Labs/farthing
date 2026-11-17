@@ -37,7 +37,11 @@ pub fn torus_knot(tubular: u32, radial: u32, p: f32, q: f32, radius: f32, tube: 
     let curve = |u: f32| {
         let qu = q * u;
         let r = radius * (2.0 + qu.cos()) * 0.5;
-        Vec3::new(r * (p * u).cos(), r * (p * u).sin(), radius * qu.sin() * 0.5)
+        Vec3::new(
+            r * (p * u).cos(),
+            r * (p * u).sin(),
+            radius * qu.sin() * 0.5,
+        )
     };
     let m = grid_mesh(tubular, radial, |i, j| {
         let u = i as f32 / tubular as f32 * std::f32::consts::TAU;
@@ -60,7 +64,9 @@ pub fn bumpy_sphere(seg: u32, rings: u32, radius: f32) -> Mesh {
     let mut m = grid_mesh(seg, rings, |i, j| {
         let th = j as f32 / rings as f32 * std::f32::consts::PI;
         let ph = i as f32 / seg as f32 * std::f32::consts::TAU;
-        let bump = 1.0 + 0.06 * (5.0 * th).sin() * (4.0 * ph).sin() + 0.03 * (13.0 * th).cos() * (9.0 * ph).cos();
+        let bump = 1.0
+            + 0.06 * (5.0 * th).sin() * (4.0 * ph).sin()
+            + 0.03 * (13.0 * th).cos() * (9.0 * ph).cos();
         let r = radius * bump;
         if j == 0 {
             return (Vec3::new(0.0, radius, 0.0), Vec3::Y);
@@ -117,11 +123,19 @@ pub fn cube(size: f32) -> Mesh {
 /// Builds the demo scene and registers its two procedural materials with the engine.
 pub fn demo_scene(engine: &mut Engine) -> Scene {
     let marble = engine.add_material(
-        MaterialDef::Marble { a: Vec4::new(0.92, 0.90, 0.85, 1.0), b: Vec4::new(0.12, 0.22, 0.45, 1.0), scale: 7.0 },
+        MaterialDef::Marble {
+            a: Vec4::new(0.92, 0.90, 0.85, 1.0),
+            b: Vec4::new(0.12, 0.22, 0.45, 1.0),
+            scale: 7.0,
+        },
         MaterialInfo::default(),
     );
     let checker = engine.add_material(
-        MaterialDef::Checker { a: Vec4::new(0.95, 0.50, 0.12, 1.0), b: Vec4::new(0.12, 0.10, 0.09, 1.0), scale: 5.0 },
+        MaterialDef::Checker {
+            a: Vec4::new(0.95, 0.50, 0.12, 1.0),
+            b: Vec4::new(0.12, 0.10, 0.09, 1.0),
+            scale: 5.0,
+        },
         MaterialInfo::default(),
     );
     let knot = torus_knot(384, 40, 2.0, 3.0, 1.0, 0.28);
@@ -131,11 +145,35 @@ pub fn demo_scene(engine: &mut Engine) -> Scene {
     hidden.material_ids.iter_mut().for_each(|m| *m = 1);
     Scene {
         meshes: vec![knot, sphere, hidden],
-        materials: vec![MaterialSlot { name: "marble".into(), id: marble }, MaterialSlot { name: "checker".into(), id: checker }],
+        materials: vec![
+            MaterialSlot {
+                name: "marble".into(),
+                id: marble,
+            },
+            MaterialSlot {
+                name: "checker".into(),
+                id: checker,
+            },
+        ],
         instances: vec![
-            Instance { name: "knot".into(), mesh: 0, transform: Mat4::from_translation(Vec3::new(-1.35, 0.0, 0.0)), skeleton: None },
-            Instance { name: "sphere".into(), mesh: 1, transform: Mat4::from_translation(Vec3::new(1.35, 0.0, 0.0)), skeleton: None },
-            Instance { name: "hidden_cube".into(), mesh: 2, transform: Mat4::from_translation(Vec3::new(1.35, 0.0, 0.0)), skeleton: None },
+            Instance {
+                name: "knot".into(),
+                mesh: 0,
+                transform: Mat4::from_translation(Vec3::new(-1.35, 0.0, 0.0)),
+                skeleton: None,
+            },
+            Instance {
+                name: "sphere".into(),
+                mesh: 1,
+                transform: Mat4::from_translation(Vec3::new(1.35, 0.0, 0.0)),
+                skeleton: None,
+            },
+            Instance {
+                name: "hidden_cube".into(),
+                mesh: 2,
+                transform: Mat4::from_translation(Vec3::new(1.35, 0.0, 0.0)),
+                skeleton: None,
+            },
         ],
         skeletons: Vec::new(),
     }
@@ -145,11 +183,19 @@ pub fn demo_scene(engine: &mut Engine) -> Scene {
 /// geometry triangle LODs handle worst (thousands of disconnected parts).
 pub fn bush(engine: &mut Engine, leaves: usize) -> Scene {
     let leaf_mat = engine.add_material(
-        MaterialDef::Marble { a: Vec4::new(0.35, 0.62, 0.18, 1.0), b: Vec4::new(0.08, 0.25, 0.06, 1.0), scale: 9.0 },
+        MaterialDef::Marble {
+            a: Vec4::new(0.35, 0.62, 0.18, 1.0),
+            b: Vec4::new(0.08, 0.25, 0.06, 1.0),
+            scale: 9.0,
+        },
         MaterialInfo::default(),
     );
     let bark = engine.add_material(
-        MaterialDef::Checker { a: Vec4::new(0.40, 0.27, 0.15, 1.0), b: Vec4::new(0.25, 0.16, 0.08, 1.0), scale: 12.0 },
+        MaterialDef::Checker {
+            a: Vec4::new(0.40, 0.27, 0.15, 1.0),
+            b: Vec4::new(0.25, 0.16, 0.08, 1.0),
+            scale: 12.0,
+        },
         MaterialInfo::default(),
     );
     let mut rng = 0x1234_5678_9abc_def0u64;
@@ -212,8 +258,22 @@ pub fn bush(engine: &mut Engine, leaves: usize) -> Scene {
     m.material_ids = mats;
     Scene {
         meshes: vec![m],
-        materials: vec![MaterialSlot { name: "leaf".into(), id: leaf_mat }, MaterialSlot { name: "bark".into(), id: bark }],
-        instances: vec![Instance { name: "bush".into(), mesh: 0, transform: Mat4::IDENTITY, skeleton: None }],
+        materials: vec![
+            MaterialSlot {
+                name: "leaf".into(),
+                id: leaf_mat,
+            },
+            MaterialSlot {
+                name: "bark".into(),
+                id: bark,
+            },
+        ],
+        instances: vec![Instance {
+            name: "bush".into(),
+            mesh: 0,
+            transform: Mat4::IDENTITY,
+            skeleton: None,
+        }],
         skeletons: Vec::new(),
     }
 }
@@ -258,13 +318,25 @@ pub fn vase(engine: &mut Engine) -> Scene {
     }
     m.compute_normals(50.0);
     let marble = engine.add_material(
-        MaterialDef::Marble { a: Vec4::new(0.85, 0.80, 0.70, 1.0), b: Vec4::new(0.45, 0.12, 0.10, 1.0), scale: 5.0 },
+        MaterialDef::Marble {
+            a: Vec4::new(0.85, 0.80, 0.70, 1.0),
+            b: Vec4::new(0.45, 0.12, 0.10, 1.0),
+            scale: 5.0,
+        },
         MaterialInfo::default(),
     );
     Scene {
         meshes: vec![m],
-        materials: vec![MaterialSlot { name: "vase".into(), id: marble }],
-        instances: vec![Instance { name: "vase".into(), mesh: 0, transform: Mat4::IDENTITY, skeleton: None }],
+        materials: vec![MaterialSlot {
+            name: "vase".into(),
+            id: marble,
+        }],
+        instances: vec![Instance {
+            name: "vase".into(),
+            mesh: 0,
+            transform: Mat4::IDENTITY,
+            skeleton: None,
+        }],
         skeletons: Vec::new(),
     }
 }

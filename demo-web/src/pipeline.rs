@@ -102,6 +102,21 @@ pub enum TextureMode {
     Recut,
 }
 
+/// How a chain's reduced levels are spaced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LevelSpacing {
+    /// Each level keeps [`LodOptions::step`] of the triangles, compounded; the chain stops at
+    /// the first level past [`LodOptions::max_error`].
+    #[default]
+    Triangles,
+    /// Each level is reduced until it deviates a set amount: the last reaches
+    /// [`LodOptions::max_error`], and each one before deviates [`LodOptions::error_ratio`]
+    /// times less. Screen-space error shrinks with distance, so the switch distances grow by
+    /// the same ratio. Triangle counts follow from the model.
+    Error,
+}
+
 /// How the levels after the first atlas level (a recut's LOD0, a shared chain's LOD1, the
 /// first proxy) size their textures.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
@@ -133,6 +148,10 @@ pub struct LodOptions {
     pub max_error: f32,
     /// Triangle ratio between consecutive levels.
     pub step: f32,
+    /// Whether levels are spaced by triangle count or by deviation.
+    pub spacing: LevelSpacing,
+    /// [`LevelSpacing::Error`]: how many times as far each level may deviate as the one before.
+    pub error_ratio: f32,
     pub fast: bool,
     pub strict_seams: bool,
     pub symmetry: bool,
@@ -212,6 +231,8 @@ impl Default for LodOptions {
             levels: 4,
             max_error: 0.0,
             step: 0.5,
+            spacing: LevelSpacing::Triangles,
+            error_ratio: 2.0,
             fast: false,
             strict_seams: false,
             symmetry: false,
@@ -251,8 +272,33 @@ impl Default for LodOptions {
 impl LodOptions {
     /// Whether level `level`, measuring `error` (world units), ends the chain: it is past
     /// [`max_error`](Self::max_error) of `diagonal`, and not the first level.
+    /// Error spacing sets every level's deviation instead, so nothing is past it.
     pub(crate) fn past_max_error(&self, level: usize, error: f32, diagonal: f32) -> bool {
-        level > 1 && self.max_error > 0.0 && error > self.max_error * diagonal
+        self.spacing == LevelSpacing::Triangles
+            && level > 1
+            && self.max_error > 0.0
+            && error > self.max_error * diagonal
+    }
+
+    /// [`LevelSpacing::Error`]: the deviations (world units, ascending) of the reduced levels
+    /// after one that deviates `floor`: up to `n` of them, the last at
+    /// [`max_error`](Self::max_error) of `diagonal` (2% when that is 0), each one before
+    /// [`error_ratio`](Self::error_ratio) times less. Fewer when the floor leaves no room: the
+    /// first must deviate at least the ratio's square root times the floor, so it is a level
+    /// apart. `None` with triangle spacing.
+    pub(crate) fn error_targets(&self, n: usize, floor: f32, diagonal: f32) -> Option<Vec<f32>> {
+        if self.spacing != LevelSpacing::Error {
+            return None;
+        }
+        let ratio = self.error_ratio.clamp(1.25, 8.0);
+        let max = if self.max_error > 0.0 {
+            self.max_error
+        } else {
+            0.02
+        } * diagonal;
+        let mut targets: Vec<f32> = (0..n as i32).rev().map(|k| max / ratio.powi(k)).collect();
+        targets.retain(|&t| t >= floor * ratio.sqrt());
+        Some(targets)
     }
 
     /// Pixels per radian of the view: `view_height` pixels over `view_fov` degrees (the
@@ -516,9 +562,13 @@ pub enum Buffer {
 pub enum Event<'a> {
     /// What the pipeline is doing now, for a status line.
     Stage(&'a str),
-    /// A level is done. `glb` is empty for level 0 (the page already has the original).
-    /// Reduced levels carry no textures; their materials are the original's, by index.
-    Level { info: &'a LevelInfo, glb: &'a [u8] },
+    /// A level is done, with what the viewer draws (see [`scene_payload`]): `None` for level 0
+    /// (the page already has the original). Reduced levels carry no textures; their materials
+    /// are the original's, by slot.
+    Level {
+        info: &'a LevelInfo,
+        scene: Option<(&'a Scene, &'a ExportTextures)>,
+    },
     /// A baked texture (sRGB base color, tangent-space normal as 0..1, or glTF ORM data),
     /// RGBA8 rows.
     Texture {
@@ -654,6 +704,16 @@ impl Demo {
     /// model.
     pub fn original_glb(&self) -> Result<Vec<u8>, String> {
         self.level_glb(0, true)
+    }
+
+    /// A level of the last run (0 = the original) as the viewer takes it: see
+    /// [`scene_payload`].
+    pub fn level_scene(&self, level: usize) -> Result<(serde_json::Value, Vec<Buffer>), String> {
+        let (s, t) = self
+            .levels
+            .get(level)
+            .ok_or_else(|| format!("no level {level}; run first"))?;
+        Ok(scene_payload(s, t))
     }
 
     /// A level of the last run as a self-contained GLB: compact (quantized and
@@ -793,7 +853,7 @@ impl Demo {
         }
         emit(Event::Level {
             info: &info,
-            glb: &[],
+            scene: None,
         });
         if opts.textures == TextureMode::Recut {
             self.shared_levels(opts, true, levels + 2, now, emit)?;
@@ -815,21 +875,33 @@ impl Demo {
             emit(Event::Stage("done"));
             return Ok(());
         }
+        // Error spacing: every reduced level's deviation, from the original's.
+        let targets = opts.error_targets(levels, 0.0, diag);
+        let goal = |level: usize| targets.as_ref().map(|t| t.get(level - 1).copied());
+        let mut prev_error = 0.0;
         let first_reduced = if shared { bake_from } else { 1 };
         for level in first_reduced..bake_from {
+            let goal = match goal(level) {
+                Some(None) => break, // no room for another level apart
+                Some(g) => g,
+                None => None,
+            };
             emit(Event::Stage(&format!("LOD{level}: reducing")));
             let t0 = now();
             let ratio = step.powi((level - from_level) as i32);
-            let limit = visible.filter(|_| level == 1);
-            let ((next, s, d), _) = fit_visible(limit, |k| {
+            let limit = goal.or(visible.filter(|_| level == 1));
+            let ((next, s, d), _) = fit_visible(limit, goal.is_some(), |k| {
                 let mut next = Vec::with_capacity(prev.len());
                 let mut extended = false;
                 for (mi, (mesh, error)) in prev.iter().enumerate() {
-                    let target = ((from[mi] as f32 * ratio) as usize).max(1);
+                    let target = match goal {
+                        Some(_) => mesh.triangle_count(),
+                        None => ((from[mi] as f32 * ratio) as usize).max(1),
+                    };
                     // In mesh units: the largest instance scale turns them into world units.
                     let limit = limit
                         .filter(|_| mesh_scale[mi] > 0.0)
-                        .map(|v| k * v / mesh_scale[mi]);
+                        .map(|v| remaining(k * v, prev_error) / mesh_scale[mi]);
                     let (m, e, x) = reduce_to(mesh, &base, target, limit).map_err(err)?;
                     extended |= x;
                     next.push((m, error + e));
@@ -846,6 +918,7 @@ impl Demo {
                 return Ok(());
             }
             prev = next;
+            prev_error = d.hausdorff;
             if limit.is_some() {
                 from = prev.iter().map(|(m, _)| m.triangle_count()).collect();
                 from_level = 1;
@@ -856,14 +929,15 @@ impl Demo {
                 .enumerate()
                 .map(|(mi, p)| p.1 * mesh_scale[mi])
                 .fold(0.0, f32::max);
-            let glb = compact_glb(&s, &ExportTextures::default()).map_err(err)?;
+            let none = ExportTextures::default();
+            let glb = compact_glb(&s, &none).map_err(err)?;
             let ms = now() - t0;
             let mut info = level_info(level, LevelKind::Reduced, &s, Some(&d), bound, ms);
             info.bytes = Some(glb.len());
             info.texture_bytes = Some(original_bytes);
             emit(Event::Level {
                 info: &info,
-                glb: &glb,
+                scene: Some((&s, &none)),
             });
             self.levels.push((s, original_textures(&self.materials)));
         }
@@ -892,17 +966,27 @@ impl Demo {
             seams: SeamMode::Permissive,
             ..base.clone()
         };
+        // How far `geo` deviates: it starts from the original, not the near levels.
+        let mut geo_measured = 0.0;
         for level in bake_from..=levels {
+            let goal = match goal(level) {
+                Some(None) => break, // no room for another level apart
+                Some(g) => g,
+                None => None,
+            };
             let t0 = now();
             emit(Event::Stage(&format!("LOD{level}: reducing")));
             let ratio = step.powi((level - far_from.1) as i32);
-            let target = ((far_from.0 as f32 * ratio) as usize).max(4);
-            let limit = visible.filter(|_| level == 1);
+            let target = match goal {
+                Some(_) => geo.triangle_count(),
+                None => ((far_from.0 as f32 * ratio) as usize).max(4),
+            };
+            let limit = goal.or(visible.filter(|_| level == 1));
             // Measured before the unwrap (which only splits vertices), so a budget can size the
             // atlas for the distance the level appears at.
-            let ((m, e, mesh, d), error) = fit_visible(limit, |k| {
-                let (m, e, x) =
-                    reduce_to(&geo, &far_base, target, limit.map(|v| k * v)).map_err(err)?;
+            let ((m, e, mesh, d), error) = fit_visible(limit, goal.is_some(), |k| {
+                let l = limit.map(|v| remaining(k * v, geo_measured));
+                let (m, e, x) = reduce_to(&geo, &far_base, target, l).map_err(err)?;
                 let mut mesh = m.clone();
                 mesh.compute_normals(60.0);
                 let d = measure(&Scene::from_mesh(mesh.clone()));
@@ -914,6 +998,7 @@ impl Demo {
             }
             geo = m;
             geo_error += e;
+            geo_measured = error;
 
             emit(Event::Stage(&format!("LOD{level}: unwrapping UVs")));
             // With a budget: a texel per pixel where the level first shows, at its switch
@@ -972,7 +1057,8 @@ impl Demo {
             let mut s = Scene::from_mesh(mesh);
             s.materials[0].name = "baked".into();
             let cooked = cook_level(level, &s, &tex, opts, now, emit)?;
-            let glb = compact_glb(&s, cooked.as_ref().map_or(&tex, |c| &c.1)).map_err(err)?;
+            let shown = cooked.as_ref().map_or(&tex, |c| &c.1);
+            let glb = compact_glb(&s, shown).map_err(err)?;
             let ms = now() - t0;
             let mut info = level_info(level, LevelKind::Baked, &s, Some(&d), geo_error, ms);
             info.coverage = Some(coverage);
@@ -983,13 +1069,13 @@ impl Demo {
             info.atlas_width = Some(w);
             info.atlas_height = Some(h);
             info.texture_halvings = (halved > 0).then_some(halved);
-            if let Some((c, _)) = cooked {
+            if let Some((c, _)) = &cooked {
                 info.cooked = Some(c.info.clone());
-                self.cooked.insert(level, c);
+                self.cooked.insert(level, c.clone());
             }
             emit(Event::Level {
                 info: &info,
-                glb: &glb,
+                scene: Some((&s, shown)),
             });
             self.levels.push((s, tex));
         }
@@ -1155,6 +1241,14 @@ impl Demo {
         // Steps compound from the original (a recut's LOD0 is a step of none), or with a
         // budget from the first level.
         let mut from = (input_tris, usize::from(recut));
+        // Error spacing: a shared chain's levels from the original (as `run_chain`'s far levels
+        // count them), a recut's after LOD0, once LOD0's own deviation is known.
+        let mut targets = if recut {
+            None
+        } else {
+            opts.error_targets(opts.levels.clamp(1, 8), 0.0, diag)
+        };
+        let mut prev_error = 0.0;
         // Later levels' textures: how many times halved, the level whose GLB carries them, and
         // the textures. The halvings only grow, so equal ones share the carrier's.
         let density = atlas_density(&mesh, w, h);
@@ -1164,14 +1258,26 @@ impl Demo {
         let mut cooked: Option<(Arc<Cooked>, ExportTextures)> = None;
         for level in 1..end {
             emit(Event::Stage(&format!("{}: reducing", name(level))));
+            let goal = match &targets {
+                // A recut's LOD0 keeps its own limit.
+                Some(t) if !(recut && level == 1) => match t.get(level - 1 - usize::from(recut)) {
+                    Some(&g) => Some(g),
+                    None => return Ok(true), // no room for another level apart
+                },
+                _ => None,
+            };
             let ratio = step.powi((level - from.1) as i32);
-            let target = ((from.0 as f32 * ratio) as usize).max(4);
-            let limit = allowed.filter(|_| level == 1);
-            let ((m, e, s, d), error) = fit_visible(limit, |k| {
+            let target = match goal {
+                Some(_) => mesh.triangle_count(),
+                None => ((from.0 as f32 * ratio) as usize).max(4),
+            };
+            let limit = goal.or(allowed.filter(|_| level == 1));
+            let ((m, e, s, d), error) = fit_visible(limit, goal.is_some(), |k| {
                 let (m, e, x) = if limit.is_none() && target >= mesh.triangle_count() {
                     (mesh.clone(), 0.0, false)
                 } else {
-                    reduce_to(&mesh, &base, target, limit.map(|v| k * v)).map_err(err)?
+                    let l = limit.map(|v| remaining(k * v, prev_error));
+                    reduce_to(&mesh, &base, target, l).map_err(err)?
                 };
                 let mut t = m.clone();
                 compute_tangents(&mut t, 0).map_err(err)?;
@@ -1185,8 +1291,12 @@ impl Demo {
             }
             mesh = m;
             error_bound += e;
+            prev_error = error;
             if limit.is_some() {
                 from = (mesh.triangle_count(), 1);
+            }
+            if recut && level == 1 {
+                targets = opts.error_targets(end.saturating_sub(2), error, diag);
             }
             let k = opts.halvings(level, 1, error, density, shrunk.0, w.min(h));
             if k != shrunk.0 {
@@ -1205,12 +1315,13 @@ impl Demo {
             if level == carrier {
                 cooked = cook_level(level, &s, ltex, opts, now, emit)?;
             }
-            let glb = if level == carrier {
-                compact_glb(&s, cooked.as_ref().map_or(ltex, |c| &c.1))
+            let none = ExportTextures::default();
+            let shown = if level == carrier {
+                cooked.as_ref().map_or(ltex, |c| &c.1)
             } else {
-                compact_glb(&s, &ExportTextures::default())
-            }
-            .map_err(err)?;
+                &none
+            };
+            let glb = compact_glb(&s, shown).map_err(err)?;
             let ms = now() - t0;
             let mut info = LevelInfo {
                 triangles: s.triangle_count(),
@@ -1254,7 +1365,7 @@ impl Demo {
             info.set_distance(&d, diag);
             emit(Event::Level {
                 info: &info,
-                glb: &glb,
+                scene: Some((&s, shown)),
             });
             self.levels.push((s, ltex.clone()));
             t0 = now();
@@ -1369,6 +1480,13 @@ impl Demo {
     }
 }
 
+/// The deviation a further reduction may add to reach `goal`, from a level that already deviates
+/// `already` (the measured distances add at most). At least a tenth of the goal, so a level that
+/// measured near it still reduces a little.
+fn remaining(goal: f32, already: f32) -> f32 {
+    (goal - already).max(0.1 * goal)
+}
+
 /// Reduces `mesh` to `target` triangles, then with `limit` (an estimated deviation, mesh
 /// units) on until the simplifier's estimate reaches it: the coarser of the two. Returns the
 /// mesh, its estimated deviation, and whether the limit took it past the target.
@@ -1423,14 +1541,20 @@ fn reduce_to(
 /// and whether the limit took it past its step. The simplifier's estimate can run well below
 /// the measured Hausdorff distance (thin parts, small pieces), so when the measured deviation
 /// is over a pixel and a quarter, the scale is bisected (a few builds at most) for the coarsest
-/// level that measures within it.
+/// level that measures within it. With `reach` (levels spaced by error, where the limit is the
+/// level's goal), the estimate can also run well above the measurement, so a level that
+/// measures under 70% of its goal is searched upward the same way.
 fn fit_visible<T>(
     limit: Option<f32>,
+    reach: bool,
     mut build: impl FnMut(f32) -> Result<(T, f32, bool), String>,
 ) -> Result<(T, f32), String> {
     let (level, error, extended) = build(1.0)?;
     let v = match limit {
         Some(v) if extended && error > 1.25 * v => 1.25 * v,
+        Some(v) if reach && extended && error < 0.7 * v => {
+            return reach_up(v, (level, error), build);
+        }
         _ => return Ok((level, error)),
     };
     // The finest scale that measured too coarse, and the coarsest that fit.
@@ -1455,6 +1579,34 @@ fn fit_visible<T>(
         };
     }
     Ok(good.map_or(finest, |g| g.1))
+}
+
+/// [`fit_visible`]'s upward search: from a level at scale 1 that measured `fit.1`, well under
+/// the goal `v`, the coarsest level (a few builds at most) that still measures within it.
+fn reach_up<T>(
+    v: f32,
+    fit: (T, f32),
+    mut build: impl FnMut(f32) -> Result<(T, f32, bool), String>,
+) -> Result<(T, f32), String> {
+    let (mut good, mut bad) = ((1.0f32, fit), None::<f32>);
+    let mut k = (v / good.1.1.max(1e-9)).clamp(1.3, 4.0);
+    for _ in 0..3 {
+        let (level, error, _) = build(k)?;
+        if error <= v {
+            good = (k, (level, error));
+            if error >= 0.7 * v {
+                break; // close enough to the goal
+            }
+        } else {
+            bad = Some(k);
+        }
+        k = match bad {
+            Some(b) if b / good.0 < 1.15 => break,
+            Some(b) => (good.0 * b).sqrt(),
+            None => (good.0 * (v / good.1.1.max(1e-9)).clamp(1.3, 4.0)).min(64.0),
+        };
+    }
+    Ok(good.1)
 }
 
 /// The fraction of the artist's texels (area × density², over textured triangles) that a cap
@@ -1689,9 +1841,136 @@ fn encoder(channel: &str, encoding: ChannelEncoding) -> fn(Vec4) -> [u8; 4] {
 }
 
 /// Every GLB the demo produces: quantized, meshopt-compressed and reordered for the GPU's
-/// caches (three.js reads it with `MeshoptDecoder`).
+/// caches. The viewer draws from [`scene_payload`]; the GLB's size is what a level ships.
 pub(crate) fn compact_glb(s: &Scene, t: &ExportTextures) -> farthing::Result<Vec<u8>> {
     glb_bytes_with(s, t, &GlbOptions::compact())
+}
+
+/// A scene as the viewer takes it: JSON naming typed arrays by their index in the buffers,
+/// so the page needs no glTF reader.
+///
+/// * `meshes`: `{positions, normals, uvs, colors, indices, parts}`. Positions and normals are
+///   xyz per vertex, uvs (set 0) uv per vertex and colors linear RGB per vertex, or -1 when the
+///   mesh has none; normals are computed when it has none. `indices` hold the triangles sorted
+///   by material slot, and `parts` are `[first index, index count, slot]`.
+/// * `instances`: `{mesh, matrix}`, the world transform column-major.
+/// * `materials`, one per slot: `{name, base_color, metallic, roughness, cutoff,
+///   base_color_texture, metallic_roughness_texture, normal_texture}` with the export's
+///   defaults, textures by index or -1. Alpha-tested slots are double-sided, as exported.
+/// * `textures`: `{width, height, srgb, rgba}`, RGBA8 rows top to bottom, each one once.
+pub fn scene_payload(s: &Scene, t: &ExportTextures) -> (serde_json::Value, Vec<Buffer>) {
+    use serde_json::json;
+    let mut buffers = Vec::new();
+    let mut push = |b: Buffer| {
+        buffers.push(b);
+        buffers.len() as i64 - 1
+    };
+    let meshes: Vec<_> = s
+        .meshes
+        .iter()
+        .map(|m| {
+            let smoothed;
+            let m = if m.normals.is_none() {
+                let mut c = m.clone();
+                c.compute_normals(60.0);
+                smoothed = c;
+                &smoothed
+            } else {
+                m
+            };
+            let xyz = |v: &[glam::Vec3]| v.iter().flat_map(|p| p.to_array()).collect::<Vec<f32>>();
+            let positions = push(Buffer::F32(xyz(&m.positions)));
+            let normals = push(Buffer::F32(xyz(m.normals.as_deref().unwrap_or_default())));
+            let uvs = m.uvs.first().map_or(-1, |u| {
+                push(Buffer::F32(u.iter().flat_map(|p| p.to_array()).collect()))
+            });
+            let colors = m.colors.as_ref().map_or(-1, |c| {
+                push(Buffer::F32(
+                    c.iter().flat_map(|c| c.truncate().to_array()).collect(),
+                ))
+            });
+            let slot = |t: u32| m.material_ids.get(t as usize).copied().unwrap_or(0);
+            let mut order: Vec<u32> = (0..(m.indices.len() / 3) as u32).collect();
+            order.sort_by_key(|&t| slot(t));
+            let mut indices = Vec::with_capacity(m.indices.len());
+            let mut parts = Vec::new();
+            for run in order.chunk_by(|&a, &b| slot(a) == slot(b)) {
+                parts.push([indices.len() as u32, run.len() as u32 * 3, slot(run[0])]);
+                for &t in run {
+                    indices.extend_from_slice(&m.indices[t as usize * 3..t as usize * 3 + 3]);
+                }
+            }
+            let indices = push(Buffer::U32(indices));
+            json!({
+                "positions": positions,
+                "normals": normals,
+                "uvs": uvs,
+                "colors": colors,
+                "indices": indices,
+                "parts": parts,
+            })
+        })
+        .collect();
+    let instances: Vec<_> = s
+        .instances
+        .iter()
+        .map(|i| json!({ "mesh": i.mesh, "matrix": i.transform.to_cols_array() }))
+        .collect();
+    let mut textures: Vec<(Texture, bool)> = Vec::new();
+    let mut texture_json = Vec::new();
+    let mut texture = |tex: Option<&Texture>, srgb: bool| -> i64 {
+        let Some(tex) = tex else { return -1 };
+        if let Some(i) = textures
+            .iter()
+            .position(|(t, s)| *s == srgb && t.same_texels(tex))
+        {
+            return i as i64;
+        }
+        textures.push((tex.clone(), srgb));
+        let rgba = push(Buffer::U8(tex.rgba8_as(srgb).into_owned()));
+        texture_json.push(json!({
+            "width": tex.width,
+            "height": tex.height,
+            "srgb": srgb,
+            "rgba": rgba,
+        }));
+        textures.len() as i64 - 1
+    };
+    let materials: Vec<_> = s
+        .materials
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let i = i as u32;
+            let mr_texture = t.metallic_roughness.get(&i);
+            let mr =
+                t.metallic_roughness_factor
+                    .get(&i)
+                    .copied()
+                    .unwrap_or(if mr_texture.is_some() {
+                        Vec2::ONE
+                    } else {
+                        Vec2::new(0.0, 0.8)
+                    });
+            json!({
+                "name": slot.name,
+                "base_color": t.base_color_factor.get(&i).copied().unwrap_or(Vec4::ONE).to_array(),
+                "metallic": mr.x,
+                "roughness": mr.y,
+                "cutoff": t.alpha_cutoff.get(&i),
+                "base_color_texture": texture(t.base_color.get(&i), true),
+                "metallic_roughness_texture": texture(mr_texture, false),
+                "normal_texture": texture(t.normal.get(&i), false),
+            })
+        })
+        .collect();
+    let json = json!({
+        "meshes": meshes,
+        "instances": instances,
+        "materials": materials,
+        "textures": texture_json,
+    });
+    (json, buffers)
 }
 
 /// GPU memory of export textures: RGBA8 with a full mip chain (4/3), each texture counted
