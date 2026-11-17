@@ -76,10 +76,10 @@
             <option value="custom">Custom</option>
           </select>
         </label>
-        <label class="select" title="ClusterOptions::max_triangles: triangles per cluster">Max triangles
+        <label class="select cluster-custom" title="ClusterOptions::max_triangles: triangles per cluster">Max triangles
           <span><input type="number" name="cluster_max_triangles" min="1" max="512" step="1" value="128" style="width: 5em"></span>
         </label>
-        <label class="select" title="ClusterOptions::max_vertices: distinct vertices per cluster (the packed format's u8 micro-indices allow at most 256)">Max vertices
+        <label class="select cluster-custom" title="ClusterOptions::max_vertices: distinct vertices per cluster (the packed format's u8 micro-indices allow at most 256)">Max vertices
           <span><input type="number" name="cluster_max_vertices" min="3" max="256" step="1" value="255" style="width: 5em"></span>
         </label>
         <label class="check" title="ClusterOptions::fast(): quicker build, coarser simplification"><input type="checkbox" name="cluster_fast"> Fast build</label>

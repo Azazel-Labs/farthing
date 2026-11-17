@@ -2092,7 +2092,8 @@ function readOptions() {
   };
 }
 
-/** A cluster layout preset fills in the two limits; it names no engine in the options. */
+/** A cluster layout preset fills in the two limits; it names no engine in the options.
+ *  Custom keeps the limits as they are and shows them for editing. */
 function applyClusterPreset() {
   const f = form.elements;
   const [tris, verts] = f.cluster_preset.value.split("x");
@@ -2101,18 +2102,12 @@ function applyClusterPreset() {
   f.cluster_max_vertices.value = verts;
 }
 
-/** Typed limits show the preset they match, or Custom. */
-function matchClusterPreset() {
-  const f = form.elements;
-  const key = `${+f.cluster_max_triangles.value}x${+f.cluster_max_vertices.value}`;
-  const known = [...f.cluster_preset.options].some((o) => o.value === key);
-  f.cluster_preset.value = known ? key : "custom";
-}
-
 /** Shows the option groups of the chosen example. */
 function syncModeUi() {
   const m = form.elements.mode.value;
   for (const fs of form.querySelectorAll("fieldset[data-modes]")) fs.hidden = !fs.dataset.modes.split(" ").includes(m);
+  const custom = form.elements.cluster_preset.value === "custom";
+  for (const el of form.querySelectorAll(".cluster-custom")) el.hidden = !custom;
   const tex = form.elements.textures.value;
   $("#shared-size").hidden = tex === "original";
   $("#shared-layout").hidden = tex !== "shared";
@@ -2259,6 +2254,12 @@ function restoreOptions() {
   } catch {}
   if (saved) {
     if (saved.version !== STORE_VERSION) delete saved.textures;
+    // Saved without the cluster preset: the one the limits match, else Custom.
+    if (saved.cluster_preset === undefined && saved.cluster_max_triangles !== undefined) {
+      const key = `${saved.cluster_max_triangles}x${saved.cluster_max_vertices}`;
+      const known = [...form.elements.cluster_preset.options].some((o) => o.value === key);
+      saved.cluster_preset = known ? key : "custom";
+    }
     // Saved before the presets: a distance was typed.
     if (saved.view_preset === undefined) saved.view_preset = saved.view_distance > 0 ? "custom" : "0";
     const f = form.elements;
@@ -2269,7 +2270,7 @@ function restoreOptions() {
       else el.value = String(v);
     }
     lastLevels = +f.levels.value;
-    matchClusterPreset();
+    applyClusterPreset();
     syncOutputs();
     if (saved.bake_from !== undefined) f.bake_from.value = String(Math.min(saved.bake_from, lastLevels));
   } else syncOutputs();
@@ -2289,12 +2290,13 @@ form.addEventListener("input", (e) => {
       f.view_density_preset.value = "custom";
     if (name.startsWith("view_density")) f.view_preset.value = "density";
     if (name === "cluster_preset") applyClusterPreset();
-    else if (name === "cluster_max_triangles" || name === "cluster_max_vertices") matchClusterPreset();
     if (["view_preset", "view_fov", "view_height"].includes(name) || name.startsWith("view_density")) applyViewPreset();
   }
   syncOutputs();
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({ ...readOptions(), version: STORE_VERSION }));
+    // The preset is page state only; the run takes the two limits.
+    const cluster_preset = form.elements.cluster_preset.value;
+    localStorage.setItem(STORE_KEY, JSON.stringify({ ...readOptions(), cluster_preset, version: STORE_VERSION }));
   } catch {}
   renderRows();
   clearTimeout(debounce);
