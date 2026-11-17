@@ -412,7 +412,8 @@ fn flat_vec2(v: &[Vec2]) -> Vec<f32> {
 }
 
 /// A cluster DAG and its GPU form per mesh. Sends every cluster's triangles once (all levels)
-/// so the page can draw any cut without asking for geometry again.
+/// so the page can draw any cut without asking for geometry again, and the packed `.fcld`
+/// bytes for the engine's GPU cluster renderer.
 pub(crate) fn run_clusters(
     demo: &mut Demo,
     opts: &LodOptions,
@@ -455,7 +456,12 @@ pub(crate) fn run_clusters(
         let tm = now();
         let dag = build_cluster_dag(mesh, &copts).map_err(err)?;
         let dag_ms = now() - tm;
-        let gpu = GpuClusterDag::from_dag(&dag, mesh, &GpuOptions::default()).map_err(err)?;
+        // 32 KiB pages: fine-grained enough for the GPU renderer to stream.
+        let gpu_opts = GpuOptions {
+            page_size: 32 * 1024,
+            ..GpuOptions::default()
+        };
+        let gpu = GpuClusterDag::from_dag(&dag, mesh, &gpu_opts).map_err(err)?;
         let levels = dag.levels() as usize;
         let mut level_clusters = vec![0usize; levels];
         let mut indices = Vec::new();
@@ -493,6 +499,7 @@ pub(crate) fn run_clusters(
         buffers.push(Buffer::U32(tri_start));
         buffers.push(Buffer::U32(materials));
         buffers.push(Buffer::U32(cluster_level));
+        buffers.push(Buffer::U8(gpu.to_bytes()));
         dags.push(dag);
         gpus.push(gpu);
     }

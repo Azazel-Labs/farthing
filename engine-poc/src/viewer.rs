@@ -6,15 +6,17 @@
 //! metallic-roughness under a procedural room light (`pbr.wgsl`); the overlays drawn over them
 //! are in [`crate::editor_visualizations`].
 
+use crate::clusters::{ClusterDraw, ClusterRenderer, ClusterStats, ClusterView};
 use crate::editor_visualizations::{self as viz, Overlay};
+use farthing::cluster::GpuClusterDag;
 use bytemuck::{Pod, Zeroable};
 use farthing::glam::{Mat3, Mat4, Vec3, Vec4};
 use std::borrow::Cow;
 use std::sync::Arc;
 
-const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+pub(crate) const DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Multisampling: WebGPU guarantees 4× for the canvas formats.
-const SAMPLES: u32 = 4;
+pub(crate) const SAMPLES: u32 = 4;
 
 /// Where the scene is seen from.
 #[derive(Clone, Copy, Debug)]
@@ -146,10 +148,10 @@ struct MaterialU {
     normal_scale: [f32; 4],
 }
 
-struct GpuMaterial {
-    bind: wgpu::BindGroup,
-    blend: bool,
-    double_sided: bool,
+pub(crate) struct GpuMaterial {
+    pub(crate) bind: wgpu::BindGroup,
+    pub(crate) blend: bool,
+    pub(crate) double_sided: bool,
 }
 
 /// Vertices that meshes index into. Meshes hold their own handles, so it can be removed while
@@ -192,12 +194,14 @@ struct GpuSplats {
 enum Drawable {
     Mesh(Box<GpuMesh>),
     Splats(GpuSplats),
+    /// A cluster mesh: its id in [`Viewer::clusters`].
+    Cluster(u32),
 }
 
 /// One mesh or splat cloud to draw this frame, where.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw {
-    /// From [`Viewer::add_mesh`] or [`Viewer::add_splats`].
+    /// From [`Viewer::add_mesh`], [`Viewer::add_splats`] or [`Viewer::add_cluster_mesh`].
     pub mesh: u32,
     pub model: Mat4,
     /// Whether the overlays that are on are drawn over it.
@@ -345,6 +349,8 @@ pub struct Viewer {
     styles: [LineStyle; 2],
     overlays: [bool; 2],
     gaussians: bool,
+    /// Made with the first cluster mesh.
+    clusters: Option<ClusterRenderer>,
 }
 
 fn uniform_layout(device: &wgpu::Device, label: &str, dynamic: bool) -> wgpu::BindGroupLayout {
@@ -649,6 +655,7 @@ impl Viewer {
             ],
             overlays: [false; 2],
             gaussians: true,
+            clusters: None,
         }
     }
 
@@ -1012,7 +1019,97 @@ impl Viewer {
 
     /// Frees a mesh or splat cloud; its id may be reused.
     pub fn remove_mesh(&mut self, id: u32) {
+        if let (Some(Some(Drawable::Cluster(c))), Some(r)) =
+            (self.meshes.get(id as usize), self.clusters.as_mut())
+        {
+            r.remove_mesh(*c);
+        }
         free(&mut self.meshes, id);
+    }
+
+    /// Whether this device can draw cluster meshes (WebGPU or native; not WebGL2).
+    pub fn clusters_supported(&self) -> bool {
+        crate::clusters::supported(&self.device)
+    }
+
+    /// A packed cluster DAG, cut, culled and drawn on the GPU, its pages streamed in as the
+    /// views need them (see `clusters.rs`). Each draw naming it is an instance. Its triangles
+    /// draw with the default material until [`Viewer::set_cluster_materials`]. None when
+    /// [`Viewer::clusters_supported`] is false.
+    pub fn add_cluster_mesh(&mut self, dag: GpuClusterDag) -> Option<u32> {
+        if !self.clusters_supported() {
+            return None;
+        }
+        if self.clusters.is_none() {
+            let default = self.add_material(&Material::default());
+            self.clusters = Some(ClusterRenderer::new(
+                &self.device,
+                self.format,
+                &self.frames.layout,
+                &self.models.layout,
+                &self.material_bgl,
+                default,
+            ));
+        }
+        let c = self.clusters.as_mut()?.add_mesh(dag);
+        Some(insert(&mut self.meshes, Drawable::Cluster(c)))
+    }
+
+    fn cluster_id(&self, id: u32) -> Option<u32> {
+        match self.meshes.get(id as usize) {
+            Some(Some(Drawable::Cluster(c))) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// The material each of a cluster mesh's material ids draws with.
+    pub fn set_cluster_materials(&mut self, id: u32, materials: &[u32]) {
+        if let (Some(c), Some(r)) = (self.cluster_id(id), self.clusters.as_mut()) {
+            r.set_materials(c, materials);
+        }
+    }
+
+    /// How cluster meshes are colored: 0 their materials, 1 a color per cluster, 2 a color
+    /// per DAG level. The colors multiply `material`'s base color (None: the default material).
+    pub fn set_cluster_shading(&mut self, mode: u32, material: Option<u32>) {
+        if let Some(r) = self.clusters.as_mut() {
+            r.set_shading(mode, material);
+        }
+    }
+
+    /// The largest error the cluster cut leaves on screen, in pixels.
+    pub fn set_cluster_threshold(&mut self, pixels: f32) {
+        if let Some(r) = self.clusters.as_mut() {
+            r.set_threshold(pixels);
+        }
+    }
+
+    /// The page pool's size and how many pages may load per frame. A new size starts
+    /// streaming over.
+    pub fn set_cluster_streaming(&mut self, budget_bytes: u64, pages_per_frame: usize) {
+        if let Some(r) = self.clusters.as_mut() {
+            r.set_streaming(budget_bytes, pages_per_frame);
+        }
+    }
+
+    /// Frustum and normal-cone culling of clusters.
+    pub fn set_cluster_culling(&mut self, frustum: bool, cone: bool) {
+        if let Some(r) = self.clusters.as_mut() {
+            r.set_culling(frustum, cone);
+        }
+    }
+
+    /// Keeps the cluster cut and culling where the cameras are now, to look at it from
+    /// elsewhere.
+    pub fn set_cluster_freeze(&mut self, on: bool) {
+        if let Some(r) = self.clusters.as_mut() {
+            r.set_freeze(on);
+        }
+    }
+
+    /// What the cluster cut drew per view and what's resident, a frame or two behind.
+    pub fn cluster_stats(&self) -> Option<ClusterStats> {
+        self.clusters.as_ref().map(ClusterRenderer::stats)
     }
 
     pub fn set_line_style(&mut self, overlay: Overlay, style: LineStyle) {
@@ -1117,6 +1214,8 @@ impl Viewer {
         let mut frames = Vec::new();
         let mut models = Vec::new();
         let mut passes = Vec::new();
+        let mut cluster_views = Vec::new();
+        let wire = self.overlays[0];
         for v in views {
             let [x, y, w, h] = v.rect;
             let (x, y) = (x.min(width - 1), y.min(height - 1));
@@ -1133,9 +1232,18 @@ impl Viewer {
                 focal: [focal, focal, 0.0, 0.0],
             });
             let mut items = Vec::new();
+            let mut cluster_draws = Vec::new();
             for d in v.draws {
                 let det = d.model.determinant();
                 let (pipe, center) = match self.meshes.get(d.mesh as usize) {
+                    Some(Some(Drawable::Cluster(c))) => {
+                        cluster_draws.push(ClusterDraw {
+                            mesh: *c,
+                            model: d.model,
+                            wire: wire && d.overlays,
+                        });
+                        continue;
+                    }
                     Some(Some(Drawable::Mesh(mesh))) => {
                         let Some(Some(mat)) = self.materials.get(mesh.material as usize) else {
                             continue;
@@ -1182,6 +1290,12 @@ impl Viewer {
                     })
             });
             passes.push(([x, y, w, h], items));
+            cluster_views.push(ClusterView {
+                view_proj: v.camera.view_proj(w as f32 / h as f32),
+                eye: v.camera.eye(),
+                ppr: focal,
+                draws: cluster_draws,
+            });
         }
         let frame_bind = self
             .frames
@@ -1193,6 +1307,10 @@ impl Viewer {
             .clone();
         let targets = self.targets.as_ref().expect("render targets");
         let mut enc = self.device.create_command_encoder(&Default::default());
+        if let Some(c) = self.clusters.as_mut() {
+            c.prepare(&self.device, &self.queue, &mut enc, &cluster_views, &self.materials);
+        }
+        let clusters = self.clusters.as_ref();
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewer"),
@@ -1221,6 +1339,12 @@ impl Viewer {
                 pass.set_viewport(*x as f32, *y as f32, *w as f32, *h as f32, 0.0, 1.0);
                 pass.set_scissor_rect(*x, *y, *w, *h);
                 pass.set_bind_group(0, &frame_bind, &[self.frames.offset(vi)]);
+                // Cluster pipelines take a model group they don't read.
+                let clusters = clusters.filter(|c| c.draws_in(vi));
+                if let Some(c) = clusters {
+                    pass.set_bind_group(1, &model_bind, &[0]);
+                    c.draw(&mut pass, vi, false, &self.materials);
+                }
                 let mut bound = None;
                 for item in items {
                     if bound != Some(item.pipe) {
@@ -1254,6 +1378,10 @@ impl Viewer {
                         }
                         _ => {}
                     }
+                }
+                if let Some(c) = clusters {
+                    pass.set_bind_group(1, &model_bind, &[0]);
+                    c.draw(&mut pass, vi, true, &self.materials);
                 }
                 for o in (0..2).filter(|&o| self.overlays[o]) {
                     pass.set_pipeline(&self.lines[o]);
@@ -1293,6 +1421,9 @@ impl Viewer {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
+        if let Some(c) = self.clusters.as_mut() {
+            c.after_submit();
+        }
     }
 }
 
@@ -1406,5 +1537,29 @@ impl Viewer {
         drop(data);
         buf.unmap();
         out
+    }
+
+    /// Waits for the GPU, so the next render streams by everything rendered so far.
+    pub fn settle(&self) {
+        if let Some(c) = &self.clusters {
+            c.settle(&self.device);
+        }
+    }
+
+    /// The clusters the last render drew: per view, (instance, cluster) sorted, where the
+    /// instance counts that view's draws of cluster meshes. For tests.
+    pub fn cluster_visible(&self) -> Vec<Vec<(u32, u32)>> {
+        self.clusters
+            .as_ref()
+            .map(|c| c.read_visible(&self.device, &self.queue))
+            .unwrap_or_default()
+    }
+
+    /// Per page of a cluster mesh, whether it's resident. For tests.
+    pub fn cluster_resident(&self, id: u32) -> Vec<bool> {
+        match (self.cluster_id(id), &self.clusters) {
+            (Some(c), Some(r)) => r.resident(c),
+            _ => Vec::new(),
+        }
     }
 }

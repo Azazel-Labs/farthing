@@ -101,6 +101,13 @@ fn env_brdf(f0: vec3f, rough: f32, nov: f32) -> vec3f {
 
 @fragment
 fn fs_main(in: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec4f {
+    return shade(in, front, obj.normal[3].w);
+}
+
+// The lit surface. `det` is the sign of the model's determinant (its triangles face the other
+// way when mirrored). A zero normal shades flat. Call it from uniform control flow: it takes
+// derivatives.
+fn shade(in: Varyings, front: bool, det: f32) -> vec4f {
     // Everything that needs derivatives first, in uniform control flow.
     let base_s = textureSample(base_tex, samp, in.uv);
     let mr = textureSample(mr_tex, samp, in.uv);
@@ -112,10 +119,11 @@ fn fs_main(in: Varyings, @builtin(front_facing) front: bool) -> @location(0) vec
     let duv1 = dpdx(in.uv);
     let duv2 = dpdy(in.uv);
 
-    let face = select(-1.0, 1.0, front) * obj.normal[3].w;
-    var n = normalize(in.normal) * face;
+    let face = select(-1.0, 1.0, front) * det;
+    let flat = mat.normal_scale.z != 0.0 || dot(in.normal, in.normal) == 0.0;
+    var n = select(normalize(in.normal), vec3f(0.0, 0.0, 1.0), flat) * face;
     let v = normalize(frame.eye.xyz - in.world);
-    if mat.normal_scale.z != 0.0 {
+    if flat {
         // Flat shading: the triangle's own normal, facing the camera.
         let f = normalize(cross(dp1, dp2));
         n = select(-f, f, dot(f, v) >= 0.0);

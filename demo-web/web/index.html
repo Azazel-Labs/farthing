@@ -398,6 +398,22 @@
           </label>
           <label class="check" data-cut="hlod"><input type="checkbox" id="tint"> Tint proxies by tree level</label>
           <label class="check" data-cut="clusters hlod" title="Keep the current cut while you move the camera, to look at it from elsewhere"><input type="checkbox" id="freeze"> Freeze cut</label>
+          <label class="select" data-cut="clusters" data-gpu title="GPU memory for cluster pages. Pages stream in by what the views need most; when it's full the least needed are evicted.">Page pool
+            <select id="pool">
+              <option value="1">1 MB</option>
+              <option value="4">4 MB</option>
+              <option value="16">16 MB</option>
+              <option value="64" selected>64 MB</option>
+              <option value="256">256 MB</option>
+            </select>
+          </label>
+          <label class="range" data-cut="clusters" data-gpu title="The most pages uploaded per frame">
+            Upload per frame <output id="upload-out"></output>
+            <input type="range" id="upload" min="1" max="64" step="1" value="16">
+          </label>
+          <label class="check" data-cut="clusters" data-gpu title="Skip clusters outside the view"><input type="checkbox" id="cull-frustum" checked> Frustum culling</label>
+          <label class="check" data-cut="clusters" data-gpu title="Skip clusters whose triangles all face away (by their normal cones)"><input type="checkbox" id="cull-cone" checked> Back-face culling</label>
+          <label class="check" data-cut="clusters" data-gpu title="Split the view: a second camera circles the model close up. Pages stream for both views at once."><input type="checkbox" id="second-camera"> Second camera</label>
           <label class="select" data-cut="splats">Draw
             <select id="splat-draw">
               <option value="gauss">Gaussians (sorted)</option>

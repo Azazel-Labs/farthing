@@ -419,7 +419,9 @@ function render() {
   const k = dpr();
   const [bw, bh] = [Math.max(1, Math.round(w * k)), Math.max(1, Math.round(h * k))];
   if (canvas.width !== bw || canvas.height !== bh) [canvas.width, canvas.height] = [bw, bh];
-  $("#divider").hidden = mode !== "compare" || !original;
+  // The GPU cluster cut can split the view with a second camera.
+  const second = original && mode !== "compare" && mode !== "auto" && displayed(selected) === 1 ? extra?.second?.() : null;
+  $("#divider").hidden = !(mode === "compare" || second) || !original;
   if (!original) {
     hud("");
     magEl.hidden = true;
@@ -462,10 +464,14 @@ function render() {
     hud(`Auto: ${label(cur)}`, `distance ${dist.toPrecision(3)}${ahead}`);
   } else {
     const shown = displayed(selected);
-    drawView(levels[shown].model, 0, bw, camera);
+    if (second) {
+      const half = Math.round(Math.floor(w / 2) * k);
+      drawView(levels[shown].model, 0, half, camera);
+      drawView(levels[shown].model, half, bw, second);
+    } else drawView(levels[shown].model, 0, bw, camera);
     gpu.endFrame();
     magEl.hidden = true;
-    hud(label(shown));
+    hud(label(shown), second ? "Second camera, circling" : "");
   }
 }
 
@@ -563,6 +569,9 @@ function syncCutPanel() {
   const m = shownMode;
   $("#cut").hidden = !(m === "clusters" || m === "hlod" || m === "splats");
   for (const el of document.querySelectorAll("[data-cut]")) el.hidden = !el.dataset.cut.split(" ").includes(m);
+  // Streaming and culling controls: only the GPU-driven cluster cut has them.
+  for (const el of document.querySelectorAll("[data-gpu]")) el.hidden ||= !extra?.gpu;
+  $("#upload-out").value = $("#upload").value;
   $("#cut-title").textContent = { clusters: "Cluster DAG cut", hlod: "HLOD cut", splats: "Splats" }[m] ?? "";
   $("#threshold-out").value = `${fmtPx(2 ** +$("#threshold").value)} px`;
   $("#bake").hidden = !!m && !(m === "chain" || m === "hlod");
@@ -579,6 +588,7 @@ function cutStats() {
 
 /** Asks the worker for the cut at the current camera, when it changed and none is pending. */
 function requestCut() {
+  if (extra?.live) return extra.live();
   if (!extra || busy || cutInflight || extra.failed || $("#freeze").checked) return;
   const ppr = canvasPpr();
   const threshold = 2 ** +$("#threshold").value;
@@ -647,11 +657,16 @@ function onData(m) {
 
 // ---- cluster DAG
 
-/** Draws any cut of the DAG: every cluster's triangles arrive once, indexing the mesh's vertices. */
+/**
+ * Draws any cut of the DAG: every cluster's triangles arrive once, indexing the mesh's vertices.
+ * With WebGPU the engine cuts, culls and streams the packed DAG itself (buildClustersGpu).
+ */
 function buildClusters(info, buffers) {
   const [xf, instMesh, ...rest] = buffers;
+  const per = (i) => rest.slice(8 * i, 8 * i + 8);
+  if (gpu.gpuClusters) return buildClustersGpu(info, xf, instMesh, per);
   const meshes = info.meshes.map((json, i) => {
-    const [pos, nrm, uv, idx, triStart, mats, clusterLevel] = rest.slice(7 * i, 7 * i + 7);
+    const [pos, nrm, uv, idx, triStart, mats, clusterLevel] = per(i);
     const normal = nrm.length ? nrm : smoothNormals(pos, idx, triStart, clusterLevel);
     const slots = [...new Set(mats)].sort((a, b) => a - b);
     const slotOf = new Map(slots.map((s, k) => [s, k]));
@@ -660,7 +675,7 @@ function buildClusters(info, buffers) {
     const geometry = gpu.addGeometry(pos, normal, uv, EMPTY);
     return { json, pos, normal, geometry, idx, triStart, tk, clusterLevel, slots, scratch: new Uint32Array(idx.length) };
   });
-  const colorMat = gpu.addMaterial(new Float32Array([1, 1, 1, 1, 0, 0.7, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0]), Int32Array.of(-1, -1, -1, -1, -1));
+  const colorMat = CLUSTER_COLOR();
   const instances = Array.from(instMesh, (mi, i) => ({
     mesh: meshes[mi],
     matrix: xf.slice(16 * i, 16 * i + 16),
@@ -752,6 +767,133 @@ function buildClusters(info, buffers) {
     },
     dispose() {}, // level 1 owns the model
   };
+}
+
+const CLUSTER_COLOR = () =>
+  gpu.addMaterial(new Float32Array([1, 1, 1, 1, 0, 0.7, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0]), Int32Array.of(-1, -1, -1, -1, -1));
+
+/**
+ * The GPU-driven cut: each frame the engine runs the LOD cut, frustum and back-face (normal
+ * cone) culling in a compute pass and draws what's left with indirect draws that decode the
+ * vertices straight from the packed pages. Pages stream into a fixed pool by what every view
+ * needs most, so the worker is never asked for a cut.
+ */
+function buildClustersGpu(info, xf, instMesh, per) {
+  const meshes = info.meshes.map((json, i) => {
+    const [, , , , , mats, , fcld] = per(i);
+    let top = 0;
+    for (const s of mats) if (s > top) top = s;
+    return { json, id: gpu.addClusterMesh(fcld), top };
+  });
+  const colorMat = CLUSTER_COLOR();
+  const instances = Array.from(instMesh, (mi, i) => ({ mesh: meshes[mi], matrix: xf.slice(16 * i, 16 * i + 16) }));
+  const fullTris = instances.reduce((a, inst) => a + inst.mesh.json.triangles, 0);
+  const cutInfo = {
+    level: 1,
+    kind: "clusters",
+    label: "Cut",
+    triangles: 0,
+    vertices: 0,
+    full_triangles: fullTris,
+    error: 0,
+    relative_error: 0,
+    error_title: "not measured on the GPU: every drawn cluster's error is under the max on screen",
+    switch_distance_1px: 0,
+    ms: info.ms,
+    bytes: info.gpu_bytes,
+  };
+  const shade = () => {
+    for (const m of meshes) {
+      const mats = Uint32Array.from({ length: m.top + 1 }, (_, k) => original?.model.materials[k] ?? fallback());
+      gpu.setClusterMaterials(m.id, mats);
+    }
+    const mode = { materials: 0, clusters: 1, levels: 2 }[$("#shading").value] ?? 0;
+    gpu.setClusterShading(mode, colorMat);
+  };
+  shade();
+  let latest = null;
+  let statsAt = 0;
+  return {
+    kind: "clusters",
+    gpu: true,
+    /** Each frame, instead of asking the worker: the panel's settings, and the stats now and then. */
+    live() {
+      gpu.setClusterThreshold(2 ** +$("#threshold").value);
+      gpu.setClusterFreeze($("#freeze").checked);
+      gpu.setClusterCulling($("#cull-frustum").checked, $("#cull-cone").checked);
+      gpu.setClusterStreaming(+$("#pool").value * 1e6, +$("#upload").value);
+      const now = performance.now();
+      if (now - statsAt < 250) return;
+      statsAt = now;
+      const j = gpu.clusterStats();
+      latest = j ? JSON.parse(j) : null;
+      const v = latest?.views[0];
+      if (v) Object.assign(cutInfo, { triangles: v.triangles, hud: `${fmtInt(v.clusters)} clusters` });
+      updateRow(1);
+      cutStats();
+    },
+    /** The second camera, when on: circling the model close up. */
+    second() {
+      if (!$("#second-camera").checked || !focus()) return null;
+      const { center, radius } = focus();
+      const d = orbit.homeDistance(radius) * 0.55;
+      const a = performance.now() / 6000;
+      const eye = [center[0] + d * Math.cos(a) * 0.9, center[1] + d * 0.35, center[2] + d * Math.sin(a) * 0.9];
+      return [lookAt(eye, center), orbit.fov, orbit.near, orbit.far];
+    },
+    model: {
+      draws: () => instances.map((inst) => [inst.matrix, inst.mesh.id, true]),
+      dispose() {
+        for (const m of meshes) gpu.removeMesh(m.id);
+        gpu.removeMaterial(colorMat);
+      },
+    },
+    info: cutInfo,
+    cut() {},
+    reshade: shade,
+    stats() {
+      const rows = [["Renderer", "GPU: compute cut and culling, indirect draws from streamed pages"]];
+      const s = latest;
+      if (!s?.views.length) return [...rows, ["Cut", "waiting for the GPU…"]];
+      s.views.forEach((v, k) => {
+        const cam = s.views.length > 1 ? ` (camera ${k + 1})` : "";
+        rows.push([`Drawn${cam}`, `${fmtInt(v.triangles)} of ${fmtInt(fullTris)} tris, ${fmtInt(v.clusters)} clusters`]);
+        rows.push([`Culled${cam}`, `${fmtInt(v.cut - v.clusters)} of ${fmtInt(v.cut)} clusters in the cut`]);
+      });
+      const lv = s.views[0].perLevel;
+      const used = lv.findLastIndex((n) => n > 0) + 1;
+      rows.push(
+        ["By DAG level", lv.slice(0, used).map((n, l) => `L${l}:${n}`).join(" ")],
+        [
+          "Resident",
+          `${fmtInt(s.residentPages)} of ${fmtInt(s.totalPages)} pages, ${fmtBytes(s.residentBytes)} of ${fmtBytes(s.totalBytes)}`,
+        ],
+        ["Page pool", `${fmtBytes(s.poolBytes)}, ${fmtInt(s.poolPages)} pages`],
+        s.requestedPages ? ["Streaming", `${fmtInt(s.requestedPages)} pages wanted`] : ["Streaming", "everything needed is resident", "ok"],
+        ["Uploaded", `${fmtInt(s.loaded)} pages, ${fmtInt(s.evicted)} evicted`],
+        ["DAG", `${info.levels} levels, ${fmtInt(info.all_level_triangles)} tris in all`],
+        ["Cluster size", `≤ ${info.max_triangles} tris, ≤ ${info.max_vertices} verts`],
+        ["Built in", `${(info.ms / 1000).toFixed(2)} s`],
+      );
+      return rows;
+    },
+    dispose() {}, // level 1 owns the model
+  };
+}
+
+/** A right-handed world-to-camera matrix, column-major, looking from `eye` at `at` with +Y up. */
+function lookAt(eye, at) {
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const norm = (a) => {
+    const l = Math.hypot(...a) || 1;
+    return a.map((x) => x / l);
+  };
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const f = norm(sub(at, eye));
+  const r = norm(cross(f, [0, 1, 0]));
+  const u = cross(r, f);
+  return new Float32Array([r[0], u[0], -f[0], 0, r[1], u[1], -f[1], 0, r[2], u[2], -f[2], 0, -dot(r, eye), -dot(u, eye), dot(f, eye), 1]);
 }
 
 /** Area-weighted vertex normals from the full-detail (DAG level 0) clusters. */
@@ -1060,6 +1202,7 @@ $("#threshold").addEventListener("input", () => {
   $("#threshold-out").value = `${fmtPx(2 ** +$("#threshold").value)} px`;
 });
 $("#freeze").addEventListener("change", () => (cutKey = ""));
+$("#upload").addEventListener("input", () => ($("#upload-out").value = $("#upload").value));
 $("#shading").addEventListener("change", () => extra?.reshade?.());
 $("#splat-draw").addEventListener("change", () => {
   for (const l of levels) if (l?.model?.splat) l.model.splat.key = "";

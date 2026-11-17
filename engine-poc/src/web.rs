@@ -1,7 +1,7 @@
 //! The browser side: a [`Viewer`] drawing into a canvas, for the web demo.
 //!
 //! The page creates one with `createView(canvas)`, uploads textures, materials, geometries,
-//! meshes and splat clouds as typed arrays, and each animation frame calls `beginFrame`, `view` once per camera (compare
+//! meshes, splat clouds and cluster meshes as typed arrays, and each animation frame calls `beginFrame`, `view` once per camera (compare
 //! mode has two), then `endFrame`. An `Orbit` turns the camera with the page's pointer and wheel
 //! events.
 
@@ -52,11 +52,21 @@ pub async fn create_view(canvas: web_sys::HtmlCanvasElement) -> Result<EngineVie
         .await
         .map_err(js_err)?;
     let backend = format!("{:?}", adapter.get_info().backend);
+    // WebGPU gets its full default limits (storage buffers and compute, for the cluster
+    // renderer) and storage bindings as large as the adapter allows, up to 1 GiB.
+    let available = adapter.limits();
+    let required_limits = if adapter.get_info().backend == wgpu::Backend::BrowserWebGpu {
+        let mut l = wgpu::Limits::default().using_resolution(available.clone());
+        l.max_storage_buffer_binding_size = available.max_storage_buffer_binding_size.min(1 << 30);
+        l.max_buffer_size = available.max_buffer_size.min(1 << 30);
+        l
+    } else {
+        wgpu::Limits::downlevel_webgl2_defaults().using_resolution(available)
+    };
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("farthing-viewer"),
-            required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits()),
+            required_limits,
             ..Default::default()
         })
         .await
@@ -207,6 +217,100 @@ impl EngineView {
     #[wasm_bindgen(js_name = setSplatShape)]
     pub fn set_splat_shape(&mut self, gaussians: bool) {
         self.viewer.set_splat_shape(gaussians);
+    }
+
+    /// Whether cluster meshes draw on the GPU (WebGPU; not WebGL2).
+    #[wasm_bindgen(getter, js_name = gpuClusters)]
+    pub fn gpu_clusters(&self) -> bool {
+        self.viewer.clusters_supported()
+    }
+
+    /// A packed cluster DAG (a `.fcld` file), cut, culled and drawn on the GPU with its pages
+    /// streamed in as the views need them. Draws naming the returned id are its instances.
+    #[wasm_bindgen(js_name = addClusterMesh)]
+    pub fn add_cluster_mesh(&mut self, fcld: &[u8]) -> Result<u32, JsValue> {
+        let dag = farthing::cluster::GpuClusterDag::from_bytes(fcld).map_err(js_err)?;
+        self.viewer
+            .add_cluster_mesh(dag)
+            .ok_or_else(|| "cluster meshes need WebGPU".into())
+    }
+
+    /// The material (from `addMaterial`) each of a cluster mesh's material ids draws with.
+    #[wasm_bindgen(js_name = setClusterMaterials)]
+    pub fn set_cluster_materials(&mut self, id: u32, materials: &[u32]) {
+        self.viewer.set_cluster_materials(id, materials);
+    }
+
+    /// 0: the cluster meshes' materials, 1: a color per cluster, 2: a color per DAG level, on
+    /// material `material` (-1: the default).
+    #[wasm_bindgen(js_name = setClusterShading)]
+    pub fn set_cluster_shading(&mut self, mode: u32, material: i32) {
+        self.viewer.set_cluster_shading(mode, u32::try_from(material).ok());
+    }
+
+    /// The largest error the cluster cut leaves on screen, in device pixels.
+    #[wasm_bindgen(js_name = setClusterThreshold)]
+    pub fn set_cluster_threshold(&mut self, pixels: f32) {
+        self.viewer.set_cluster_threshold(pixels);
+    }
+
+    /// The page pool's size in bytes and how many pages may upload per frame. A new size
+    /// starts streaming over.
+    #[wasm_bindgen(js_name = setClusterStreaming)]
+    pub fn set_cluster_streaming(&mut self, budget: f64, pages_per_frame: u32) {
+        self.viewer
+            .set_cluster_streaming(budget.max(0.0) as u64, pages_per_frame as usize);
+    }
+
+    #[wasm_bindgen(js_name = setClusterCulling)]
+    pub fn set_cluster_culling(&mut self, frustum: bool, cone: bool) {
+        self.viewer.set_cluster_culling(frustum, cone);
+    }
+
+    /// Keeps the cluster cut where the cameras are now.
+    #[wasm_bindgen(js_name = setClusterFreeze)]
+    pub fn set_cluster_freeze(&mut self, on: bool) {
+        self.viewer.set_cluster_freeze(on);
+    }
+
+    /// What the cluster cut drew and what's resident, as JSON: `views` (per view `cut`,
+    /// `clusters`, `triangles`, `perLevel`), `residentPages`, `totalPages`, `residentBytes`,
+    /// `totalBytes`, `poolBytes`, `poolPages`, `requestedPages`, `loaded`, `evicted`. Empty
+    /// without cluster meshes.
+    #[wasm_bindgen(js_name = clusterStats)]
+    pub fn cluster_stats(&self) -> String {
+        let Some(s) = self.viewer.cluster_stats() else {
+            return String::new();
+        };
+        let list = |v: &[u32]| {
+            v.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+        };
+        let views: Vec<String> = s
+            .views
+            .iter()
+            .map(|v| {
+                format!(
+                    r#"{{"cut":{},"clusters":{},"triangles":{},"perLevel":[{}]}}"#,
+                    v.cut,
+                    v.clusters,
+                    v.triangles,
+                    list(&v.per_level)
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"views":[{}],"residentPages":{},"totalPages":{},"residentBytes":{},"totalBytes":{},"poolBytes":{},"poolPages":{},"requestedPages":{},"loaded":{},"evicted":{}}}"#,
+            views.join(","),
+            s.resident_pages,
+            s.total_pages,
+            s.resident_bytes,
+            s.total_bytes,
+            s.pool_bytes,
+            s.pool_pages,
+            s.requested_pages,
+            s.loaded,
+            s.evicted
+        )
     }
 
     /// Frees a mesh or splat cloud.

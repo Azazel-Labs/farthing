@@ -120,10 +120,22 @@ gains a *Size* column (GLB, PLY or packed GPU bytes).
 - **Cluster DAG.** `build_cluster_dag` per mesh (Nanite or meshlet cluster limits, optionally
   `ClusterOptions::fast()`), packed with `GpuClusterDag`. The *Cut* row is the view-dependent
   selection at the current camera: every cluster is drawn or replaced by its coarser parent
-  depending on its own error on screen, so moving the camera changes it. The worker runs both
-  the CPU `LodView` cut and the GPU-format `select` and reports whether they agree. You can
-  color the cut by material, by cluster or by DAG level, set the pixel threshold, and freeze
-  the cut so you can inspect it from another angle.
+  depending on its own error on screen, so moving the camera changes it. With WebGPU the
+  engine does it all on the GPU each frame (`engine-poc/src/clusters.rs`):
+  - A compute pass makes the LOD cut and culls clusters outside the frustum or facing away
+    (by their normal cones).
+  - Indirect draws decode the vertices straight from the packed `.fcld` pages.
+  - The pages stream into a fixed pool. A page's priority is the most any view needs it, and
+    pages it depends on load first. When the pool is full, the least needed pages are evicted,
+    oldest first among equals. The cut only uses pages that are resident, so nothing goes
+    missing while they load.
+
+  You can set the pool size and the upload rate, toggle each kind of culling, and split the
+  view with a second camera circling close up. Pages then stream for both views at once.
+  Without WebGPU (the WebGL2 build), the worker makes the cut on the CPU and also checks that
+  the GPU-format `select` agrees. Either way, you can color the cut by material, by cluster or
+  by DAG level, set the pixel threshold, and freeze the cut so you can inspect it from
+  another angle.
 - **HLOD cells.** The model is tiled on a grid (1, 3×3 or 5×5 copies) so there are cells to
   merge. `build_hlod_tree_with` gives each cell, and each group of cells above it, a merged
   proxy, which is reduced and can have its textures baked. *Full* draws every copy. *Cut* is
