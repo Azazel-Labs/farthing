@@ -172,8 +172,8 @@ farthing splats tree.glb -o tree.ply --count 20000         # foliage as Gaussian
 
 ```toml
 [dependencies]
-farthing = "0.17"                                            # with glTF/OBJ I/O
-# farthing = { version = "0.17", default-features = false }  # geometry only
+farthing = "0.18"                                            # with glTF/OBJ I/O
+# farthing = { version = "0.18", default-features = false }  # geometry only
 ```
 
 | Integration level | How | Use when |
