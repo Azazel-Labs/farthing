@@ -18,103 +18,169 @@ It's a pure-Rust, engine-agnostic asset optimizer. It has no `unsafe` code, give
 output on any machine and any thread count, and is MIT-0 licensed. Use it as a library, a CLI
 or a build step.
 
-## Closer to the original at the same triangle count
+## Same triangle budget, *closer to the original.*
+
+Both tools reduced the same helmet to exactly **3,349** triangles, keeping UV seams intact.
+farthing's version renders **3.7 dB** closer to the original and its outline is **6×** tighter.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/h2h-dark.png">
   <img alt="DamagedHelmet reduced from 15,452 to 3,349 triangles by meshoptimizer and by farthing, with pixel-error maps against the original. meshoptimizer: 18.4 dB PSNR, silhouette off 1.86%. farthing: 22.1 dB, silhouette off 0.33%." src="docs/images/h2h-light.png">
 </picture>
 
+<sub>DamagedHelmet (Khronos glTF sample) · meshoptimizer simplify with attributes, farthing
+simplify, matched counts · PSNR and silhouette over three views. This is the widest gap of 24
+cases; across all 24 farthing is ahead in 21, by +1.5 dB on average. Every row:
+[docs/benchmarks/image-space-vs-meshopt.txt](docs/benchmarks/image-space-vs-meshopt.txt)</sub>
+
 farthing's reducer protects what you actually see: silhouettes, UV seams, shading normals and
-texture layout. This is the widest gap of the 24 image comparisons. Across all 24, farthing is
-ahead in 21, by +1.5 dB on average
-([every case](docs/benchmarks/image-space-vs-meshopt.txt)).
+texture layout.
+
+## A fraction of the error *at the same triangle count.*
+
+8 assets reduced to 50%, 20%, 5% and 1%, kept only where both tools landed within 3% of the
+same count. Each bar is **farthing's error as a share of meshoptimizer's** (geometric mean).
+Shorter is better; past the line, meshoptimizer wins.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/bench-dark.png">
   <img alt="Bar charts of farthing's error as a share of meshoptimizer's at matched triangle counts. Against attribute-aware meshoptimizer: worst-case distance 0.69x, mean distance 0.41x, UV error 0.27x, normal error 0.89x. Against permissive seams: 0.80x, 0.57x, 0.33x, 0.99x. Against positions-only: 1.17x (a loss), 0.62x, 0.29x, 0.40x. Also +1.5 dB in image space, 100% of triangle targets reached, and 5 to 9 times slower." src="docs/images/bench-light.png">
 </picture>
 
-Measured over 8 assets at 50%, 20%, 5% and 1% of their triangles. The price is speed:
-farthing is 5–7× slower than meshoptimizer because it measures error much more carefully.
-That's meant for a build step, not for every frame. A fast mode gets to about 2× of
-meshoptimizer's speed and still has lower distance and UV error (normals are slightly worse). Methodology and per-asset tables are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md#triangle-reduction).
+<sub>Khronos glTF sample assets · error measured against the original: sampled two-way
+Hausdorff and mean surface distance, 90th-percentile UV error, normal angle · v8 reducer
+numbers (current defaults are slightly better) · every case:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#triangle-reduction)</sub>
 
-## Every level comes with the distance to use it
+The price is speed: farthing is 5–9× slower than meshoptimizer because it measures error much
+more carefully. That's meant for a build step, not for every frame. A fast mode gets to about
+2× of meshoptimizer's speed and still has lower distance and UV error (normals are slightly
+worse).
+
+## Each level takes over *where the difference is a pixel.*
+
+farthing measures each level's worst-case error and reports the distance at which that error
+shrinks to **one pixel**. Here each level is rendered at exactly that distance on a 1080p
+screen, then blown up so you can see the pixels.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/switch-dark.png">
   <img alt="FlightHelmet LOD1, LOD2 and LOD3 (a quarter, a sixteenth and a sixty-fourth of the triangles) rendered at their reported switch distances on a 1080p screen next to the original, magnified, with difference maps. 1%, 5% and 16% of pixels differ by more than 10%." src="docs/images/switch-light.png">
 </picture>
 
-farthing measures each level's worst-case deviation from the original and turns it into a
-switch distance: the point where that error is one pixel on a 1080p screen. You don't have to
-tune distances by eye. The farthest level here is a baked proxy, one new mesh with a new UV
-atlas and color, normal and roughness/metal textures baked from the original. Most of its
-difference is the glass visor, which an opaque proxy can't reproduce.
+<sub>FlightHelmet (Khronos glTF sample, CC0) · 1920×1080, 60° vertical FOV, 4× MSAA ·
+distances in model units (meters) · error is a sampled two-way Hausdorff distance. LOD3 is a
+baked proxy (one new mesh, new UV atlas, color, normal and roughness/metal baked from the
+original). Much of its difference is the glass visor, which an opaque proxy can't
+reproduce.</sub>
 
-## UV atlases with fewer seams and less wasted texture
+That distance is the level's switch distance, so every LOD comes with the point to use it and
+you don't have to tune distances by eye.
+
+## Bigger charts, *packed tighter.*
+
+The same helmet unwrapped from scratch into a 1024² atlas, xatlas tuned for its best result.
+farthing cuts it into **3.1× fewer pieces** with **47% less seam length**, and fills **53%
+more** of the texture. Blue is unused texture. The bars push each atlas's pieces together.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/atlas-dark.png">
   <img alt="DamagedHelmet unwrapped into a 1024 by 1024 atlas by farthing and by xatlas tuned for its best result, with unused texture shown in blue and a bar of each atlas's pieces pushed together. farthing: 69.7% of the texture used, 277 charts, 13.6% seams, stretch 1.0034. xatlas: 45.7%, 848 charts, 25.7%, 1.0064." src="docs/images/atlas-light.png">
 </picture>
 
-Far levels need a fresh UV atlas to bake into. Against xatlas at its best settings, with
-both packed into the same 1024² atlas, farthing makes fewer charts with shorter seams on
-all 8 benchmark assets and uses more of the texture on 7 (67% on average, against 59%).
-Stretch is a near tie: farthing is lower on 5 assets, and every result is within 1% of
-isometric ([data](docs/BENCHMARKS.md#uv-atlases)). The packer is available on its own as
-[`snugly`](https://crates.io/crates/snugly).
+<sub>DamagedHelmet (Khronos glTF sample), original UVs discarded · both 1024², 2 px padding ·
+xatlas via xatlas-rs-v2: 4 chart iterations, density searched to fill one atlas (brute-force
+and bilinear packing tried, no better) · seams = 3D length of UV-seam edges ÷ total edge
+length · stretch = normalized Sander L2 (1 = isometric). Every row:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#uv-atlases)</sub>
 
-## One atlas for the whole chain
+Far levels need a fresh UV atlas to bake into. Across 8 benchmark assets, farthing makes fewer
+charts with shorter seams on all 8 and uses more of the texture on 7 (67% on average, against
+59%). Stretch is a near tie: farthing is lower on 5 assets, and every result is within 1% of
+isometric. The packer is available on its own as [`snugly`](https://crates.io/crates/snugly).
+
+## One atlas, *every level.*
+
+**Recut** cuts the whole model's surface afresh into charts that survive mipmapping and
+resamples every material into one atlas at the artist's texel density. LOD0 keeps every
+triangle; each level after it is reduced from the one before and **draws with the same
+textures**, so the chain costs one draw call and one texture set at any distance.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/recut-dark.png">
   <img alt="FlightHelmet recut: the original (94,722 triangles, 6 materials) next to LOD0 to LOD3 at 94,722, 33,152, 11,603 and 4,061 triangles, 0.24%, 0.71% and 2.2% off. Each is half shaded and half overlaid with its UV seams in one row and its triangles in the other. All four levels draw with one 2048 by 2048 atlas." src="docs/images/recut-light.png">
 </picture>
 
-The browser demo's default chain starts with a recut. It merges the model into one mesh,
-unwraps it afresh with charts that hold up under mipmapping, and bakes every material into one
-atlas at the artist's texel density. LOD0 keeps every triangle. Each later level is reduced
-from the one before and keeps the same UVs, so the whole chain is one draw call with one
-texture set, which the GPU mips as usual.
+<sub>FlightHelmet.gltf (Khronos glTF sample, CC0) · 94,722 triangles, 6 materials · recut
+chain, step 0.35 · errors are measured two-way Hausdorff distance over the bounding-box
+diagonal · drawn with the web demo's engine viewer and its editor overlays. Reproduce:
+[demo-web/readme/build.sh](demo-web/readme/build.sh)</sub>
 
-## Impostors for the far distance
+The browser demo's default chain starts with a recut, which first merges the model into one
+mesh. The GPU mips the shared atlas as usual.
+
+## Far away, *two triangles.*
+
+Once a model is small on screen, farthing captures it from 144 directions into one texture and
+draws it as a single camera-facing card. Each atlas is sized for one texel per screen pixel at
+the size it's used. Here each is shown **at exactly that size**, from angles between the
+captured ones, then magnified.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/impostor-dark.png">
   <img alt="An octahedral impostor atlas of DamagedHelmet (12 by 12 views), and the 15,452-triangle mesh next to its 2-triangle impostor at 160, 96 and 48 pixels on screen, magnified, with difference maps. 27.5, 28.5 and 25.1 dB." src="docs/images/impostor-light.png">
 </picture>
 
-Past a hundred pixels or so, a whole model becomes one card. farthing plans the views, your
-engine renders them with its real materials, and farthing assembles a relightable atlas sized
-for one texel per screen pixel. It ships with a reference shader that blends between views
-and marches depth for parallax.
+<sub>DamagedHelmet (Khronos glTF sample) · captured and drawn by engine-poc's own wgpu
+renderer through farthing's host interface · mesh reference 4× supersampled · octahedral
+layout, 12×12 frames, 2× supersampled capture · PSNR over covered pixels · edge = pixels
+covered by only one of the two. Reproduce: `farthing-poc-engine impostor_shot DamagedHelmet.glb
+out 160 96 48`</sub>
 
-## Cluster LOD that follows the pixels
+These are octahedral impostors. farthing plans the views, your engine renders them with its
+real materials, and farthing assembles a relightable atlas. It ships with a reference shader
+that blends between views and marches depth for parallax.
+
+## Detail only *where the pixels are.*
+
+A **cluster DAG** groups the mesh into clusters of at most 128 triangles, then merges and
+simplifies groups of them, level by level, with borders that always match. To draw, each part
+of the model picks the coarsest clusters whose error stays **under a pixel**. One color per
+cluster. The three cuts are for the helmet 800, 200 and 50 pixels tall on a 1080p screen,
+magnified to the same size here; the insets show them to scale.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/clusters-dark.png">
   <img alt="FlightHelmet's cluster DAG (1,496 clusters in 8 levels), one color per cluster, cut for the helmet 800, 200 and 50 pixels tall on a 1080p screen at a one-pixel error: 73,677, 29,359 and 10,818 triangles from 577, 233 and 87 clusters. Insets show each cut at its real size." src="docs/images/clusters-light.png">
 </picture>
 
-For Nanite-style renderers, farthing builds a cluster DAG with borders that always match. Each
-part of the model picks the coarsest clusters whose error stays under a pixel, so detail goes
-where the screen can show it. The select test is per cluster and needs no traversal. Its
-packed form is ready to upload to the GPU.
+<sub>FlightHelmet.gltf (Khronos glTF sample, CC0) · 1,496 clusters in 8 DAG levels, 188,887
+triangles in all · cut for a 60° view 1080 pixels high, 1 px error threshold · the same cut on
+the CPU and through the packed GPU form · drawn with the web demo's engine viewer. Reproduce:
+[demo-web/readme/build.sh](demo-web/readme/build.sh)</sub>
 
-## Surfels and Gaussian splats
+This is cluster LOD for Nanite-style renderers. The select test is per cluster and needs no
+traversal, and the packed form is ready to upload to the GPU.
+
+## From triangles *to Gaussians.*
+
+farthing scatters a **progressive surfel cloud** over the surface, then turns the surfels into
+3D Gaussian splats that any splat renderer draws. Every prefix of the cloud covers the whole
+surface on its own, so coarser levels are just **shorter prefixes**: 20,000, 5,000 and 1,250
+splats here.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/splats-dark.png">
   <img alt="FlightHelmet as a 94,722-triangle mesh, as 20,000 surfels drawn as discs, and as 20,000 3D Gaussian splats shaped by the surface each one covers, with close-ups of the goggles. As 3DGS PLY files, 20,000, 5,000 and 1,250 splats are 1,329, 332 and 83 KB." src="docs/images/splats-light.png">
 </picture>
 
-A progressive surfel cloud covers the whole surface at any prefix length, so coarser levels are
-just shorter prefixes. farthing exports it as 3D Gaussian splats in `.ply`, each shaped to
-the surface patch it stands for, so any splat renderer can draw it.
+<sub>FlightHelmet.gltf (Khronos glTF sample, CC0) · footprint Gaussians, colors averaged over
+each surfel's footprint · as 3DGS PLY: 1,329 KB, 332 KB and 83 KB · surfels drawn as round
+discs, Gaussians blended back to front · drawn with the web demo's engine viewer. Reproduce:
+[demo-web/readme/build.sh](demo-web/readme/build.sh)</sub>
+
+The splats export as a standard 3DGS `.ply`, each one shaped to the surface patch it stands
+for.
 
 ## What's in the box
 

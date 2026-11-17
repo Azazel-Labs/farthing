@@ -6,7 +6,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,400..700,0..100,0..1;1,9..144,400..600,0..100,0..1&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=block" rel="stylesheet">
 <link rel="stylesheet" href="fig.css">
 <style>
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); column-gap: 22px; margin-top: 28px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); column-gap: 22px; }
   .cell { position: relative; }
   canvas.p { display: block; border-radius: 8px; }
   .inset { position: absolute; left: 12px; top: 12px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
@@ -18,10 +18,7 @@
 </style>
 </head>
 <body>
-<h1>Detail only <em>where the pixels are.</em></h1>
-<p class="sub" id="sub"></p>
 <div class="grid" id="grid"></div>
-<div class="foot" id="foot"></div>
 <script type="module">
 import { stats, img, canvas, int, pct, ready } from "./sheet.js";
 const c = stats.clusters;
@@ -52,15 +49,6 @@ for (const [k, cut] of c.cuts.entries()) {
     `${int(cut.triangles)} of ${int(cut.full_triangles)} triangles<br>${int(cut.clusters)} clusters from DAG levels ${levels}</div>`);
   grid.append(cell);
 }
-document.getElementById("sub").innerHTML =
-  `A <b>cluster DAG</b> groups the mesh into clusters of at most ${c.info.max_triangles} triangles, then merges and simplifies groups of them, level by level, ` +
-  `with borders that always match. To draw, each part of the model picks the coarsest clusters whose error stays <b>under a pixel</b>. ` +
-  `One color per cluster. The three cuts are for the helmet ${c.cuts.map((x) => x.screen_px).join(", ").replace(/, (?=[^,]*$)/, " and ")} pixels tall on a 1080p screen, magnified to the same size here; the insets show them to scale.`;
-document.getElementById("foot").innerHTML =
-  `${stats.model} (Khronos glTF sample, CC0) · ${int(c.info.clusters)} clusters in ${c.info.levels} DAG levels, ${int(c.info.all_level_triangles)} triangles in all · ` +
-  `cut for a 60° view 1080 pixels high, 1 px error threshold · ` +
-  (c.cuts.every((x) => x.gpu_agrees) ? `the same cut on the CPU and through the packed GPU form · ` : ``) +
-  `drawn with the web demo's engine viewer.<br>Reproduce: demo-web/readme/build.sh`;
 await ready();
 </script>
 </body>

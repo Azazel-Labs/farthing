@@ -6,7 +6,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,400..700,0..100,0..1;1,9..144,400..600,0..100,0..1&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=block" rel="stylesheet">
 <link rel="stylesheet" href="fig.css">
 <style>
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); column-gap: 22px; margin-top: 28px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); column-gap: 22px; }
   canvas.p { display: block; border-radius: 8px; }
   .lvl { margin-top: 12px; font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--muted); line-height: 1.55; }
   .lvl .big { font-family: Fraunces, serif; font-weight: 600; font-size: 30px; color: var(--ink); line-height: 1; display: block; margin-bottom: 6px; font-variation-settings: "opsz" 96; }
@@ -17,11 +17,8 @@
 </style>
 </head>
 <body>
-<h1>From triangles <em>to Gaussians.</em></h1>
-<p class="sub" id="sub"></p>
 <div class="grid" id="grid"></div>
 <div class="close" id="close"></div>
-<div class="foot" id="foot"></div>
 <script type="module">
 import { stats, img, canvas, int, ready } from "./sheet.js";
 const s = stats.splats;
@@ -52,17 +49,6 @@ for (const [k, [src, name, big, note]] of panels.entries()) {
   cl.insertAdjacentHTML("beforeend", `<div class="tag">${name}, close up: ${(1 / crop.w).toFixed(1)}× the panel above</div>`);
   close.append(cl);
 }
-// "a, b and c": the numbers have commas of their own.
-const list = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}` : xs.join(""));
-const kb = (b) => `${Math.round(b / 1024).toLocaleString("en-US")} KB`;
-document.getElementById("sub").innerHTML =
-  `farthing scatters a <b>progressive surfel cloud</b> over the surface, then turns the surfels into 3D Gaussian splats that any splat renderer draws. ` +
-  `Every prefix of the cloud covers the whole surface on its own, so coarser levels are just <b>shorter prefixes</b>: ` +
-  list(s.levels.map((l) => int(l.vertices))) + " splats here.";
-document.getElementById("foot").innerHTML =
-  `${stats.model} (Khronos glTF sample, CC0) · footprint Gaussians, colors averaged over each surfel's footprint · ` +
-  `as 3DGS PLY: ${list(s.levels.map((l) => kb(l.bytes)))} · surfels drawn as round discs, Gaussians blended back to front · ` +
-  `drawn with the web demo's engine viewer.<br>Reproduce: demo-web/readme/build.sh`;
 await ready();
 </script>
 </body>

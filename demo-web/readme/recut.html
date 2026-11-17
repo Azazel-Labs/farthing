@@ -7,10 +7,9 @@
 <link rel="stylesheet" href="fig.css">
 <style>
   .head { display: flex; gap: 32px; align-items: flex-end; }
-  .head > div:first-child { flex: 1; }
   .atlas { flex: none; display: flex; gap: 14px; align-items: flex-end; }
   .atlas canvas { display: block; border-radius: 8px; }
-  .cap { width: 190px; font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--faint); line-height: 1.5; text-align: right; }
+  .cap { width: 420px; font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--faint); line-height: 1.5; }
   .cap b { color: var(--muted); font-weight: 500; }
   .grid { display: grid; grid-template-columns: 112px repeat(5, 1fr); column-gap: 14px; row-gap: 14px; margin-top: 26px; }
   .col { font-family: "JetBrains Mono", monospace; font-size: 13px; color: var(--muted); text-align: center; line-height: 1.5; }
@@ -24,14 +23,9 @@
 </head>
 <body>
 <div class="head">
-  <div>
-    <h1>One atlas, <em>every level.</em></h1>
-    <p class="sub" id="sub" style="max-width: none"></p>
-  </div>
-  <div class="atlas"><div class="cap" id="atlascap"></div><div id="atlas"></div></div>
+  <div class="atlas"><div id="atlas"></div><div class="cap" id="atlascap"></div></div>
 </div>
 <div class="grid" id="grid"></div>
-<div class="foot" id="foot"></div>
 <script type="module">
 import { theme, stats, img, canvas, int, pct, ready } from "./sheet.js";
 const r = stats.recut;
@@ -70,13 +64,6 @@ ag.drawImage(atlas, 0, 0, ac.width, ac.height);
 document.getElementById("atlas").append(ac);
 document.getElementById("atlascap").innerHTML =
   `<b>LOD0–LOD3 all draw with this</b> ${r.atlas.width}² base color atlas (and its normal and ORM twins), in place of the source's ${stats.materials} materials.`;
-document.getElementById("sub").innerHTML =
-  `<b>Recut</b> cuts the whole model's surface afresh into charts that survive mipmapping and resamples every material into one atlas at the artist's texel density. ` +
-  `LOD0 keeps every triangle; each level after it is reduced from the one before and <b>draws with the same textures</b>, so the chain costs one draw call and one texture set at any distance.`;
-document.getElementById("foot").innerHTML =
-  `${stats.model} (Khronos glTF sample, CC0) · ${int(stats.triangles)} triangles, ${stats.materials} materials · ` +
-  `recut chain, step ${0.35} · errors are measured two-way Hausdorff distance over the bounding-box diagonal · ` +
-  `drawn with the web demo's engine viewer and its editor overlays.<br>Reproduce: demo-web/readme/build.sh`;
 await ready();
 </script>
 </body>
