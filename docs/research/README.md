@@ -34,8 +34,7 @@ cost, and whether graphics has already absorbed it.
 FFT correlation placement of UV charts against an occupancy map, proposed in two reports, is
 claimed by US 12,112,510 B2 (Tencent America, priority 2022, granted 2024). It is not to be
 implemented. Contact-scored placement over free-space pockets, also proposed, is the
-alternative to explore, and would get its own check first. All patents farthing avoids are in
-the README's patent shame list.
+alternative to explore, and would get its own check first.
 
 ## Status
 

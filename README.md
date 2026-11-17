@@ -36,8 +36,8 @@ ahead in 21, by +1.5 dB on average
 </picture>
 
 Measured over 8 assets at 50%, 20%, 5% and 1% of their triangles. The price is speed:
-farthing is 5–9× slower than meshoptimizer because it measures error much more carefully.
-That's meant for a build step, not for every frame. A fast mode gets within 2× of
+farthing is 5–7× slower than meshoptimizer because it measures error much more carefully.
+That's meant for a build step, not for every frame. A fast mode gets to about 2× of
 meshoptimizer's speed and still has lower distance and UV error (normals are slightly worse). Methodology and per-asset tables are in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md#triangle-reduction).
 
@@ -489,7 +489,7 @@ let merged = aggregate(&scene, &infos, &AggregateOptions { atlas_size: 2048, ..D
 let color = copy_texels(&merged, &flattened, channels::BASE_COLOR)?; // flattened: FlattenedTextures
 ```
 
-### Cluster LOD
+### Cluster|Meshlet LOD
 
 `build_cluster_dag` builds the cluster hierarchy that Nanite-style renderers select from per
 cluster: meshlets at the bottom, coarser clusters above, one root at the top. Every cluster
@@ -634,47 +634,28 @@ Work runs on rayon's thread pool, and the output is the same on any thread count
 
 ## Honest limits
 
-- **Speed.** The default reducer is 5–9× slower than meshoptimizer on small assets and 2–3×
-  on large ones. About 88% of the work runs in parallel. Fast mode closes most of the gap.
-- **Cluster DAG build speed.** Faster than a serial meshoptimizer `clusterlod.h`-style build
-  from about 4 threads up, but 1.4× (fast) to 3× (default) slower per core. On Windows, link
+- **Speed.** The default reducer is 5–7× slower than meshoptimizer on small assets and 2–3×
+  on large ones. About 90% of the work runs in parallel. Fast mode gets to about 2× of
+  meshoptimizer.
+- **Cluster DAG build speed.** Per core, 1.2× (fast) to 2.9× (default) slower than a serial
+  meshoptimizer `clusterlod.h`-style build. On large meshes the parallel build is faster from a
+  few threads up; on small ones (the 15k-triangle helmet) only fast mode catches up. On Windows, link
   [mimalloc](https://crates.io/crates/mimalloc) as the global allocator: the system heap
   limits parallel scaling.
 - **Worst-case distance against positions-only reducers.** Ranking by area-weighted error
   trades a little worst-case distance for much better mean, UV and normal fidelity. Set
   `error_normalization = 1.0` for classic QEM when only the outline matters.
-- **Very aggressive targets** (1% and below). farthing leads on every quality average, but a
-  few cases are still worse, such as a watch's strap lugs at 1%.
-- **Proxies** can trail marching cubes on deep, narrow slots (the dragon: 1.39% vs 0.87% worst
-  case, though marching cubes leaves 6% of it open). farthing's proxies are always closed and manifold.
+- **Very aggressive targets** (1% and below). farthing leads on every quality average but
+  reaches fewer targets (73% against 88%), and has the higher worst case on some large assets:
+  a watch's strap lugs at 1% (16% against 4.7%), CarConcept.
+- **Proxies** can trail marching cubes on worst-case distance (the dragon: 1.39% vs 0.87%,
+  though marching cubes leaves 6% of it open). The loss is in the final reduction to 3,000
+  triangles, not the contouring. farthing's proxies are always closed and manifold.
 - **Opaque proxies can't reproduce transmission or refraction**, as the visor above shows.
 
 The details, and what was tried and reverted, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 Technique sources are in [PROVENANCE.md](PROVENANCE.md), and ideas borrowed from other sciences
 are in [docs/research/](docs/research/README.md).
-
-## Patent shame list
-
-Patents on techniques in farthing's space that it deliberately stays clear of, with how it does
-so. Status and dates are from Google Patents as of November 2026; Google itself labels status
-an assumption, not a legal conclusion. This is a working list, not legal advice, and farthing has
-not had a freedom-to-operate review. If you know of one that belongs here, open an issue.
-
-**Active: designed around**
-
-| Patent | Owner | What it claims, in short | Status | How farthing stays clear |
-|---|---|---|---|---|
-| [US 12,112,510 B2](https://patents.google.com/patent/US12112510B2/en), *Convolutional approach to fast and compact packing of 3D mesh into 2D maps* | Tencent America LLC | Placing each UV chart where a correlation between the atlas occupancy map and the chart's occupancy matrix shows no overlap | Active, granted 2024-10-08, est. expiry 2043-05-11 | The packer drops charts onto a per-column skyline outline; it never correlates masks against an occupancy map. FFT/correlation placement, proposed twice in the v8 research, is off the table. |
-| [US 12,394,102 B2](https://patentsgazette.uspto.gov/week33/OG/html/1537-3/US12394102-20250819.html), *Mesh parameterization with temporally correlated UV atlases* | Tencent America LLC | Generating a frame's UV atlas by aligning its charts with reference charts from previous frames, via packing | Granted 2025-08-19 (filed 2023-03-16) | farthing parameterizes each mesh on its own; it has no per-frame atlases for animated sequences. Anything like that would need a different design. |
-| [US 9,978,176 B2](https://patents.google.com/patent/US9978176B2/en), *Simplifying small mesh components with redundant backs* | Electronic Arts Inc. | Casting a ray along a surface's normal and removing that surface from a component when the ray hits other geometry within a threshold distance | Active, granted 2018-05-22, est. expiry 2036-03-31 | Part removal (v8) deletes whole connected parts or nothing, using closest-point distances. It casts no normal rays and never strips individual surfaces from a part. |
-
-**Expired: free for everyone** (listed for credit, and so nobody avoids them by mistake)
-
-| Patent | Owner | What it covered | Status |
-|---|---|---|---|
-| [US 6,362,820 B1](https://patents.google.com/patent/US6362820B1/en), *Quadric metric for simplifying meshes with appearance attributes* (Hoppe) | Microsoft | The attribute quadric with wedges that farthing's reducer builds on | Expired (lifetime) |
-| [US 8,860,723 B2](https://patents.google.com/patent/US8860723B2/en), *Bounded simplification of geometrical computer data* | Donya Labs AB (Simplygon), now Microsoft | Collapse-based reduction that projects removed geometry onto the reduced mesh and stops at an error bound | Lapsed 2022-11-21 for unpaid fees |
-| [US 8,698,809 B2](https://patents.google.com/patent/US8698809B2/en), *Creation and rendering of hierarchical digital multimedia data* | Donya Labs AB, now Microsoft | Repeatedly combining objects and simplifying each combination into a stand-in (hierarchical LOD) | Expired (fees) |
 
 ## Layout
 
