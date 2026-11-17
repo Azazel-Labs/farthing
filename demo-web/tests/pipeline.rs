@@ -1026,8 +1026,16 @@ fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
             let (kind, json, buffers) = &run.data[0];
             assert_eq!(kind, "clusters");
             let meshes = json["meshes"].as_array().unwrap();
-            assert_eq!(buffers.len(), 2 + 7 * meshes.len());
+            assert_eq!(buffers.len(), 2 + 8 * meshes.len());
             assert!(json["gpu_bytes"].as_u64().unwrap() > 0);
+            // Each mesh's eighth buffer is its packed DAG, for the engine's GPU renderer.
+            for (i, m) in meshes.iter().enumerate() {
+                let Buffer::U8(fcld) = &buffers[2 + 8 * i + 7] else {
+                    panic!("mesh {i}: the packed DAG should be bytes");
+                };
+                let dag = farthing::cluster::GpuClusterDag::from_bytes(fcld).unwrap();
+                assert_eq!(dag.pages.len() as u64, m["pages"].as_u64().unwrap());
+            }
             // Close up shows full detail, far away a coarser cut; the packed GPU form picks
             // the same clusters.
             let view = |d: f32, threshold| ViewRequest {

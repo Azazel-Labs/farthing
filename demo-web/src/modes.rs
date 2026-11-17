@@ -456,12 +456,20 @@ pub(crate) fn run_clusters(
         let tm = now();
         let dag = build_cluster_dag(mesh, &copts).map_err(err)?;
         let dag_ms = now() - tm;
-        // 32 KiB pages: fine-grained enough for the GPU renderer to stream.
-        let gpu_opts = GpuOptions {
-            page_size: 32 * 1024,
-            ..GpuOptions::default()
+        // 32 KiB pages, fine-grained enough for the GPU renderer to stream. Every group has to
+        // fit in one page, so a mesh with a bigger group doubles its pages until it does: the
+        // engine sizes its pool slots to the largest page it is given.
+        let mut page_size = 32 * 1024;
+        let gpu = loop {
+            let gpu_opts = GpuOptions {
+                page_size,
+                ..GpuOptions::default()
+            };
+            match GpuClusterDag::from_dag(&dag, mesh, &gpu_opts) {
+                Err(_) if page_size < 256 * 1024 => page_size *= 2,
+                r => break r.map_err(err)?,
+            }
         };
-        let gpu = GpuClusterDag::from_dag(&dag, mesh, &gpu_opts).map_err(err)?;
         let levels = dag.levels() as usize;
         let mut level_clusters = vec![0usize; levels];
         let mut indices = Vec::new();

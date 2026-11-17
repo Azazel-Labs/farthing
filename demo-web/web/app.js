@@ -1203,7 +1203,15 @@ $("#threshold").addEventListener("input", () => {
 });
 $("#freeze").addEventListener("change", () => (cutKey = ""));
 $("#upload").addEventListener("input", () => ($("#upload-out").value = $("#upload").value));
-$("#shading").addEventListener("change", () => extra?.reshade?.());
+$("#shading").addEventListener("change", () => {
+  $("#show-clusters").checked = $("#shading").value === "clusters";
+  extra?.reshade?.();
+});
+// The toolbar's shortcut for the cut panel's Color: per cluster, or back to the materials.
+$("#show-clusters").addEventListener("change", (e) => {
+  $("#shading").value = e.target.checked ? "clusters" : "materials";
+  $("#shading").dispatchEvent(new Event("change"));
+});
 $("#splat-draw").addEventListener("change", () => {
   for (const l of levels) if (l?.model?.splat) l.model.splat.key = "";
   cutStats();
