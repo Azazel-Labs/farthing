@@ -80,3 +80,7 @@ required-features = ["io"]
 [[example]]
 name = "bench_hlod_tree"
 required-features = ["io"]
+
+[[example]]
+name = "thin_features"
+required-features = ["io"]
