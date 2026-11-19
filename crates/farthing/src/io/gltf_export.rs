@@ -3,7 +3,10 @@ use crate::image::Texture;
 use crate::reduce::optimize::optimize_mesh;
 use crate::{Error, Mesh, Result, Scene};
 use glam::{Mat4, Vec3};
-use polysmelt::meshopt::{encode_index_buffer, encode_oct8, encode_vertex_buffer};
+use polysmelt::meshopt::{
+    ExpMode, encode_filter_color, encode_filter_exp, encode_filter_quat, encode_index_buffer,
+    encode_oct8, encode_vertex_buffer_level,
+};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -31,6 +34,44 @@ pub struct ExportTextures {
     pub metallic_roughness_factor: BTreeMap<u32, glam::Vec2>,
 }
 
+/// Which meshoptimizer compression extension [`GlbOptions::compress`] writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MeshoptCodec {
+    /// `EXT_meshopt_compression`, attribute codec version 0: what most viewers read today.
+    #[default]
+    Ext,
+    /// `KHR_meshopt_compression`, attribute codec version 1: smaller vertex data, and the
+    /// `COLOR` filter for quantized vertex colors. `level` is how hard the encoder searches,
+    /// as meshoptimizer's `meshopt_encodeVertexBufferLevel`: 0 is fastest, 2 is its default
+    /// and 3 also tries the 32-bit XOR deltas that suit floats (higher values encode as 3).
+    Khr {
+        /// Encoder effort, 0 to 3.
+        level: u8,
+    },
+}
+
+impl MeshoptCodec {
+    /// `KHR_meshopt_compression` at level 3, the smallest output.
+    pub const KHR: MeshoptCodec = MeshoptCodec::Khr { level: 3 };
+
+    /// The glTF extension name.
+    pub fn extension(self) -> &'static str {
+        match self {
+            MeshoptCodec::Ext => "EXT_meshopt_compression",
+            MeshoptCodec::Khr { .. } => "KHR_meshopt_compression",
+        }
+    }
+
+    fn encode_vertices(self, data: &[u8], stride: usize) -> Vec<u8> {
+        match self {
+            MeshoptCodec::Ext => encode_vertex_buffer_level(data, stride, 2, 0),
+            MeshoptCodec::Khr { level } => {
+                encode_vertex_buffer_level(data, stride, level.min(9), 1)
+            }
+        }
+    }
+}
+
 /// How [`glb_bytes_with`] encodes geometry. The default writes plain float attributes that
 /// any glTF reader opens; [`GlbOptions::compact`] turns everything on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -40,10 +81,15 @@ pub struct GlbOptions {
     /// coordinates and colors within [0, 1] as 16-bit normalized. Skinned and morphed meshes
     /// keep float positions, since their node matrices can't carry the dequantization.
     pub quantize: bool,
-    /// `EXT_meshopt_compression`: vertex and index buffers through meshoptimizer's codecs, with
-    /// normals and tangents in its octahedral filter (with `quantize`). The file then
-    /// requires the extension (three.js: `GLTFLoader.setMeshoptDecoder`).
+    /// meshoptimizer compression (the extension [`GlbOptions::codec`] picks): vertex, index,
+    /// animation and inverse bind matrix data through meshoptimizer's codecs. With `quantize`
+    /// it also applies its lossy filters: octahedral for normals and tangents, quaternion
+    /// (12 bits) for rotation keys, exponential (16 bits) for translation and scale keys, and
+    /// with `KHR_meshopt_compression` the color filter (12 bits) for vertex colors. The file
+    /// then requires the extension (three.js: `GLTFLoader.setMeshoptDecoder`).
     pub compress: bool,
+    /// The compression extension `compress` writes.
+    pub codec: MeshoptCodec,
     /// Reorders each mesh's triangles for the vertex cache and for overdraw, and its vertices
     /// by first use ([`optimize_mesh`]); compression works best on that order.
     pub optimize: bool,
@@ -56,7 +102,17 @@ impl GlbOptions {
         GlbOptions {
             quantize: true,
             compress: true,
+            codec: MeshoptCodec::Ext,
             optimize: true,
+        }
+    }
+
+    /// [`GlbOptions::compact`] with `KHR_meshopt_compression` ([`MeshoptCodec::KHR`]):
+    /// smaller still, for viewers that read the newer extension.
+    pub fn compact_khr() -> Self {
+        GlbOptions {
+            codec: MeshoptCodec::KHR,
+            ..Self::compact()
         }
     }
 }
@@ -64,6 +120,7 @@ impl GlbOptions {
 const ARRAY_BUFFER: u32 = 34962;
 const ELEMENT_ARRAY_BUFFER: u32 = 34963;
 const I8: u32 = 5120;
+const I16: u32 = 5122;
 const U16: u32 = 5123;
 const U32: u32 = 5125;
 const F32: u32 = 5126;
@@ -72,8 +129,10 @@ struct Bin {
     data: Vec<u8>,
     views: Vec<Value>,
     accessors: Vec<Value>,
-    /// Encode vertex and index views with `EXT_meshopt_compression`.
-    compress: bool,
+    /// Encode vertex, index and animation views with this meshopt extension.
+    compress: Option<MeshoptCodec>,
+    /// Apply meshopt's lossy filters (quantization was asked for).
+    filters: bool,
     /// Size of the fallback buffer the compressed views decode into.
     fallback: usize,
     /// An accessor uses a type only `KHR_mesh_quantization` allows.
@@ -100,10 +159,11 @@ impl Bin {
     /// fallback buffer; `ext` holds the codec's mode and layout.
     fn compressed_view(
         &mut self,
+        codec: MeshoptCodec,
         raw_len: usize,
         encoded: &[u8],
         mut ext: Value,
-        target: u32,
+        target: Option<u32>,
     ) -> usize {
         self.data.resize(align4(self.data.len()), 0);
         ext["buffer"] = json!(0);
@@ -111,31 +171,50 @@ impl Bin {
         ext["byteLength"] = json!(encoded.len());
         self.data.extend_from_slice(encoded);
         self.fallback = align4(self.fallback);
-        self.views.push(json!({
-            "buffer": 1, "byteOffset": self.fallback, "byteLength": raw_len, "target": target,
-            "extensions": { "EXT_meshopt_compression": ext }
-        }));
+        let mut v = json!({
+            "buffer": 1, "byteOffset": self.fallback, "byteLength": raw_len,
+            "extensions": { codec.extension(): ext }
+        });
+        if let Some(t) = target {
+            v["target"] = json!(t);
+        }
+        self.views.push(v);
         self.fallback += raw_len;
         self.views.len() - 1
     }
-    /// A vertex attribute view of `stride`-byte elements.
-    fn attribute_view(&mut self, bytes: &[u8], stride: usize, filter: Option<&str>) -> usize {
-        let view = if self.compress {
+    /// A view of `stride`-byte elements, through the attribute codec when compressing (with
+    /// `filter` applied on decode); `target` is set for vertex attributes, which also get a
+    /// byte stride.
+    fn elements_view(
+        &mut self,
+        bytes: &[u8],
+        stride: usize,
+        filter: Option<&str>,
+        target: Option<u32>,
+    ) -> usize {
+        let view = if let Some(codec) = self.compress {
             let mut ext = json!({ "byteStride": stride, "count": bytes.len() / stride, "mode": "ATTRIBUTES" });
             if let Some(f) = filter {
                 ext["filter"] = json!(f);
             }
-            self.compressed_view(
-                bytes.len(),
-                &encode_vertex_buffer(bytes, stride),
-                ext,
-                ARRAY_BUFFER,
-            )
+            let encoded = codec.encode_vertices(bytes, stride);
+            self.compressed_view(codec, bytes.len(), &encoded, ext, target)
         } else {
-            self.view(bytes, Some(ARRAY_BUFFER))
+            self.view(bytes, target)
         };
-        self.views[view]["byteStride"] = json!(stride);
+        if target.is_some() {
+            self.views[view]["byteStride"] = json!(stride);
+        }
         view
+    }
+    /// A vertex attribute view of `stride`-byte elements.
+    fn attribute_view(&mut self, bytes: &[u8], stride: usize, filter: Option<&str>) -> usize {
+        self.elements_view(bytes, stride, filter, Some(ARRAY_BUFFER))
+    }
+    /// Floats in elements of `comps`, outside vertex data (animation keys, matrices).
+    fn floats_view(&mut self, data: &[f32], comps: usize) -> usize {
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.elements_view(&bytes, 4 * comps, None, None)
     }
     fn accessor(
         &mut self,
@@ -191,7 +270,7 @@ impl Bin {
     /// Unit vectors (with a fourth component for tangents) as normalized bytes, through the
     /// octahedral filter when compressing.
     fn accessor_unit8(&mut self, v: &[[f32; 4]], kind: &str) -> usize {
-        let filter = self.compress.then_some("OCTAHEDRAL");
+        let filter = self.compress.is_some().then_some("OCTAHEDRAL");
         let bytes: Vec<u8> = v
             .iter()
             .flat_map(|&[x, y, z, w]| {
@@ -206,6 +285,19 @@ impl Bin {
         let view = self.attribute_view(&bytes, 4, filter);
         self.quantized = true;
         self.accessor(view, I8, true, v.len(), kind)
+    }
+    /// RGBA colors in [0, 1] as normalized 16-bit, through the `COLOR` filter (12 bits) when
+    /// compressing with `KHR_meshopt_compression`, else plain.
+    fn accessor_color16(&mut self, colors: &[f32], plain: &[u16]) -> usize {
+        if !matches!(self.compress, Some(MeshoptCodec::Khr { .. })) {
+            return self.accessor_u16(plain, 4, 4, "VEC4", true);
+        }
+        let rgba: Vec<[f32; 4]> = colors
+            .chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect();
+        let view = self.attribute_view(&encode_filter_color(&rgba, 8, 12), 8, Some("COLOR"));
+        self.accessor(view, U16, true, rgba.len(), "VEC4")
     }
     /// Triangle indices, 16-bit when every vertex fits.
     fn accessor_indices(&mut self, data: &[u32], vertex_count: usize) -> usize {
@@ -222,13 +314,14 @@ impl Bin {
         } else {
             data.iter().flat_map(|i| i.to_le_bytes()).collect()
         };
-        let view = if self.compress {
+        let view = if let Some(codec) = self.compress {
             let ext = json!({ "byteStride": stride, "count": data.len(), "mode": "TRIANGLES" });
             self.compressed_view(
+                codec,
                 bytes.len(),
                 &encode_index_buffer(data),
                 ext,
-                ELEMENT_ARRAY_BUFFER,
+                Some(ELEMENT_ARRAY_BUFFER),
             )
         } else {
             self.view(&bytes, Some(ELEMENT_ARRAY_BUFFER))
@@ -236,7 +329,9 @@ impl Bin {
         self.accessor(view, component, false, data.len(), "SCALAR")
     }
     /// An animation sampler: its key times (one accessor per distinct run of times, shared)
-    /// and its values, flattened to `comps` floats each.
+    /// and its values, flattened to `comps` floats each. With compression and filters,
+    /// rotations (`comps` 4) go through the quaternion filter and the rest through the
+    /// exponential one; cubic spline tangents stay exact.
     fn sampler<T: Copy>(
         &mut self,
         times_cache: &mut HashMap<Vec<u32>, usize>,
@@ -248,8 +343,7 @@ impl Bin {
         let input = match times_cache.get(&key) {
             Some(&a) => a,
             None => {
-                let bytes: Vec<u8> = curve.times.iter().flat_map(|t| t.to_le_bytes()).collect();
-                let view = self.view(&bytes, None);
+                let view = self.floats_view(&curve.times, 1);
                 let a = self.accessor(view, F32, false, curve.times.len(), "SCALAR");
                 let (lo, hi) = (curve.times[0], curve.times[curve.times.len() - 1]);
                 self.accessors[a]["min"] = json!([lo]);
@@ -259,10 +353,26 @@ impl Bin {
             }
         };
         let values: Vec<f32> = curve.values.iter().flat_map(|&v| flatten(v)).collect();
-        let bytes: Vec<u8> = values.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let view = self.view(&bytes, None);
         let kind = if comps == 4 { "VEC4" } else { "VEC3" };
-        let output = self.accessor(view, F32, false, curve.values.len(), kind);
+        let filtered = self.compress.is_some()
+            && self.filters
+            && !matches!(curve.interpolation, Interpolation::CubicSpline);
+        let output = if filtered && comps == 4 {
+            let q: Vec<[f32; 4]> = values
+                .chunks_exact(4)
+                .map(|c| [c[0], c[1], c[2], c[3]])
+                .collect();
+            let view = self.elements_view(&encode_filter_quat(&q, 12), 8, Some("QUATERNION"), None);
+            // Rotation outputs may be normalized shorts in core glTF.
+            self.accessor(view, I16, true, q.len(), kind)
+        } else if filtered {
+            let bytes = encode_filter_exp(&values, 4 * comps, 16, ExpMode::SharedComponent);
+            let view = self.elements_view(&bytes, 4 * comps, Some("EXPONENTIAL"), None);
+            self.accessor(view, F32, false, curve.values.len(), kind)
+        } else {
+            let view = self.floats_view(&values, comps);
+            self.accessor(view, F32, false, curve.values.len(), kind)
+        };
         let interpolation = match curve.interpolation {
             Interpolation::Step => "STEP",
             Interpolation::Linear => "LINEAR",
@@ -271,11 +381,8 @@ impl Bin {
         json!({ "input": input, "output": output, "interpolation": interpolation })
     }
     fn accessor_mat4(&mut self, mats: &[Mat4]) -> usize {
-        let bytes: Vec<u8> = mats
-            .iter()
-            .flat_map(|m| m.to_cols_array().into_iter().flat_map(f32::to_le_bytes))
-            .collect();
-        let view = self.view(&bytes, None);
+        let data: Vec<f32> = mats.iter().flat_map(|m| m.to_cols_array()).collect();
+        let view = self.floats_view(&data, 16);
         self.accessor(view, F32, false, mats.len(), "MAT4")
     }
 }
@@ -365,7 +472,8 @@ pub fn glb_bytes_with(
         data: Vec::new(),
         views: Vec::new(),
         accessors: Vec::new(),
-        compress: options.compress,
+        compress: options.compress.then_some(options.codec),
+        filters: options.quantize,
         fallback: 0,
         quantized: false,
     };
@@ -503,7 +611,7 @@ pub fn glb_bytes_with(
         if let Some(c) = &mesh.colors {
             let d: Vec<f32> = c.iter().flat_map(|v| v.to_array()).collect();
             let a = match unorm16(d.iter().copied()).filter(|_| q) {
-                Some(u) => bin.accessor_u16(&u, 4, 4, "VEC4", true),
+                Some(u) => bin.accessor_color16(&d, &u),
                 None => bin.accessor_f32(&d, 4, "VEC4", false),
             };
             attrs.insert("COLOR_0".into(), json!(a));
@@ -648,11 +756,11 @@ pub fn glb_bytes_with(
     if bin.quantized {
         extensions.push("KHR_mesh_quantization");
     }
-    if bin.fallback > 0 {
-        extensions.push("EXT_meshopt_compression");
+    if let Some(codec) = bin.compress.filter(|_| bin.fallback > 0) {
+        extensions.push(codec.extension());
         buffers.push(json!({
             "byteLength": align4(bin.fallback),
-            "extensions": { "EXT_meshopt_compression": { "fallback": true } }
+            "extensions": { codec.extension(): { "fallback": true } }
         }));
     }
     let mut doc = json!({

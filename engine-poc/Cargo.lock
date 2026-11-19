@@ -852,9 +852,9 @@ checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
 
 [[package]]
 name = "polysmelt"
-version = "0.12.0"
+version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e80f798776fb730046338476b4ce600c29be7bf9b947561bd0edf0aae199b9f"
+checksum = "20e9ae6f5b034d798f265250d3ab09bf2e46ab6b23c46d19f07a077c8d3326f3"
 dependencies = [
  "bytemuck",
  "draco-core",

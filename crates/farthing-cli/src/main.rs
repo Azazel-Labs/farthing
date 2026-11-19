@@ -30,10 +30,16 @@ struct Cli {
     /// tools do not.
     #[arg(long, global = true)]
     compact: bool,
+    /// With `--compact`, compress with KHR_meshopt_compression instead: smaller, for viewers
+    /// that read the newer extension.
+    #[arg(long, global = true, requires = "compact")]
+    khr: bool,
 }
 
 /// `--compact`, for `save`.
 static COMPACT: AtomicBool = AtomicBool::new(false);
+/// `--khr`, for `save`.
+static KHR: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, ValueEnum)]
 enum ImpostorType {
@@ -383,7 +389,12 @@ fn save(s: &Scene, p: &Path) -> Result<()> {
     let glb = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("glb"));
     if glb && COMPACT.load(Ordering::Relaxed) {
         use farthing::io::{ExportTextures, GlbOptions, save_glb_with};
-        save_glb_with(s, p, &ExportTextures::default(), &GlbOptions::compact())
+        let options = if KHR.load(Ordering::Relaxed) {
+            GlbOptions::compact_khr()
+        } else {
+            GlbOptions::compact()
+        };
+        save_glb_with(s, p, &ExportTextures::default(), &options)
     } else {
         farthing::io::save(s, p)
     }
@@ -497,6 +508,7 @@ fn hlod_tree(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     COMPACT.store(cli.compact, Ordering::Relaxed);
+    KHR.store(cli.khr, Ordering::Relaxed);
     let t0 = Instant::now();
     match cli.cmd {
         Cmd::Info { input } => {

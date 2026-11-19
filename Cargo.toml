@@ -29,7 +29,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 gltf = { version = "1.4", default-features = false, features = ["import", "utils", "names", "extras"] }
 # glTF meshopt, Draco and quantization decoding, meshopt encoding for compact exports, and
 # (farthing's `formats` and `usd` features) the other model formats, read into glTF.
-polysmelt = { version = "0.12", default-features = false, features = ["gltf", "draco"] }
+polysmelt = { version = "0.13", default-features = false, features = ["gltf", "draco"] }
 tobj = { version = "4", default-features = false }
 mikktspace = { version = "0.3", default-features = false, features = ["glam"] }
 clap = { version = "4", features = ["derive"] }

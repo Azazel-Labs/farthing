@@ -22,7 +22,7 @@ mod obj;
 mod obj_quads;
 
 pub use gltf_export::{
-    ExportTextures, GlbOptions, glb_bytes, glb_bytes_with, save_glb, save_glb_with,
+    ExportTextures, GlbOptions, MeshoptCodec, glb_bytes, glb_bytes_with, save_glb, save_glb_with,
 };
 pub use gltf_import::{GltfMaterial, load_gltf, load_gltf_slice, load_gltf_with};
 pub use model::{MODEL_EXTENSIONS, load_model};
@@ -164,12 +164,18 @@ mod tests {
         let s = sample_scene();
         for opts in [
             GlbOptions::compact(),
+            GlbOptions::compact_khr(),
             GlbOptions {
                 quantize: true,
                 ..Default::default()
             },
             GlbOptions {
                 compress: true,
+                ..Default::default()
+            },
+            GlbOptions {
+                compress: true,
+                codec: MeshoptCodec::Khr { level: 0 },
                 ..Default::default()
             },
             GlbOptions {
@@ -203,6 +209,110 @@ mod tests {
                 uvs,
                 [Vec2::ZERO, Vec2::Y * 2.0, Vec2::X * 2.0, Vec2::ONE * 2.0]
             );
+            let colors = m.colors.as_ref().unwrap();
+            assert!(
+                colors
+                    .iter()
+                    .all(|c| (*c - Vec4::ONE).abs().max_element() < 1e-3)
+            );
+        }
+    }
+
+    /// Animation keys and inverse bind matrices compress too: exact without quantization,
+    /// through the quaternion and exponential filters with it, under both extensions.
+    #[test]
+    fn compressed_glb_animation_roundtrip() {
+        use crate::anim::{Animation, Curve, Interpolation, Track};
+        use crate::glam::Quat;
+        let mut s = sample_scene();
+        let times: Vec<f32> = (0..30).map(|i| i as f32 / 30.0).collect();
+        let mut track = Track::new(1);
+        track.translation = Some(Curve {
+            interpolation: Interpolation::Linear,
+            times: times.clone(),
+            values: times
+                .iter()
+                .map(|t| Vec3::new(t.sin() * 3.0, 1.0 + t * 0.25, -0.01 * t))
+                .collect(),
+        });
+        track.rotation = Some(Curve {
+            interpolation: Interpolation::Linear,
+            times: times.clone(),
+            values: times
+                .iter()
+                .map(|t| Quat::from_euler(glam::EulerRot::XYZ, t * 2.0, -t, t * 0.5))
+                .collect(),
+        });
+        track.scale = Some(Curve {
+            interpolation: Interpolation::Step,
+            times: times.clone(),
+            values: times.iter().map(|t| Vec3::splat(1.0 + t)).collect(),
+        });
+        s.skeletons[0].animations.push(Animation {
+            name: "wave".into(),
+            tracks: vec![track],
+        });
+        for (opts, ext, tolerance) in [
+            (
+                GlbOptions {
+                    compress: true,
+                    ..Default::default()
+                },
+                "EXT_meshopt_compression",
+                0.0_f32,
+            ),
+            (
+                GlbOptions {
+                    compress: true,
+                    codec: MeshoptCodec::KHR,
+                    ..Default::default()
+                },
+                "KHR_meshopt_compression",
+                0.0,
+            ),
+            (GlbOptions::compact(), "EXT_meshopt_compression", 1e-3),
+            (GlbOptions::compact_khr(), "KHR_meshopt_compression", 1e-3),
+        ] {
+            let bytes = glb_bytes_with(&s, &ExportTextures::default(), &opts).unwrap();
+            let doc = glb_json(&bytes);
+            assert_eq!(
+                doc["extensionsRequired"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap(),
+                ext
+            );
+            assert_eq!(doc["buffers"][1]["extensions"][ext]["fallback"], true);
+            // Only vertex attributes carry a stride, and every view but images is compressed.
+            for v in doc["bufferViews"].as_array().unwrap() {
+                assert!(v["extensions"][ext].is_object(), "{v}");
+                assert_eq!(v["byteStride"].is_null(), v["target"] != 34962, "{v}");
+            }
+            let (back, _) = load_gltf_slice(&bytes).unwrap();
+            let (a, b) = (&s.skeletons[0], &back.skeletons[0]);
+            assert_eq!(a.joints[1].inverse_bind, b.joints[1].inverse_bind);
+            let (ta, tb) = (&a.animations[0].tracks[0], &b.animations[0].tracks[0]);
+            let (ra, rb) = (ta.rotation.as_ref().unwrap(), tb.rotation.as_ref().unwrap());
+            assert_eq!(ra.times, rb.times);
+            for (x, y) in ra.values.iter().zip(&rb.values) {
+                assert!(x.dot(*y).abs() > 1.0 - tolerance.max(1e-6), "{x} {y}");
+            }
+            for (ca, cb) in [
+                (
+                    ta.translation.as_ref().unwrap(),
+                    tb.translation.as_ref().unwrap(),
+                ),
+                (ta.scale.as_ref().unwrap(), tb.scale.as_ref().unwrap()),
+            ] {
+                assert_eq!(ca.interpolation, cb.interpolation);
+                for (x, y) in ca.values.iter().zip(&cb.values) {
+                    assert!(
+                        (*x - *y).abs().max_element() <= tolerance * x.abs().max_element().max(1.0),
+                        "{x} {y}"
+                    );
+                }
+            }
         }
     }
 
@@ -248,6 +358,18 @@ mod tests {
             compact.len(),
             plain.len()
         );
+
+        // The newer codec (version 1, level 3) beats the first on the same data.
+        let khr =
+            glb_bytes_with(&s, &ExportTextures::default(), &GlbOptions::compact_khr()).unwrap();
+        assert!(
+            khr.len() < compact.len(),
+            "{} vs {}",
+            khr.len(),
+            compact.len()
+        );
+        let (back, _) = load_gltf_slice(&khr).unwrap();
+        assert_eq!(back.triangle_count(), s.triangle_count());
 
         let doc = glb_json(&compact);
         for ext in ["KHR_mesh_quantization", "EXT_meshopt_compression"] {

@@ -222,6 +222,7 @@ cargo install farthing-cli
 
 farthing lods model.glb -o lods/ --levels 4 --far-from 3   # LOD chain, far levels baked
 farthing lods model.glb -o lods/ --levels 4 --compact      # quantized, meshopt-compressed GLBs
+farthing lods model.glb -o lods/ --levels 4 --compact --khr  # smaller, KHR_meshopt_compression
 farthing reduce model.glb -o lod.glb --ratio 0.25           # one level
 farthing reduce model.glb -o lod.glb --ratio 0.25 --strict-seams --symmetry
 farthing remesh scene.glb -o proxy.glb --resolution 128 --triangles 3000
@@ -707,7 +708,7 @@ tex.normal.insert(0, baked.textures[channels::NORMAL].image.clone());
 save_glb(&out, "far.glb", &tex)?;              // glb_bytes(&out, &tex) for memory
 ```
 
-`GlbOptions::compact()` writes the smallest GLB: `KHR_mesh_quantization` (16-bit positions
+`GlbOptions::compact()` writes a small GLB: `KHR_mesh_quantization` (16-bit positions
 and UVs, 8-bit octahedral normals and tangents), `EXT_meshopt_compression`, and the
 `optimize_mesh` ordering. three.js reads it with `GLTFLoader.setMeshoptDecoder`, and the CLI
 writes it with `--compact`. Some tools (Blender among them) can't open it, so keep plain GLB
@@ -715,8 +716,21 @@ for authoring round trips. Skinned
 and morphed meshes keep float positions. Every export uses 16-bit indices when a mesh has
 fewer than 65,536 vertices.
 
+Compression covers every buffer but images: vertices, indices, animation keys and inverse bind matrices,
+with meshoptimizer's codecs and filters. With quantization on, rotation keys go through the
+quaternion filter (12 bits) and other keys through the exponential filter. `MeshoptCodec`
+picks the extension:
+
+- `Ext` (the default), `EXT_meshopt_compression`: the widest reader support.
+- `Khr { level }`, `KHR_meshopt_compression`: the Khronos extension, with version 1 of the
+  vertex codec and the color filter for quantized vertex colors. It is usually smaller;
+  `level` 0–9 trades encode time for size.
+  `GlbOptions::compact_khr()` (CLI: `--compact --khr`) is `compact()` with `MeshoptCodec::KHR`
+  (level 3). Older loaders may not know the KHR name yet.
+
 ```rust
 save_glb_with(&out, "far.glb", &tex, &GlbOptions::compact())?;
+save_glb_with(&out, "far_khr.glb", &tex, &GlbOptions::compact_khr())?;
 ```
 
 The option structs implement `serde`, so pipeline settings can live in your asset database.
