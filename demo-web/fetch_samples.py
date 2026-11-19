@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Downloads the demo's sample models into web/samples/, with an index.json the page reads.
 
-The models are CC0 assets from the Khronos glTF Sample Assets, pinned to one commit. They're
-fetched at build time and served with the page, not committed. A model whose metadata lists
-any license other than CC0-1.0 is refused. A .glb is copied as is; a multi-file .gltf is packed
+The models are from the Khronos glTF Sample Assets, pinned to one commit. They're fetched at
+build time and served with the page, not committed. Each is CC0, except the models listed in
+ATTRIBUTED, whose parts may also be CC BY 4.0: the index then carries an attribution naming
+every author, their part and its license, which the page shows with the model. A model with any
+other license is refused. A .glb is copied as is; a multi-file .gltf is packed
 into a .zip with its buffers and textures (the demo loads both). Each model's screenshot is saved
 next to it as its thumbnail. Files already downloaded are kept, so a rerun only fetches what's
 missing.
@@ -34,7 +36,13 @@ SAMPLES = [
     ("BoomBox", "glTF-Binary"),
     ("Lantern", "glTF-Binary"),
     ("WaterBottle", "glTF-Binary"),
+    ("Fox", "glTF-Binary"),
 ]
+
+# Models allowed to have CC BY 4.0 parts (credited in the index and on the page). The Fox's
+# rigging, animation and glTF conversion are CC BY; it's the demo's animated, skinned model.
+ATTRIBUTED = {"Fox"}
+LICENSE_NAMES = {"CC0-1.0": "CC0 1.0", "CC-BY-4.0": "CC BY 4.0"}
 
 OUT = pathlib.Path(__file__).resolve().parent / "web" / "samples"
 
@@ -48,8 +56,9 @@ def get(url: str) -> bytes:
 def fetch(name: str, variant: str) -> dict:
     meta = json.loads(get(f"{RAW}/{name}/metadata.json"))
     licenses = {entry.get("license") for entry in meta.get("legal", [])}
-    if licenses != {"CC0-1.0"}:
-        sys.exit(f"{name}: licensed {sorted(licenses)}, not CC0-1.0 only; refusing to bundle it")
+    allowed = {"CC0-1.0", "CC-BY-4.0"} if name in ATTRIBUTED else {"CC0-1.0"}
+    if not licenses or not licenses <= allowed:
+        sys.exit(f"{name}: licensed {sorted(licenses)}, not {' / '.join(sorted(allowed))}; refusing to bundle it")
 
     if variant == "glTF-Binary":
         file = f"{name}.glb"
@@ -82,17 +91,29 @@ def fetch(name: str, variant: str) -> dict:
 
     names = [x for e in meta["legal"] for x in (e.get("artist"), e.get("owner"))]
     credit = ", ".join(dict.fromkeys(x for x in names if x and x != "Public")) or "Khronos"
+    license = "CC-BY-4.0" if "CC-BY-4.0" in licenses else "CC0-1.0"
     size = dest.stat().st_size
-    print(f"{name:14} {file:18} {size / 1e6:6.1f} MB  CC0-1.0  {credit}")
-    return {
+    print(f"{name:14} {file:18} {size / 1e6:6.1f} MB  {license:9}  {credit}")
+    entry = {
         "name": meta.get("name", name),
         "file": file,
         "bytes": size,
         "thumb": thumb,
         "credit": credit,
-        "license": "CC0-1.0",
+        "license": license,
         "source": f"{BROWSE}/{name}",
     }
+    if license != "CC0-1.0":
+        # "Model by PixelMannen (CC0 1.0); rigging & animation by tomkranis (CC BY 4.0); ..."
+        parts = []
+        for e in meta["legal"]:
+            who = e.get("artist") or e.get("owner") or "unknown"
+            what = (e.get("what") or "model").lower().replace("gltf", "glTF")
+            parts.append(f"{what} by {who} ({LICENSE_NAMES.get(e.get('license'), e.get('license'))})")
+        text = "; ".join(parts)
+        entry["attribution"] = text[0].upper() + text[1:] + ". Modified by the demo (reduced, rebaked)."
+        entry["license_url"] = "https://creativecommons.org/licenses/by/4.0/"
+    return entry
 
 
 def main() -> None:

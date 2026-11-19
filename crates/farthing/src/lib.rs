@@ -27,6 +27,8 @@
 //! * [`visibility`] — camera-sampled visibility culling and texel budgets.
 //! * [`impostor`] — octahedral, flipbook, single-view and billboard-cloud impostors.
 //! * [`bones`] — skinning LOD: influence limiting and bone removal.
+//! * [`anim`] — skeletal animation: sampling clips, and baking them into a GPU pose palette
+//!   that a vertex shader plays back for crowds of units without the CPU.
 //! * `io` — glTF 2.0 and OBJ import/export (feature `io`, on by default).
 
 #![forbid(unsafe_code)]
@@ -51,6 +53,7 @@ pub mod scene;
 
 // Processors.
 pub mod aggregate;
+pub mod anim;
 pub mod bake;
 pub mod bones;
 pub mod cluster;
@@ -63,8 +66,9 @@ pub mod uv;
 pub mod visibility;
 pub mod voxel;
 
+pub use anim::Animation;
 pub use error::{Error, Result};
 pub use glam;
 pub use math::Aabb;
 pub use mesh::{Mesh, MorphTarget, Skin};
-pub use scene::{Instance, Joint, MaterialId, MaterialSlot, Scene, Skeleton};
+pub use scene::{Instance, Joint, MaterialId, MaterialSlot, Scene, Skeleton, Transform};

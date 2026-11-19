@@ -1,3 +1,4 @@
+use crate::anim::{Curve, Interpolation};
 use crate::image::Texture;
 use crate::reduce::optimize::optimize_mesh;
 use crate::{Error, Mesh, Result, Scene};
@@ -5,6 +6,7 @@ use glam::{Mat4, Vec3};
 use polysmelt::meshopt::{encode_index_buffer, encode_oct8, encode_vertex_buffer};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Optional textures to embed per material slot, so outputs open in any glTF viewer.
@@ -233,6 +235,41 @@ impl Bin {
         };
         self.accessor(view, component, false, data.len(), "SCALAR")
     }
+    /// An animation sampler: its key times (one accessor per distinct run of times, shared)
+    /// and its values, flattened to `comps` floats each.
+    fn sampler<T: Copy>(
+        &mut self,
+        times_cache: &mut HashMap<Vec<u32>, usize>,
+        curve: &Curve<T>,
+        comps: usize,
+        flatten: impl Fn(T) -> Vec<f32>,
+    ) -> Value {
+        let key: Vec<u32> = curve.times.iter().map(|t| t.to_bits()).collect();
+        let input = match times_cache.get(&key) {
+            Some(&a) => a,
+            None => {
+                let bytes: Vec<u8> = curve.times.iter().flat_map(|t| t.to_le_bytes()).collect();
+                let view = self.view(&bytes, None);
+                let a = self.accessor(view, F32, false, curve.times.len(), "SCALAR");
+                let (lo, hi) = (curve.times[0], curve.times[curve.times.len() - 1]);
+                self.accessors[a]["min"] = json!([lo]);
+                self.accessors[a]["max"] = json!([hi]);
+                times_cache.insert(key, a);
+                a
+            }
+        };
+        let values: Vec<f32> = curve.values.iter().flat_map(|&v| flatten(v)).collect();
+        let bytes: Vec<u8> = values.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let view = self.view(&bytes, None);
+        let kind = if comps == 4 { "VEC4" } else { "VEC3" };
+        let output = self.accessor(view, F32, false, curve.values.len(), kind);
+        let interpolation = match curve.interpolation {
+            Interpolation::Step => "STEP",
+            Interpolation::Linear => "LINEAR",
+            Interpolation::CubicSpline => "CUBICSPLINE",
+        };
+        json!({ "input": input, "output": output, "interpolation": interpolation })
+    }
     fn accessor_mat4(&mut self, mats: &[Mat4]) -> usize {
         let bytes: Vec<u8> = mats
             .iter()
@@ -295,7 +332,8 @@ fn png_bytes(tex: &Texture, srgb: bool) -> Result<Vec<u8>> {
 }
 
 /// Writes a binary glTF. Each mesh becomes one glTF mesh with one primitive per material
-/// slot used (vertex accessors shared). Instances become nodes; skeletons become joint nodes.
+/// slot used (vertex accessors shared). Instances become nodes; skeletons become joint nodes
+/// (with their rest transforms), and their clips animations.
 /// Attributes are floats, and indices 16-bit when a mesh has at most 65,535 vertices.
 pub fn save_glb(scene: &Scene, path: impl AsRef<Path>, textures: &ExportTextures) -> Result<()> {
     save_glb_with(scene, path, textures, &GlbOptions::default())
@@ -520,15 +558,56 @@ pub fn glb_bytes_with(
     let mut nodes: Vec<Value> = Vec::new();
     let mut scene_roots: Vec<usize> = Vec::new();
     let mut skins = Vec::new();
+    let mut animations: Vec<Value> = Vec::new();
+    let mut times_cache = HashMap::new();
     for sk in &scene.skeletons {
         let base = nodes.len();
-        let worlds: Vec<Mat4> = (0..sk.joints.len()).map(|j| sk.bind_world(j)).collect();
-        for (j, joint) in sk.joints.iter().enumerate() {
-            let local = match joint.parent {
-                Some(p) => worlds[p].inverse() * worlds[j],
-                None => worlds[j],
-            };
-            nodes.push(json!({ "name": joint.name, "matrix": local.to_cols_array() }));
+        for joint in &sk.joints {
+            let r = joint.rest;
+            let mut node = json!({ "name": joint.name });
+            if r.translation != Vec3::ZERO {
+                node["translation"] = json!(r.translation.to_array());
+            }
+            if r.rotation != glam::Quat::IDENTITY {
+                node["rotation"] = json!(r.rotation.to_array());
+            }
+            if r.scale != Vec3::ONE {
+                node["scale"] = json!(r.scale.to_array());
+            }
+            nodes.push(node);
+        }
+        for clip in &sk.animations {
+            let mut samplers = Vec::new();
+            let mut channels = Vec::new();
+            for track in clip.tracks.iter().filter(|t| t.joint < sk.joints.len()) {
+                let node = base + track.joint;
+                let mut add = |sampler: Value, path: &str| {
+                    channels.push(json!({ "sampler": samplers.len(), "target": { "node": node, "path": path } }));
+                    samplers.push(sampler);
+                };
+                if let Some(c) = track.translation.as_ref().filter(|c| c.is_valid()) {
+                    add(
+                        bin.sampler(&mut times_cache, c, 3, |v| v.to_array().to_vec()),
+                        "translation",
+                    );
+                }
+                if let Some(c) = track.rotation.as_ref().filter(|c| c.is_valid()) {
+                    add(
+                        bin.sampler(&mut times_cache, c, 4, |v| v.to_array().to_vec()),
+                        "rotation",
+                    );
+                }
+                if let Some(c) = track.scale.as_ref().filter(|c| c.is_valid()) {
+                    add(
+                        bin.sampler(&mut times_cache, c, 3, |v| v.to_array().to_vec()),
+                        "scale",
+                    );
+                }
+            }
+            if !channels.is_empty() {
+                animations
+                    .push(json!({ "name": clip.name, "samplers": samplers, "channels": channels }));
+            }
         }
         for (j, joint) in sk.joints.iter().enumerate() {
             match joint.parent {
@@ -593,6 +672,9 @@ pub fn glb_bytes_with(
     }
     if !skins.is_empty() {
         doc["skins"] = json!(skins);
+    }
+    if !animations.is_empty() {
+        doc["animations"] = json!(animations);
     }
     if !images.is_empty() {
         doc["images"] = json!(images);

@@ -13,6 +13,7 @@
   --k-clusters: #2a8a5a;
   --k-hlod: #9a5cc6;
   --k-splats: #c0702a;
+  --k-crowd: #c03a6a;
   --gh-bg: #1f2328;
   --gh-ink: #ffffff;
   color-scheme: light;
@@ -32,6 +33,7 @@
     --k-clusters: #5cc492;
     --k-hlod: #c194ea;
     --k-splats: #eda366;
+    --k-crowd: #ef7fa6;
     --gh-bg: #f6f8fa;
     --gh-ink: #1f2328;
     color-scheme: dark;
@@ -260,6 +262,7 @@ tbody tr.pending td { color: var(--muted); font-style: italic; }
 .kind.clusters { border-color: var(--k-clusters); color: var(--k-clusters); }
 .kind.hlod { border-color: var(--k-hlod); color: var(--k-hlod); }
 .kind.splats { border-color: var(--k-splats); color: var(--k-splats); }
+.kind.crowd { border-color: var(--k-crowd); color: var(--k-crowd); }
 td.label { max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 td button { padding: 0 8px; font-size: 12px; }
 

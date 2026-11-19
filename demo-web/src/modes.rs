@@ -9,6 +9,8 @@
 //!   cell tree with a merged proxy per cell; [`Demo::select`] picks the cut.
 //! * **Splats** ([`run_splats`]): a progressive surfel cloud turned into Gaussian splats at
 //!   three densities.
+//! * **Crowd** ([`run_crowd`]): a skinned, animated model's pose palette, bone-reduced levels
+//!   and vertex animation, for the engine's GPU crowd of thousands of units.
 //!
 //! Each run reports through [`Event::Data`] (a JSON description and typed arrays) and keeps
 //! only what selection and downloads need in [`Extra`].
@@ -17,7 +19,11 @@ use crate::pipeline::{
     Buffer, Demo, Event, LevelInfo, LevelKind, LodOptions, MaterialHost, compact_glb,
     original_textures, reference_ppr, scene_payload, switch_distance,
 };
+use farthing::anim::bake::{BakeOptions as AnimBakeOptions, bake, measure};
+use farthing::anim::sample_poses;
+use farthing::anim::vat::{bake_vat, measure_vat};
 use farthing::bake::BakeOptions;
+use farthing::bones::{BoneReductionOptions, apply_bone_reduction, plan_bone_reduction};
 use farthing::cluster::{
     ClusterDag, ClusterOptions, GpuClusterDag, GpuOptions, LodView, build_cluster_dag,
 };
@@ -916,4 +922,208 @@ pub(crate) fn run_splats(
     demo.extra = Extra::Splats(kept);
     emit(Event::Stage("done"));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Crowd
+
+/// Projected radius, in pixels, from which a crowd unit draws each level (nearest first): the
+/// whole mesh and skeleton, the reduced mesh with fewer bones, the vertex animation.
+pub const CROWD_PIXELS: [f32; 3] = [100.0, 25.0, 0.0];
+
+/// A skinned crowd's levels from the first skinned mesh and its skeleton's clips: a pose
+/// palette ([`farthing::anim::bake`]) for every level, the whole mesh, a reduced mesh skinned
+/// to [`LodOptions::crowd_bones`] bones ([`farthing::bones`], planned on the clips' poses),
+/// and a coarser mesh baked to a vertex animation ([`farthing::anim::vat`]). The page builds
+/// the engine's GPU crowd from them and animates the units; it also gets the whole mesh's
+/// weights skinned to the reduced bones, to show what the bone reduction alone changes.
+pub(crate) fn run_crowd(
+    demo: &mut Demo,
+    opts: &LodOptions,
+    now: &dyn Fn() -> f64,
+    emit: &mut dyn FnMut(Event),
+) -> Result<(), String> {
+    emit_original(demo, emit);
+    let scene = &demo.scene;
+    let not_skinned =
+        || "a crowd needs a skinned model with a skeleton: try the Fox sample".to_owned();
+    let mi = scene
+        .meshes
+        .iter()
+        .position(|m| m.skin.is_some())
+        .ok_or_else(not_skinned)?;
+    let si = scene
+        .instances
+        .iter()
+        .find(|i| i.mesh == mi)
+        .and_then(|i| i.skeleton)
+        .unwrap_or(0);
+    let sk = scene.skeletons.get(si).ok_or_else(not_skinned)?;
+    let t0 = now();
+    let mut mesh = scene.meshes[mi].clone();
+    mesh.morph_targets.clear();
+    if mesh.normals.is_none() {
+        mesh.compute_normals(60.0);
+    }
+    farthing::bones::limit_influences(&mut mesh, 4);
+
+    emit(Event::Stage("Crowd: baking the pose palette"));
+    let bake_opts = AnimBakeOptions::default();
+    let palette = bake(sk, &bake_opts);
+    let fanm = palette.to_bytes();
+    let palette_err = measure(&palette, sk, &mesh).map_err(err)?;
+    let size = palette_err.size.max(f32::MIN_POSITIVE);
+
+    // Where the clips take the mesh: units stand on its lowest point and are spaced by its
+    // reach.
+    let poses = sample_poses(sk, 15.0);
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    let skin = mesh.skin.as_ref().expect("a skinned mesh");
+    for frame in poses.iter().step_by(2) {
+        let mats = sk.skinning_matrices(frame);
+        for (v, &p) in mesh.positions.iter().enumerate() {
+            let q = skin_point(&mats, skin.joints[v], skin.weights[v], p);
+            lo = lo.min(q);
+            hi = hi.max(q);
+        }
+    }
+    if lo.x > hi.x {
+        (lo, hi) = (Vec3::ZERO, Vec3::ZERO);
+    }
+
+    emit(Event::Stage("Crowd: reducing bones"));
+    let joints = sk.joints.len();
+    let bones = opts.crowd_bones.clamp(1, joints.max(1));
+    let red = plan_bone_reduction(
+        sk,
+        &[&mesh],
+        Some(&poses),
+        &BoneReductionOptions {
+            max_bones: Some(bones),
+            ..Default::default()
+        },
+    )
+    .map_err(err)?;
+    // The whole mesh on the reduced bones: what the reduction alone moves.
+    let mut fewer = mesh.clone();
+    apply_bone_reduction(&mut fewer, &red);
+    let fewer_skin = fewer.skin.as_ref().expect("a skinned mesh");
+    let mut bone_gap = 0.0f32;
+    for frame in poses.iter().step_by(2) {
+        let mats = sk.skinning_matrices(frame);
+        for (v, &p) in mesh.positions.iter().enumerate() {
+            let a = skin_point(&mats, skin.joints[v], skin.weights[v], p);
+            let b = skin_point(&mats, fewer_skin.joints[v], fewer_skin.weights[v], p);
+            bone_gap = bone_gap.max(a.distance(b));
+        }
+    }
+
+    emit(Event::Stage("Crowd: reducing triangles"));
+    let ratio = opts.crowd_ratio.clamp(0.02, 1.0);
+    let tris = mesh.triangle_count();
+    let reduce = |m: &Mesh, keep: f32| -> Result<Mesh, String> {
+        let target = ((tris as f32 * keep) as usize).max(4);
+        if target >= m.triangle_count() {
+            return Ok(m.clone());
+        }
+        let so = SimplifyOptions {
+            target_triangles: Some(target),
+            ..Default::default()
+        };
+        Ok(simplify(m, &so).map_err(err)?.mesh)
+    };
+    // The middle level is reduced from the whole mesh on the reduced bones, so it carries them.
+    let mid = reduce(&fewer, ratio)?;
+    let far = reduce(&mesh, ratio * 0.25)?;
+
+    emit(Event::Stage("Crowd: baking the vertex animation"));
+    let vat = bake_vat(sk, &far, &bake_opts).map_err(err)?;
+    let vat_err = measure_vat(&vat, sk, &far).map_err(err)?;
+    let fvat = vat.to_bytes();
+
+    let uvs = |m: &Mesh| m.uvs.first().map_or_else(Vec::new, |u| flat_vec2(u));
+    let joints_of = |m: &Mesh| -> Vec<u32> {
+        let s = m.skin.as_ref().expect("a skinned mesh");
+        s.joints.iter().flatten().map(|&j| j as u32).collect()
+    };
+    let weights_of = |m: &Mesh| -> Vec<f32> {
+        let s = m.skin.as_ref().expect("a skinned mesh");
+        s.weights.iter().flatten().copied().collect()
+    };
+    let skinned = |m: &Mesh| {
+        [
+            Buffer::F32(flat_vec3(&m.positions)),
+            Buffer::F32(flat_vec3(m.normals.as_deref().unwrap_or(&[]))),
+            Buffer::F32(uvs(m)),
+            Buffer::U32(joints_of(m)),
+            Buffer::F32(weights_of(m)),
+            Buffer::U32(m.indices.clone()),
+        ]
+    };
+    let mut buffers = vec![Buffer::U8(fanm.clone())];
+    buffers.extend(skinned(&mesh));
+    buffers.extend(skinned(&mid));
+    buffers.extend([
+        Buffer::U8(fvat.clone()),
+        Buffer::F32(uvs(&far)),
+        Buffer::U32(far.indices.clone()),
+        Buffer::U32(joints_of(&fewer)),
+        Buffer::F32(weights_of(&fewer)),
+    ]);
+    let level = |kind: &str, m: &Mesh, bones: usize, pixels: f32| {
+        json!({
+            "kind": kind,
+            "triangles": m.triangle_count(),
+            "vertices": m.vertex_count(),
+            "bones": bones,
+            "pixels": pixels,
+        })
+    };
+    let json = json!({
+        "clips": palette.clips.iter().map(|c| json!({
+            "name": c.name,
+            "duration": c.duration,
+            "looping": c.looping,
+            "frames": c.frame_count,
+        })).collect::<Vec<_>>(),
+        "joints": joints,
+        "bones": red.kept_count(),
+        "size": size,
+        "bounds": [lo.to_array(), hi.to_array()],
+        "material": mesh.material_ids.first().copied().unwrap_or(0),
+        "levels": [
+            level("skinned", &mesh, joints, CROWD_PIXELS[0]),
+            level("skinned", &mid, red.kept_count(), CROWD_PIXELS[1]),
+            level("vat", &far, 0, CROWD_PIXELS[2]),
+        ],
+        "fps": bake_opts.fps,
+        "frames": palette.frame_count(),
+        "palette_bytes": fanm.len(),
+        "vat_bytes": fvat.len(),
+        "palette_error": palette_err.max(),
+        "vat_error": vat_err.max(),
+        "bone_gap": bone_gap,
+        "ms": now() - t0,
+    })
+    .to_string();
+    emit(Event::Data {
+        kind: "crowd",
+        json,
+        buffers,
+    });
+    emit(Event::Stage("done"));
+    Ok(())
+}
+
+/// A vertex skinned with up to four joints (weights as stored; they sum to one).
+fn skin_point(mats: &[Mat4], joints: [u16; 4], weights: [f32; 4], p: Vec3) -> Vec3 {
+    let mut out = Vec3::ZERO;
+    for (j, w) in joints.into_iter().zip(weights) {
+        if w > 0.0
+            && let Some(m) = mats.get(j as usize)
+        {
+            out += m.transform_point3(p) * w;
+        }
+    }
+    out
 }

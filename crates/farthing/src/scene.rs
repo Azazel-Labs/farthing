@@ -1,8 +1,9 @@
 //! Scenes: meshes, instances, skeletons and opaque material slots.
 
+use crate::anim::Animation;
 use crate::math::Aabb;
 use crate::mesh::Mesh;
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// An opaque handle to a material owned by the [`crate::host::RenderHost`].
@@ -20,23 +21,107 @@ pub struct MaterialSlot {
     pub id: MaterialId,
 }
 
+/// A translation, rotation and scale, applied scale first: a joint's local transform, as glTF
+/// nodes and animation channels have it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Transform {
+    pub translation: Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
+}
+
+impl Transform {
+    pub const IDENTITY: Transform = Transform {
+        translation: Vec3::ZERO,
+        rotation: Quat::IDENTITY,
+        scale: Vec3::ONE,
+    };
+
+    pub fn matrix(&self) -> Mat4 {
+        Mat4::from_scale_rotation_translation(self.scale, self.rotation, self.translation)
+    }
+
+    /// Decomposes an affine matrix. Shear is lost.
+    pub fn from_matrix(m: Mat4) -> Transform {
+        let (scale, rotation, translation) = m.to_scale_rotation_translation();
+        Transform {
+            translation,
+            rotation: rotation.normalize(),
+            scale,
+        }
+    }
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Transform::IDENTITY
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Joint {
     pub name: String,
     pub parent: Option<usize>,
     /// Inverse of the joint's world-space bind matrix.
     pub inverse_bind: Mat4,
+    /// The rest pose: the joint's transform relative to its parent joint (to the skeleton's
+    /// space, for a root). An animation's tracks replace parts of it.
+    /// [`Skeleton::rest_from_bind`] fills it in from the bind pose.
+    pub rest: Transform,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Skeleton {
     pub name: String,
     pub joints: Vec<Joint>,
+    /// The clips that animate it: tracks that replace parts of [`Joint::rest`] over time.
+    pub animations: Vec<Animation>,
 }
 
 impl Skeleton {
     pub fn bind_world(&self, joint: usize) -> Mat4 {
         self.joints[joint].inverse_bind.inverse()
+    }
+
+    /// Sets every joint's [`Joint::rest`] to its bind pose, relative to its parent's.
+    pub fn rest_from_bind(&mut self) {
+        let worlds: Vec<Mat4> = (0..self.joints.len()).map(|j| self.bind_world(j)).collect();
+        for (j, joint) in self.joints.iter_mut().enumerate() {
+            let local = match joint.parent {
+                Some(p) => worlds[p].inverse() * worlds[j],
+                None => worlds[j],
+            };
+            joint.rest = Transform::from_matrix(local);
+        }
+    }
+
+    /// Every joint's [`Joint::rest`].
+    pub fn rest_pose(&self) -> Vec<Transform> {
+        self.joints.iter().map(|j| j.rest).collect()
+    }
+
+    /// The joints' matrices in the skeleton's space for local transforms (one per joint), each
+    /// its parent's times its own.
+    pub fn world_matrices(&self, locals: &[Transform]) -> Vec<Mat4> {
+        let mut world = vec![Mat4::IDENTITY; self.joints.len()];
+        for j in self.topological_order() {
+            let local = locals.get(j).map_or(Mat4::IDENTITY, Transform::matrix);
+            world[j] = match self.joints[j].parent {
+                Some(p) => world[p] * local,
+                None => local,
+            };
+        }
+        world
+    }
+
+    /// Skinning matrices for joint matrices from [`Skeleton::world_matrices`]: each times the
+    /// joint's inverse bind matrix, so they take bind-pose vertices to the pose.
+    pub fn skinning_matrices(&self, worlds: &[Mat4]) -> Vec<Mat4> {
+        worlds
+            .iter()
+            .zip(&self.joints)
+            .map(|(w, j)| *w * j.inverse_bind)
+            .collect()
     }
     pub fn children(&self, joint: usize) -> impl Iterator<Item = usize> + '_ {
         self.joints
@@ -212,10 +297,12 @@ mod tests {
             name: String::new(),
             parent: p,
             inverse_bind: Mat4::IDENTITY,
+            rest: Transform::IDENTITY,
         };
         let s = Skeleton {
             name: "s".into(),
             joints: vec![j(Some(2)), j(None), j(Some(1))],
+            animations: Vec::new(),
         };
         assert_eq!(s.topological_order(), vec![1, 2, 0]);
     }

@@ -196,7 +196,8 @@ for.
 | **Aggregation** | Merges many objects into one draw call | Material classes, island repacking by texel density, texel copy |
 | **Impostors** | Cards for the far distance | Octahedral, hemi-octahedral, flipbook or single view, with an optional second depth layer, billboard clouds and progressive surfel clouds, which also export as 3D Gaussian splats (`.ply`) shaped to the surface each one stands for. Reference WGSL included |
 | **Visibility & occluders** | Removes what can't be seen and builds occlusion geometry | Camera-sampled ID renders (alpha-aware through your engine), plus conservative self-tuning occluder meshes and boxes |
-| **Bones** | Fewer joints and influences for far LODs | Leaf-first removal by skinned error, influence limiting |
+| **Bones** | Fewer joints and influences for far LODs | Leaf-first removal by skinned error over the clips' poses, influence limiting |
+| **Animation** | Skeletal clips for GPU crowds: thousands of units with no per-frame CPU work | glTF clips in and out. Clips baked to a quantized pose palette (`.fanm`) that a vertex shader samples by clip and time, shared by every bone LOD, and vertex animation (`.fvat`) for the farthest levels. Both measured against exact sampling. Reference WGSL included |
 | **I/O** | glTF/GLB (skins, morphs, embedded textures) and OBJ; FBX, 3MF, 3DS, PLY, STL, MagicaVoxel and USD in | Optional `io`, `formats` and `usd` features |
 
 **farthing never decides what anything looks like.** It handles geometry, UVs,
@@ -227,6 +228,7 @@ farthing remesh scene.glb -o proxy.glb --resolution 128 --triangles 3000
 farthing uv far.glb -o far_uv.glb
 farthing occluder scene.glb -o occ.glb --triangles 300 --boxes 8
 farthing bones character.glb -o char_lod.glb --ratio 0.5 --influences 2
+farthing anim character.glb -o character.fanm --vat character.fvat   # crowd animation
 farthing quad-reduce character.obj -o character_lod.obj --ratio 0.25
 farthing clusters model.glb -o dag.json                     # Nanite-style cluster DAG
 farthing hlod block.glb -o far.glb --triangles 2000 --hemisphere   # distant proxy of an area
@@ -666,8 +668,30 @@ remap_joint_indices(&mut mesh, &remap);
 limit_influences(&mut mesh, 2);
 ```
 
-Pass animation poses as the third argument and each bone's removal error is measured in
-motion, not just from the bind pose.
+Pass animation poses as the third argument (`farthing::anim::sample_poses`) and each bone's
+removal error is measured in motion, not just from the bind pose.
+
+### Animation for crowds
+
+A crowd shares one pose palette per skeleton. A unit's state is just its clip and start time,
+so the CPU writes to the GPU only when a unit changes clip:
+
+```rust
+use farthing::anim::{bake, vat};
+
+let palette = bake::bake(&skeleton, &bake::BakeOptions::default());
+std::fs::write("fox.fanm", palette.to_bytes())?;
+let err = bake::measure(&palette, &skeleton, &mesh)?;   // worst vertex move per clip
+let far = vat::bake_vat(&skeleton, &far_mesh, &bake::BakeOptions::default())?;
+std::fs::write("fox.fvat", far.to_bytes())?;
+```
+
+Every bone LOD reads the same palette: `apply_bone_reduction` re-links vertices to kept joints
+without renumbering them, so don't compact the skeleton of a level that shares one.
+`bake::REFERENCE_SHADER` is the palette lookup in WGSL. `engine-poc` draws whole crowds this
+way: a compute pass culls the units and picks each one's level by its size on screen, then
+one indirect instanced draw per level. The browser demo's *GPU crowd* example runs it on the
+[Fox](https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Fox).
 
 ### Writing results
 
@@ -727,7 +751,8 @@ are in [docs/research/](docs/research/README.md).
 
 ```
 crates/farthing/       the library: data model at the root, then io/ reduce/ uv/ bake/
-                       aggregate/ voxel/ visibility/ impostor/ bones/, reference WGSL in shaders/
+                       aggregate/ voxel/ visibility/ impostor/ bones/ anim/, reference WGSL
+                       in shaders/
 crates/farthing-cli/   the `farthing` binary
 demo-web/              WebAssembly browser demo (separate workspace)
 engine-poc/            wgpu engine implementing RenderHost (separate workspace)

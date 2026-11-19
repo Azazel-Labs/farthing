@@ -30,8 +30,9 @@
     <section id="samples" hidden>
       <h2>Samples</h2>
       <div class="cards" id="sample-cards"></div>
-      <small class="credit">CC0 models from the
+      <small class="credit">CC0 and CC BY models from the
         <a href="https://github.com/KhronosGroup/glTF-Sample-Assets" target="_blank" rel="noopener">Khronos glTF Sample Assets</a>.</small>
+      <small class="credit" id="sample-attribution" hidden></small>
     </section>
 
     <section id="asset" hidden>
@@ -50,6 +51,7 @@
             <option value="clusters">Cluster DAG</option>
             <option value="hlod">HLOD cells</option>
             <option value="splats">Gaussian splats</option>
+            <option value="crowd">GPU crowd (skinned)</option>
           </select>
         </label>
         <p class="hint" id="mode-hint"></p>
@@ -123,6 +125,26 @@
           </select>
         </label>
         <label class="check" title="Shape each Gaussian from the surface patch it covers, instead of a round disc"><input type="checkbox" name="splat_footprints" checked> Footprint shapes</label>
+      </fieldset>
+
+      <fieldset data-modes="crowd">
+        <legend>Crowd</legend>
+        <label class="select" title="Bones the middle level keeps: the bone reduction merges the rest into their parents by how far that moves the skin over the clips">Middle level bones
+          <select name="crowd_bones">
+            <option value="6">6</option>
+            <option value="8">8</option>
+            <option value="12" selected>12</option>
+            <option value="16">16</option>
+            <option value="20">20</option>
+          </select>
+        </label>
+        <label class="select" title="Fraction of the triangles the middle level keeps; the far level, a baked vertex animation, keeps a quarter of that">Middle level triangles
+          <select name="crowd_ratio">
+            <option value="0.25">25%</option>
+            <option value="0.4" selected>40%</option>
+            <option value="0.6">60%</option>
+          </select>
+        </label>
       </fieldset>
 
       <fieldset data-modes="chain">
@@ -427,6 +449,17 @@
           <label class="check" data-cut="clusters" data-gpu title="Skip clusters outside the view"><input type="checkbox" id="cull-frustum" checked> Frustum culling</label>
           <label class="check" data-cut="clusters" data-gpu title="Skip clusters whose triangles all face away (by their normal cones)"><input type="checkbox" id="cull-cone" checked> Back-face culling</label>
           <label class="check" data-cut="clusters" data-gpu title="Split the view: a second camera circles the model close up. Pages stream for both views at once."><input type="checkbox" id="second-camera"> Second camera</label>
+          <label class="select" data-cut="crowd" title="Units in the crowd, in squads of 25 that change clip together">Units
+            <select id="crowd-units">
+              <option value="1000">1,000</option>
+              <option value="5000" selected>5,000</option>
+              <option value="20000">20,000</option>
+              <option value="50000">50,000</option>
+            </select>
+          </label>
+          <label class="check" data-cut="crowd" title="Blue: all bones; green: fewer bones and triangles; amber: the baked vertex animation"><input type="checkbox" id="crowd-lods"> Tint by level</label>
+          <label class="check" data-cut="crowd" title="Skip units outside the view, in the compute pass"><input type="checkbox" id="crowd-cull" checked> Frustum culling</label>
+          <label class="check" data-cut="crowd" title="Two units side by side playing the same clip: left on every bone, right on the reduced bones, same mesh"><input type="checkbox" id="crowd-compare"> Bones: before and after</label>
           <label class="select" data-cut="splats">Draw
             <select id="splat-draw">
               <option value="gauss">Gaussians (sorted)</option>

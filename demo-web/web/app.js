@@ -109,6 +109,8 @@ function home() {
   if (!orbit || !focus()) return;
   syncFocus();
   orbit.home();
+  // A focus may ask to start closer than the distance that frames all of it.
+  if (focus().distance) orbit.setDistance(focus().distance);
 }
 
 // Line overlays: colors are sRGB like CSS, the engine wants linear ones; widths are CSS pixels.
@@ -471,7 +473,7 @@ function render() {
     } else drawView(levels[shown].model, 0, bw, camera);
     gpu.endFrame();
     magEl.hidden = true;
-    hud(label(shown), second ? "Second camera, circling" : "");
+    hud(label(shown), second ? "Second camera, circling" : (shown === 1 && extra?.hud?.()) || "");
   }
 }
 
@@ -485,13 +487,14 @@ requestAnimationFrame(render);
 
 // ---------------------------------------------------------------- example modes
 //
-// Besides the classic chain, the page runs four other examples (the Example picker):
+// Besides the classic chain, the page runs five other examples (the Example picker):
 // option configurations (levels, like the chain), a cluster DAG and an HLOD tree (one "Cut"
-// level the worker re-selects as the camera moves) and Gaussian splats (drawn here).
+// level the worker re-selects as the camera moves), Gaussian splats (drawn here) and a GPU
+// crowd of a skinned model (animated here, drawn by the engine).
 
-const MODE_KIND = { presets: "reduced", clusters: "clusters", hlod: "hlod", splats: "splats" };
-const MODE_LEVELS = { presets: 10, clusters: 1, hlod: 1, splats: 3 };
-const KIND_TEXT = { clusters: "cluster DAG", hlod: "HLOD" };
+const MODE_KIND = { presets: "reduced", clusters: "clusters", hlod: "hlod", splats: "splats", crowd: "crowd" };
+const MODE_LEVELS = { presets: 10, clusters: 1, hlod: 1, splats: 3, crowd: 1 };
+const KIND_TEXT = { clusters: "cluster DAG", hlod: "HLOD", crowd: "GPU crowd" };
 const MODE_HINTS = {
   chain: "Reduced levels, then baked proxies, each built from the last. Auto LOD switches them by distance.",
   presets:
@@ -500,6 +503,8 @@ const MODE_HINTS = {
     "A Nanite-style cluster DAG per mesh. Each cluster is kept or swapped for a coarser one by its own error on screen: zoom in and out and watch the cut follow.",
   hlod: "The model tiled on a grid and split into cells; each cell, and each group of cells above it, gets a merged proxy. Far cells draw their proxy instead.",
   splats: "A progressive surfel cloud as Gaussian splats: the whole cloud, its first quarter and its first sixteenth.",
+  crowd:
+    "Thousands of a skinned, animated model (try the Fox) drawn by the GPU: one pose palette, a level per unit by its size on screen (all bones, fewer bones, a baked vertex animation), and the page writes a unit only when it changes clip.",
 };
 const AUTO_MODES = new Set(["chain", "splats"]);
 
@@ -567,12 +572,12 @@ function switchMode(m) {
 
 function syncCutPanel() {
   const m = shownMode;
-  $("#cut").hidden = !(m === "clusters" || m === "hlod" || m === "splats");
+  $("#cut").hidden = !(m === "clusters" || m === "hlod" || m === "splats" || m === "crowd");
   for (const el of document.querySelectorAll("[data-cut]")) el.hidden = !el.dataset.cut.split(" ").includes(m);
   // Streaming and culling controls: only the GPU-driven cluster cut has them.
   for (const el of document.querySelectorAll("[data-gpu]")) el.hidden ||= !extra?.gpu;
   $("#upload-out").value = $("#upload").value;
-  $("#cut-title").textContent = { clusters: "Cluster DAG cut", hlod: "HLOD cut", splats: "Splats" }[m] ?? "";
+  $("#cut-title").textContent = { clusters: "Cluster DAG cut", hlod: "HLOD cut", splats: "Splats", crowd: "GPU crowd" }[m] ?? "";
   $("#threshold-out").value = `${fmtPx(2 ** +$("#threshold").value)} px`;
   $("#bake").hidden = !!m && !(m === "chain" || m === "hlod");
   $('[data-mode="auto"]').hidden = !!m && !AUTO_MODES.has(m);
@@ -636,6 +641,7 @@ function onData(m) {
   const { kind, info, buffers } = m;
   const id = m.runId;
   if (kind === "clusters") installExtra(buildClusters(info, buffers));
+  else if (kind === "crowd") installExtra(buildCrowd(info, buffers));
   else if (kind === "hlod_node") {
     if (hlodIncoming?.runId !== id) {
       dropIncoming();
@@ -653,6 +659,286 @@ function onData(m) {
     renderRows();
     cutStats();
   }
+}
+
+// ---- GPU crowd
+
+/** Floats per unit `setCrowdUnits` takes: x, y, z, yaw, clip, previousClip, fade, scale, start,
+ *  previousStart, fadeStart, speed. */
+const UNIT = 12;
+/** Units in a squad: a 5 x 5 block that changes clip together, so each change is one
+ *  contiguous write. */
+const SQUAD = 25;
+/** Seconds a unit keeps a clip, on average, and the cross-fade into the next. */
+const CROWD_HOLD = 8;
+const CROWD_FADE = 0.35;
+const LEVEL_TINTS = ["blue", "green", "amber"];
+
+/**
+ * Thousands of copies of the skinned model on the engine's GPU crowd. Every unit samples the
+ * one pose palette on the GPU from its clip and start time; a compute pass culls the units and
+ * gives each a level by its size on screen (all bones, fewer bones on a reduced mesh, a baked
+ * vertex animation), then one indirect instanced draw per level. The page writes a unit only
+ * when it changes clip: a squad at a time, one contiguous upload.
+ */
+function buildCrowd(info, buffers) {
+  const [fanm, ...rest] = buffers;
+  const level = (k) => {
+    const [positions, normals, uvs, joints, weights, indices] = rest.slice(6 * k, 6 * k + 6);
+    return { positions, normals, uvs, joints: Uint16Array.from(joints), weights, indices };
+  };
+  const [full, mid] = [level(0), level(1)];
+  const [fvat, farUvs, farIndices, fewerJoints, fewerWeights] = rest.slice(12);
+  const fewer = { ...full, joints: Uint16Array.from(fewerJoints), weights: fewerWeights };
+  const cutInfo = {
+    level: 1,
+    kind: "crowd",
+    label: "Crowd",
+    triangles: 0,
+    vertices: 0,
+    full_triangles: 0,
+    error: info.bone_gap,
+    relative_error: info.bone_gap / (assetInfo?.diagonal || info.size),
+    error_title: `the bone reduction moves a vertex up to ${info.bone_gap.toPrecision(3)} (all bones against ${info.bones})`,
+    switch_distance_1px: 0,
+    ms: info.ms,
+    bytes: info.palette_bytes + info.vat_bytes,
+  };
+  const fail = (why) => ({
+    kind: "crowd",
+    info: cutInfo,
+    model: { draws: () => [], dispose() {} },
+    live() {},
+    cut() {},
+    stats: () => [["Crowd", why, "bad"]],
+    dispose() {},
+  });
+  if (!gpu.gpuClusters) return fail("needs WebGPU: the crowd samples its palette in compute and vertex shaders");
+
+  const material = original?.model.materials[info.material] ?? fallback();
+  const make = (levels) => {
+    gpu.beginCrowd(fanm);
+    for (const l of levels) {
+      if (l.vat) gpu.addCrowdVatLod(l.vat, l.uvs, l.indices, l.pixels);
+      else gpu.addCrowdSkinnedLod(l.positions, l.normals, l.uvs, l.joints, l.weights, l.indices, l.pixels);
+    }
+    return gpu.endCrowd(material);
+  };
+  let ids;
+  try {
+    ids = {
+      crowd: make([
+        { ...full, pixels: info.levels[0].pixels },
+        { ...mid, pixels: info.levels[1].pixels },
+        { vat: fvat, uvs: farUvs, indices: farIndices, pixels: 0 },
+      ]),
+      before: make([{ ...full, pixels: 0 }]),
+      after: make([{ ...fewer, pixels: 0 }]),
+    };
+  } catch (e) {
+    return fail(String(e?.message ?? e));
+  }
+
+  // Units stand on the ground of the clips' bounds, spaced by their reach.
+  const [lo, hi] = info.bounds;
+  const reach = Math.max(hi[0] - lo[0], hi[2] - lo[2], info.size * 0.25);
+  const spacing = reach * 1.15;
+  const clips = info.clips;
+  const t0 = performance.now() / 1000;
+  const clock = () => performance.now() / 1000 - t0;
+  let units = new Float32Array(0);
+  let count = 0;
+  let squads = 0;
+  let side = 1; // squads across the field
+  let due = 0; // squad changes owed
+  let lastTick = 0;
+  let written = []; // [time, units] of recent writes
+  const pick = () => Math.floor(Math.random() * clips.length);
+
+  /** Unit u's clip state, new: `clip` from `now`, fading in from what it played. */
+  function setClip(u, clip, now, speed) {
+    const o = u * UNIT;
+    const d = clips[clip].duration || 1;
+    units[o + 5] = units[o + 4];
+    units[o + 9] = units[o + 8];
+    units[o + 4] = clip;
+    units[o + 8] = now - Math.random() * d; // a random phase, so a squad doesn't march in step
+    units[o + 10] = now;
+    units[o + 6] = CROWD_FADE;
+    if (speed) units[o + 11] = speed;
+  }
+
+  function layout(n) {
+    count = n;
+    squads = Math.ceil(n / SQUAD);
+    side = Math.ceil(Math.sqrt(squads));
+    units = new Float32Array(n * UNIT);
+    const now = clock();
+    for (let s = 0; s < squads; s++) {
+      const clip = pick();
+      const [sx, sz] = [s % side, Math.floor(s / side)];
+      for (let i = 0; i < SQUAD; i++) {
+        const u = s * SQUAD + i;
+        if (u >= n) break;
+        const o = u * UNIT;
+        const jitter = () => (Math.random() - 0.5) * 0.35 * spacing;
+        units[o] = ((sx - side / 2) * 5 + (i % 5) + 0.5) * spacing + jitter();
+        units[o + 1] = -lo[1];
+        units[o + 2] = ((sz - side / 2) * 5 + Math.floor(i / 5) + 0.5) * spacing + jitter();
+        units[o + 3] = Math.random() * Math.PI * 2;
+        units[o + 7] = 1;
+        setClip(u, clip, now, 0.85 + Math.random() * 0.3);
+        units[o + 5] = clip;
+        units[o + 6] = 0; // no fade at the start
+      }
+    }
+    gpu.setCrowdUnits(ids.crowd, 0, units);
+    gpu.setCrowdUnitCount(ids.crowd, n);
+    written = [];
+    cutInfo.full_triangles = n * info.levels[0].triangles;
+    // The camera keeps the whole field in its planes but starts low over the middle, so the
+    // near units draw on every bone and the far ones baked; Reset view comes back here.
+    const half = (side * 5 * spacing) / 2;
+    const prev = focusOverride;
+    focusOverride = {
+      center: [0, (hi[1] - lo[1]) / 2, 0],
+      radius: half * 0.75,
+      distance: Math.min(orbit.homeDistance(half * 0.75), orbit.homeDistance(reach) * 1.5),
+    };
+    orbit.maxDistance = half * 400;
+    if (!prev || Math.abs(prev.radius - focusOverride.radius) > 1e-6 * prev.radius) home();
+  }
+
+  // The bone comparison: one unit on all bones, one on the reduced ones, side by side in step.
+  let pairClip = -1;
+  let pairAt = 0;
+  const pair = new Float32Array(2 * UNIT);
+  function comparePair(now) {
+    if (pairClip >= 0 && now < pairAt) return;
+    pairClip = (pairClip + 1) % clips.length;
+    pairAt = now + Math.max(4, 2 * (clips[pairClip].duration || 1));
+    for (let k = 0; k < 2; k++) {
+      const o = k * UNIT;
+      pair.set([(k ? 0.6 : -0.6) * reach, -lo[1], 0, 0.5, pairClip, pairClip, 0, 1, now, now, now, 1], o);
+    }
+    gpu.setCrowdUnits(ids.before, 0, pair.subarray(0, UNIT));
+    gpu.setCrowdUnits(ids.after, 0, pair.subarray(UNIT));
+  }
+  let comparing = false;
+  function syncCompare() {
+    const on = $("#crowd-compare").checked;
+    if (on === comparing && (on || count)) return;
+    comparing = on;
+    if (on) {
+      pairClip = -1;
+      focusOverride = { center: [0, (hi[1] - lo[1]) / 2, 0], radius: reach * 0.9 };
+      orbit.maxDistance = reach * 400;
+      home();
+    } else layout(+$("#crowd-units").value);
+  }
+
+  let latest = null;
+  let statsAt = 0;
+  return {
+    kind: "crowd",
+    gpu: true,
+    info: cutInfo,
+    model: {
+      draws: () =>
+        comparing
+          ? [
+              [IDENTITY, ids.before, false],
+              [IDENTITY, ids.after, false],
+            ]
+          : [[IDENTITY, ids.crowd, false]],
+      dispose() {
+        for (const id of Object.values(ids)) gpu.removeMesh(id);
+      },
+    },
+    /** Each frame: the clock, the panel's settings, the squads whose clip changes, the stats. */
+    live() {
+      const now = clock();
+      gpu.setCrowdTime(now);
+      gpu.setCrowdOptions($("#crowd-cull").checked, $("#crowd-lods").checked);
+      syncCompare();
+      if (comparing) comparePair(now);
+      else {
+        const want = +$("#crowd-units").value;
+        if (want !== count) layout(want);
+        // Every unit changes about every CROWD_HOLD seconds; at most a few squads a frame, and
+        // consecutive ones, so the frame's write stays one range.
+        due += Math.min(0.25, now - lastTick) * (squads / CROWD_HOLD);
+        const k = Math.min(Math.floor(due), squads, 8);
+        if (k > 0) {
+          due -= k;
+          const first = Math.floor(Math.random() * (squads - k + 1));
+          for (let s = first; s < first + k; s++) {
+            const clip = pick();
+            for (let i = 0; i < SQUAD && s * SQUAD + i < count; i++) setClip(s * SQUAD + i, clip, now);
+          }
+          const a = first * SQUAD;
+          const b = Math.min(count, (first + k) * SQUAD);
+          gpu.setCrowdUnits(ids.crowd, a, units.subarray(a * UNIT, b * UNIT));
+          written.push([now, b - a]);
+        }
+      }
+      lastTick = now;
+      written = written.filter(([t]) => now - t < 2);
+      if (performance.now() - statsAt < 250) return;
+      statsAt = performance.now();
+      const j = gpu.crowdStats(comparing ? ids.after : ids.crowd);
+      latest = j ? JSON.parse(j) : null;
+      if (latest) {
+        cutInfo.triangles = latest.triangles;
+        cutInfo.hud = comparing
+          ? "2 units"
+          : `${fmtInt((latest.perLod[0] ?? []).reduce((a, n) => a + n, 0))} of ${fmtInt(count)} units drawn`;
+      }
+      updateRow(1);
+      cutStats();
+    },
+    hud: () => (comparing ? `Left: all ${info.joints} bones · right: ${info.bones} bones` : ""),
+    cut() {},
+    stats() {
+      const rows = [["Renderer", "GPU: compute culling and level pick, one indirect instanced draw per level"]];
+      const per = latest?.perLod[0];
+      const names = [
+        `all ${info.joints} bones, ${fmtInt(info.levels[0].triangles)} tris`,
+        `${info.bones} bones, ${fmtInt(info.levels[1].triangles)} tris`,
+        `vertex animation, ${fmtInt(info.levels[2].triangles)} tris`,
+      ];
+      info.levels.forEach((l, k) => {
+        const from = l.pixels ? `from ${l.pixels} px radius` : "smaller";
+        const n = !comparing && per ? `${fmtInt(per[k] ?? 0)} units · ` : "";
+        rows.push([`Level ${k} (${LEVEL_TINTS[k]})`, `${n}${names[k]} · ${from}`]);
+      });
+      if (!comparing) {
+        const drawn = per ? per.reduce((a, n) => a + n, 0) : 0;
+        rows.push(["Culled", per ? `${fmtInt(count - drawn)} of ${fmtInt(count)} units` : "waiting for the GPU…"]);
+        const perSecond = written.reduce((a, [, n]) => a + n, 0) / 2;
+        rows.push([
+          "CPU writes",
+          `${fmtInt(Math.round(perSecond))} units/s (${fmtBytes(perSecond * UNIT * 4)}/s): only clip changes`,
+        ]);
+      }
+      if (latest) rows.push(["Triangles", fmtInt(latest.triangles)]);
+      const clipText = clips.map((c) => `${c.name} ${c.duration.toFixed(2)} s${c.looping ? " ↻" : ""}`).join(", ");
+      rows.push(
+        ["Clips", clipText],
+        ["Pose palette", `${fmtBytes(info.palette_bytes)}: ${fmtInt(info.frames)} frames × ${info.joints} bones at ${info.fps} fps`],
+        ["Palette error", `${info.palette_error.toPrecision(3)} (${((100 * info.palette_error) / info.size).toPrecision(2)}% of the size)`],
+        ["Vertex animation", `${fmtBytes(info.vat_bytes)}, error ${info.vat_error.toPrecision(3)}`],
+        [
+          "Bone reduction",
+          `${info.joints} → ${info.bones} bones moves a vertex up to ${info.bone_gap.toPrecision(3)} ` +
+            `(${((100 * info.bone_gap) / info.size).toPrecision(2)}% of the size)`,
+        ],
+        ["Built in", `${(info.ms / 1000).toFixed(2)} s`],
+      );
+      return rows;
+    },
+    dispose() {}, // level 1 owns the model
+  };
 }
 
 // ---- cluster DAG
@@ -1412,8 +1698,14 @@ async function onWorker(m) {
         clusters: "the cluster DAG",
         hlod: "the HLOD tree",
         splats: `${n} splat levels`,
+        crowd: "the GPU crowd",
       }[shownMode];
-      const live = shownMode === "clusters" || shownMode === "hlod" ? "; the cut follows the camera" : "";
+      const live =
+        shownMode === "clusters" || shownMode === "hlod"
+          ? "; the cut follows the camera"
+          : shownMode === "crowd"
+            ? "; each unit's level follows the camera"
+            : "";
       const limit = `${+((runOpts.max_error || 0.02) * 100).toFixed(2)}%`;
       const byError = runOpts.spacing === "error";
       const stop = byError
@@ -1591,7 +1883,8 @@ function renderRows() {
     const info = l?.info;
     const kind = info?.kind ?? (i === 0 ? "original" : chain ? (i >= bakeFrom ? "baked" : near) : MODE_KIND[m]);
     const pending = !info || l.stale;
-    const live = kind === "clusters" || kind === "hlod";
+    const live = kind === "clusters" || kind === "hlod" || kind === "crowd";
+    const per = { hlod: "cell", crowd: "unit" }[kind] ?? "cluster";
     const of = info?.full_triangles || total;
     const errTitle =
       info?.error_title ??
@@ -1614,7 +1907,7 @@ function renderRows() {
           i === 0
             ? "—"
             : live
-              ? `<span title="Every ${kind === "hlod" ? "cell" : "cluster"} switches at its own distance">per ${kind === "hlod" ? "cell" : "cluster"}</span>`
+              ? `<span title="Every ${per} switches at its own distance">per ${per}</span>`
               : info.switch_distance_1px.toPrecision(3),
           i === 0 ? "—" : `${info.ms.toFixed(0)} ms`,
           info.bytes ? fmtBytes(info.bytes) : "—",
@@ -2089,6 +2382,8 @@ function readOptions() {
     gpu_visibility: f.gpu_visibility.checked,
     splat_count: +f.splat_count.value,
     splat_footprints: f.splat_footprints.checked,
+    crowd_bones: +f.crowd_bones.value,
+    crowd_ratio: +f.crowd_ratio.value,
   };
 }
 
@@ -2422,15 +2717,16 @@ async function loadUrl(url, name, expected, onProgress = () => {}, thumb = null)
   }
 }
 
-// Sample models: CC0 assets that fetch_samples.py downloads into samples/ at build time, listed
-// in samples/index.json, each shown as a card in the sidebar. Without the index (a local build
-// that skipped the script) the section stays hidden.
+// Sample models: CC0 and CC BY assets that fetch_samples.py downloads into samples/ at build
+// time, listed in samples/index.json, each shown as a card in the sidebar; an attributed one
+// shows its attribution while it's open. Without the index (a local build that skipped the
+// script) the section stays hidden.
 const cards = new Map(); // sample file -> its card button
 function card(s) {
   const b = document.createElement("button");
   b.type = "button";
   b.className = "card";
-  b.title = `${s.name} · ${mb(s.bytes)} · by ${s.credit} · ${s.license}`;
+  b.title = `${s.name} · ${mb(s.bytes)} · ${s.attribution ?? `by ${s.credit}`} · ${s.license}`;
   b.innerHTML =
     (s.thumb ? `<img src="samples/${esc(s.thumb)}" alt="" loading="lazy">` : `<span class="noimg"></span>`) +
     `<span class="name">${esc(s.name)}</span><span class="size">${mb(s.bytes)}</span><span class="bar"></span>`;
@@ -2438,8 +2734,19 @@ function card(s) {
   return b;
 }
 
+/** The open sample's attribution, with links to its source and license, when it needs one. */
+function showAttribution(s) {
+  const el = $("#sample-attribution");
+  el.hidden = !s?.attribution;
+  if (el.hidden) return;
+  const link = (href, text) => `<a href="${esc(href)}" target="_blank" rel="noopener">${esc(text)}</a>`;
+  el.innerHTML =
+    `${link(s.source, s.name)}: ${esc(s.attribution)} ` + link(s.license_url, s.license.replace(/-/g, " "));
+}
+
 function loadSample(s) {
   for (const [file, b] of cards) b.setAttribute("aria-current", String(file === s.file));
+  showAttribution(s);
   const b = cards.get(s.file);
   loadUrl(
     `samples/${s.file}`,
@@ -2468,6 +2775,7 @@ fetch("samples/index.json")
 
 // Choosing or dropping a file of your own cancels a sample download and clears its highlight.
 const clearCurrent = () => {
+  showAttribution(null);
   fetching?.abort();
   for (const b of cards.values()) b.removeAttribute("aria-current");
 };

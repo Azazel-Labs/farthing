@@ -1,19 +1,42 @@
 //! The browser side: a [`Viewer`] drawing into a canvas, for the web demo.
 //!
 //! The page creates one with `createView(canvas)`, uploads textures, materials, geometries,
-//! meshes, splat clouds and cluster meshes as typed arrays, and each animation frame calls `beginFrame`, `view` once per camera (compare
-//! mode has two), then `endFrame`. An `Orbit` turns the camera with the page's pointer and wheel
+//! meshes, splat clouds, cluster meshes and crowds as typed arrays, and each animation frame
+//! calls `beginFrame`, `view` once per camera (compare mode has two), then `endFrame`. An `Orbit` turns the camera with the page's pointer and wheel
 //! events.
 
 use crate::editor_visualizations::Overlay;
 use crate::orbit::OrbitCamera;
+use crate::crowd::{CrowdLod, CrowdLodKind, CrowdUnit};
 use crate::viewer::{AlphaMode, Camera, Draw, LineStyle, Material, Viewer};
+use farthing::anim::bake::PosePalette;
+use farthing::anim::vat::VertexAnimation;
 use farthing::glam::{Mat4, Vec2, Vec3, Vec4};
 use wasm_bindgen::prelude::*;
 
 fn js_err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
+
+/// A crowd level of detail queued by `addCrowdSkinnedLod` or `addCrowdVatLod`.
+struct QueuedLod {
+    /// Skinned, or a vertex animation.
+    skinned: Option<SkinnedArrays>,
+    vat: Option<VertexAnimation>,
+    uvs: Vec<f32>,
+    indices: Vec<u32>,
+    min_pixels: f32,
+}
+
+struct SkinnedArrays {
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    joints: Vec<u16>,
+    weights: Vec<f32>,
+}
+
+/// Floats per unit `setCrowdUnits` takes.
+const UNIT_FLOATS: usize = 12;
 
 /// A view queued by `view` for `endFrame`.
 struct QueuedView {
@@ -31,6 +54,8 @@ pub struct EngineView {
     viewer: Viewer,
     backend: String,
     views: Vec<QueuedView>,
+    /// The crowd `beginCrowd` started: its palette and levels so far.
+    crowd: Option<(PosePalette, Vec<QueuedLod>)>,
 }
 
 /// Opens the GPU and binds it to `canvas`. Fails when the browser has no WebGPU (or, in a
@@ -96,6 +121,7 @@ pub async fn create_view(canvas: web_sys::HtmlCanvasElement) -> Result<EngineVie
         viewer,
         backend,
         views: Vec::new(),
+        crowd: None,
     })
 }
 
@@ -311,6 +337,148 @@ impl EngineView {
             s.loaded,
             s.evicted
         )
+    }
+
+    /// Starts a crowd animated by a pose palette (a `.fanm` file, from farthing's
+    /// `anim::bake`). Add its levels of detail, nearest first, with `addCrowdSkinnedLod` and
+    /// `addCrowdVatLod`, then `endCrowd`.
+    #[wasm_bindgen(js_name = beginCrowd)]
+    pub fn begin_crowd(&mut self, fanm: &[u8]) -> Result<(), JsValue> {
+        self.crowd = Some((PosePalette::from_bytes(fanm).map_err(js_err)?, Vec::new()));
+        Ok(())
+    }
+
+    /// A skinned level: per vertex xyz positions and normals (normals may be empty), uvs (or
+    /// empty), four joint indices into the palette's skeleton and four weights; three indices
+    /// per triangle. Units at least `min_pixels` of projected radius take it; smaller ones the
+    /// next level.
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = addCrowdSkinnedLod)]
+    pub fn add_crowd_skinned_lod(
+        &mut self,
+        positions: &[f32],
+        normals: &[f32],
+        uvs: &[f32],
+        joints: &[u16],
+        weights: &[f32],
+        indices: &[u32],
+        min_pixels: f32,
+    ) -> Result<(), JsValue> {
+        let (_, lods) = self.crowd.as_mut().ok_or("no beginCrowd")?;
+        lods.push(QueuedLod {
+            skinned: Some(SkinnedArrays {
+                positions: positions.to_vec(),
+                normals: normals.to_vec(),
+                joints: joints.to_vec(),
+                weights: weights.to_vec(),
+            }),
+            vat: None,
+            uvs: uvs.to_vec(),
+            indices: indices.to_vec(),
+            min_pixels,
+        });
+        Ok(())
+    }
+
+    /// A level drawn from a vertex animation texture (a `.fvat` file, from farthing's
+    /// `anim::vat`, baked like the palette), with its mesh's uvs and indices.
+    #[wasm_bindgen(js_name = addCrowdVatLod)]
+    pub fn add_crowd_vat_lod(&mut self, fvat: &[u8], uvs: &[f32], indices: &[u32], min_pixels: f32) -> Result<(), JsValue> {
+        let (_, lods) = self.crowd.as_mut().ok_or("no beginCrowd")?;
+        lods.push(QueuedLod {
+            skinned: None,
+            vat: Some(VertexAnimation::from_bytes(fvat).map_err(js_err)?),
+            uvs: uvs.to_vec(),
+            indices: indices.to_vec(),
+            min_pixels,
+        });
+        Ok(())
+    }
+
+    /// Makes the crowd, drawn with `material`; returns its mesh id, for draws. It has no units
+    /// until `setCrowdUnits`. Fails without WebGPU, or when a level doesn't match the palette.
+    #[wasm_bindgen(js_name = endCrowd)]
+    pub fn end_crowd(&mut self, material: u32) -> Result<u32, JsValue> {
+        let (palette, queued) = self.crowd.take().ok_or("no beginCrowd")?;
+        let lods: Vec<CrowdLod> = queued
+            .iter()
+            .map(|q| CrowdLod {
+                kind: match (&q.skinned, &q.vat) {
+                    (Some(s), _) => CrowdLodKind::Skinned {
+                        positions: &s.positions,
+                        normals: &s.normals,
+                        joints: &s.joints,
+                        weights: &s.weights,
+                    },
+                    (None, Some(v)) => CrowdLodKind::Vat(v),
+                    (None, None) => unreachable!("a level is skinned or baked"),
+                },
+                uvs: &q.uvs,
+                indices: &q.indices,
+                min_pixels: q.min_pixels,
+            })
+            .collect();
+        self.viewer.add_crowd(&palette, &lods, material).map_err(js_err)
+    }
+
+    /// Writes units `first` on, growing the crowd to hold them: 12 floats per unit, `x, y, z,
+    /// yaw, clip, previousClip, fade, scale, start, previousStart, fadeStart, speed` (clip
+    /// indices as numbers; times on the `setCrowdTime` clock, seconds). Write a unit only when
+    /// it changes: the GPU animates it from the clock.
+    #[wasm_bindgen(js_name = setCrowdUnits)]
+    pub fn set_crowd_units(&mut self, id: u32, first: u32, units: &[f32]) {
+        let units: Vec<CrowdUnit> = units
+            .as_chunks::<UNIT_FLOATS>()
+            .0
+            .iter()
+            .map(|u| CrowdUnit {
+                position: [u[0], u[1], u[2]],
+                yaw: u[3],
+                clip: u[4] as u32,
+                previous_clip: u[5] as u32,
+                fade: u[6],
+                scale: u[7],
+                start: u[8],
+                previous_start: u[9],
+                fade_start: u[10],
+                speed: u[11],
+            })
+            .collect();
+        self.viewer.set_crowd_units(id, first as usize, &units);
+    }
+
+    /// Keeps a crowd's first `count` units.
+    #[wasm_bindgen(js_name = setCrowdUnitCount)]
+    pub fn set_crowd_unit_count(&mut self, id: u32, count: u32) {
+        self.viewer.set_crowd_unit_count(id, count as usize);
+    }
+
+    /// The clock crowd units' times are on, seconds.
+    #[wasm_bindgen(js_name = setCrowdTime)]
+    pub fn set_crowd_time(&mut self, seconds: f32) {
+        self.viewer.set_crowd_time(seconds);
+    }
+
+    /// Whether crowds skip units outside the view, and tint units by their level of detail.
+    #[wasm_bindgen(js_name = setCrowdOptions)]
+    pub fn set_crowd_options(&mut self, culling: bool, show_lods: bool) {
+        self.viewer.set_crowd_culling(culling);
+        self.viewer.set_crowd_show_lods(show_lods);
+    }
+
+    /// What a crowd drew a frame or two ago, as JSON: `perLod` (per view, units per level) and
+    /// `triangles`. Empty for an id that isn't a crowd.
+    #[wasm_bindgen(js_name = crowdStats)]
+    pub fn crowd_stats(&self, id: u32) -> String {
+        let Some(s) = self.viewer.crowd_stats(id) else {
+            return String::new();
+        };
+        let views: Vec<String> = s
+            .per_lod
+            .iter()
+            .map(|v| format!("[{}]", v.iter().map(u32::to_string).collect::<Vec<_>>().join(",")))
+            .collect();
+        format!(r#"{{"perLod":[{}],"triangles":{}}}"#, views.join(","), s.triangles)
     }
 
     /// Frees a mesh or splat cloud.

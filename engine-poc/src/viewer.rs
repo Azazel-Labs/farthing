@@ -7,6 +7,7 @@
 //! are in [`crate::editor_visualizations`].
 
 use crate::clusters::{ClusterDraw, ClusterRenderer, ClusterStats, ClusterView};
+use crate::crowd::{CrowdDraw, CrowdLod, CrowdRenderer, CrowdStats, CrowdUnit, CrowdView};
 use crate::editor_visualizations::{self as viz, Overlay};
 use farthing::cluster::GpuClusterDag;
 use bytemuck::{Pod, Zeroable};
@@ -196,12 +197,15 @@ enum Drawable {
     Splats(GpuSplats),
     /// A cluster mesh: its id in [`Viewer::clusters`].
     Cluster(u32),
+    /// A crowd: its id in [`Viewer::crowds`].
+    Crowd(u32),
 }
 
 /// One mesh or splat cloud to draw this frame, where.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw {
-    /// From [`Viewer::add_mesh`], [`Viewer::add_splats`] or [`Viewer::add_cluster_mesh`].
+    /// From [`Viewer::add_mesh`], [`Viewer::add_splats`], [`Viewer::add_cluster_mesh`] or
+    /// [`Viewer::add_crowd`].
     pub mesh: u32,
     pub model: Mat4,
     /// Whether the overlays that are on are drawn over it.
@@ -351,6 +355,8 @@ pub struct Viewer {
     gaussians: bool,
     /// Made with the first cluster mesh.
     clusters: Option<ClusterRenderer>,
+    /// Made with the first crowd.
+    crowds: Option<CrowdRenderer>,
 }
 
 fn uniform_layout(device: &wgpu::Device, label: &str, dynamic: bool) -> wgpu::BindGroupLayout {
@@ -656,6 +662,7 @@ impl Viewer {
             overlays: [false; 2],
             gaussians: true,
             clusters: None,
+            crowds: None,
         }
     }
 
@@ -1024,6 +1031,9 @@ impl Viewer {
         {
             r.remove_mesh(*c);
         }
+        if let (Some(Some(Drawable::Crowd(c))), Some(r)) = (self.meshes.get(id as usize), self.crowds.as_mut()) {
+            r.remove(*c);
+        }
         free(&mut self.meshes, id);
     }
 
@@ -1053,6 +1063,84 @@ impl Viewer {
         }
         let c = self.clusters.as_mut()?.add_mesh(dag);
         Some(insert(&mut self.meshes, Drawable::Cluster(c)))
+    }
+
+    /// A crowd of skinned units animated from `palette` (see `crowd.rs`), with up to
+    /// [`crate::CROWD_MAX_LODS`] levels of detail that are bone LODs of the palette's
+    /// skeleton, drawn with `material`. Each draw naming it places the whole crowd. It has no
+    /// units until [`Viewer::set_crowd_units`]. Fails when [`Viewer::clusters_supported`] is
+    /// false (crowds need the same compute and storage support) or a level doesn't match the
+    /// palette.
+    pub fn add_crowd(
+        &mut self,
+        palette: &farthing::anim::bake::PosePalette,
+        lods: &[CrowdLod],
+        material: u32,
+    ) -> Result<u32, String> {
+        if !crate::crowd::supported(&self.device) {
+            return Err("crowds need WebGPU".into());
+        }
+        let r = self.crowds.get_or_insert_with(|| {
+            CrowdRenderer::new(&self.device, self.format, &self.frames.layout, &self.models.layout, &self.material_bgl)
+        });
+        let c = r.add(&self.device, &self.queue, palette, lods, material)?;
+        Ok(insert(&mut self.meshes, Drawable::Crowd(c)))
+    }
+
+    fn crowd_id(&self, id: u32) -> Option<u32> {
+        match self.meshes.get(id as usize) {
+            Some(Some(Drawable::Crowd(c))) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// Writes a crowd's units `first..first + units.len()`, growing it to hold them. Only the
+    /// changed range is uploaded, at the next render.
+    pub fn set_crowd_units(&mut self, id: u32, first: usize, units: &[CrowdUnit]) {
+        if let (Some(c), Some(r)) = (self.crowd_id(id), self.crowds.as_mut()) {
+            r.set_units(c, first, units);
+        }
+    }
+
+    /// Keeps a crowd's first `count` units.
+    pub fn set_crowd_unit_count(&mut self, id: u32, count: usize) {
+        if let (Some(c), Some(r)) = (self.crowd_id(id), self.crowds.as_mut()) {
+            r.set_unit_count(c, count);
+        }
+    }
+
+    /// How many units a crowd has.
+    pub fn crowd_unit_count(&self, id: u32) -> usize {
+        match (self.crowd_id(id), &self.crowds) {
+            (Some(c), Some(r)) => r.units(c),
+            _ => 0,
+        }
+    }
+
+    /// The clock crowd units' start times are on, seconds.
+    pub fn set_crowd_time(&mut self, seconds: f32) {
+        if let Some(r) = self.crowds.as_mut() {
+            r.set_time(seconds);
+        }
+    }
+
+    /// Whether crowds skip units outside the view (on by default).
+    pub fn set_crowd_culling(&mut self, on: bool) {
+        if let Some(r) = self.crowds.as_mut() {
+            r.set_frustum_culling(on);
+        }
+    }
+
+    /// Whether crowd units are tinted by their level of detail.
+    pub fn set_crowd_show_lods(&mut self, on: bool) {
+        if let Some(r) = self.crowds.as_mut() {
+            r.set_show_lods(on);
+        }
+    }
+
+    /// What a crowd drew, a frame or two behind (read back without stalling).
+    pub fn crowd_stats(&self, id: u32) -> Option<CrowdStats> {
+        self.crowds.as_ref()?.stats(self.crowd_id(id)?)
     }
 
     fn cluster_id(&self, id: u32) -> Option<u32> {
@@ -1215,6 +1303,7 @@ impl Viewer {
         let mut models = Vec::new();
         let mut passes = Vec::new();
         let mut cluster_views = Vec::new();
+        let mut crowd_views = Vec::new();
         let wire = self.overlays[0];
         for v in views {
             let [x, y, w, h] = v.rect;
@@ -1233,6 +1322,7 @@ impl Viewer {
             });
             let mut items = Vec::new();
             let mut cluster_draws = Vec::new();
+            let mut crowd_draws = Vec::new();
             for d in v.draws {
                 let det = d.model.determinant();
                 let (pipe, center) = match self.meshes.get(d.mesh as usize) {
@@ -1241,6 +1331,13 @@ impl Viewer {
                             mesh: *c,
                             model: d.model,
                             wire: wire && d.overlays,
+                        });
+                        continue;
+                    }
+                    Some(Some(Drawable::Crowd(c))) => {
+                        crowd_draws.push(CrowdDraw {
+                            crowd: *c,
+                            model: d.model,
                         });
                         continue;
                     }
@@ -1296,6 +1393,12 @@ impl Viewer {
                 ppr: focal,
                 draws: cluster_draws,
             });
+            crowd_views.push(CrowdView {
+                view_proj: v.camera.view_proj(w as f32 / h as f32),
+                eye: v.camera.eye(),
+                focal,
+                draws: crowd_draws,
+            });
         }
         let frame_bind = self
             .frames
@@ -1310,7 +1413,11 @@ impl Viewer {
         if let Some(c) = self.clusters.as_mut() {
             c.prepare(&self.device, &self.queue, &mut enc, &cluster_views, &self.materials);
         }
+        if let Some(c) = self.crowds.as_mut() {
+            c.prepare(&self.device, &self.queue, &mut enc, &crowd_views);
+        }
         let clusters = self.clusters.as_ref();
+        let crowds = self.crowds.as_ref();
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewer"),
@@ -1344,6 +1451,11 @@ impl Viewer {
                 if let Some(c) = clusters {
                     pass.set_bind_group(1, &model_bind, &[0]);
                     c.draw(&mut pass, vi, false, &self.materials);
+                }
+                // Crowd pipelines too.
+                if let Some(c) = crowds.filter(|c| c.draws_in(vi)) {
+                    pass.set_bind_group(1, &model_bind, &[0]);
+                    c.draw(&mut pass, vi, &self.materials);
                 }
                 let mut bound = None;
                 for item in items {
@@ -1422,6 +1534,9 @@ impl Viewer {
         }
         self.queue.submit([enc.finish()]);
         if let Some(c) = self.clusters.as_mut() {
+            c.after_submit();
+        }
+        if let Some(c) = self.crowds.as_mut() {
             c.after_submit();
         }
     }
@@ -1540,8 +1655,11 @@ impl Viewer {
     }
 
     /// Waits for the GPU, so the next render streams by everything rendered so far.
-    pub fn settle(&self) {
+    pub fn settle(&mut self) {
         if let Some(c) = &self.clusters {
+            c.settle(&self.device);
+        }
+        if let Some(c) = self.crowds.as_mut() {
             c.settle(&self.device);
         }
     }

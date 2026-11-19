@@ -1,10 +1,11 @@
+use crate::anim::{Animation, Curve, Interpolation, Track};
 use crate::host::{MaterialClass, MaterialInfo};
 use crate::image::Texture;
 use crate::{
     Error, Instance, Joint, MaterialId, MaterialSlot, Mesh, MorphTarget, Result, Scene, Skeleton,
-    Skin,
+    Skin, Transform,
 };
-use glam::{Mat4, Vec2, Vec3, Vec4};
+use glam::{Mat4, Quat, Vec2, Vec3, Vec4};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -31,11 +32,23 @@ pub struct GltfMaterial {
 
 /// Loads a glTF / GLB file. Each glTF mesh becomes one [`Mesh`] (primitives merged, material
 /// ids = slot index); each node with a mesh becomes an [`Instance`] with its world transform.
+///
+/// Each skin becomes a [`Skeleton`]: its joints' rest transforms come from their nodes, and
+/// the animation channels that target its joints become its [`Skeleton::animations`] (one
+/// [`Animation`] per glTF animation that moves any of them). Nodes between two joints that
+/// aren't joints themselves are folded into the child joint, curves included (exactly, when
+/// they don't scale unevenly). Channels on other nodes and morph target weights are not read.
 pub fn load_gltf(path: impl AsRef<Path>) -> Result<(Scene, Vec<GltfMaterial>)> {
     let path = path.as_ref();
     let bytes = std::fs::read(path)?;
     let dir = path.parent().unwrap_or(Path::new(""));
     load_gltf_with(&bytes, |uri| std::fs::read(dir.join(uri)).ok())
+}
+
+fn transform_is_identity(t: &Transform) -> bool {
+    t.translation.abs_diff_eq(Vec3::ZERO, 1e-6)
+        && t.rotation.abs_diff_eq(Quat::IDENTITY, 1e-6)
+        && t.scale.abs_diff_eq(Vec3::ONE, 1e-6)
 }
 
 /// Loads a GLB, or a `.gltf` whose buffers and images are embedded (`data:` URIs), from memory.
@@ -182,9 +195,13 @@ fn decode_encodings(
     } else {
         ("model.gltf", "gltf")
     };
+    // Everything farthing reads: the meshes and what shapes them, and the skins' animations.
+    let keep = polysmelt::document::Keep {
+        animations: true,
+        ..polysmelt::document::Keep::MESHES
+    };
     let mut doc =
-        polysmelt::formats::load_bytes(bytes, name, ext, &files, polysmelt::document::Keep::MESHES)
-            .map_err(invalid)?;
+        polysmelt::formats::load_bytes(bytes, name, ext, &files, keep).map_err(invalid)?;
     doc.decode().map_err(invalid)?;
     Ok(Some(doc.to_glb().map_err(invalid)?))
 }
@@ -555,6 +572,9 @@ fn build(
             .enumerate()
             .map(|(j, &n)| (n, j))
             .collect();
+        // Per joint: what lies between it and its parent joint (the skeleton's space, for a
+        // root), when that's more than the node's own parent link.
+        let mut offsets: Vec<Option<Transform>> = Vec::with_capacity(joint_nodes.len());
         let joints = joint_nodes
             .iter()
             .enumerate()
@@ -567,20 +587,113 @@ fn build(
                     }
                     p = parent.get(&pn).copied();
                 }
+                let direct = parent.get(&n).copied();
+                let offset = match (p, direct) {
+                    (Some(pj), Some(d)) if pj == d => None,
+                    (_, None) => None,
+                    (Some(pj), Some(d)) => Some(world(pj).inverse() * world(d)),
+                    (None, Some(d)) => Some(world(d)),
+                }
+                .map(Transform::from_matrix)
+                .filter(|o| !transform_is_identity(o));
+                offsets.push(offset);
+                let node = doc.nodes().nth(n);
+                let rest = node.as_ref().map_or(Transform::IDENTITY, |nd| {
+                    let (t, r, s) = nd.transform().decomposed();
+                    let own = Transform {
+                        translation: Vec3::from(t),
+                        rotation: Quat::from_array(r).normalize(),
+                        scale: Vec3::from(s),
+                    };
+                    match offset {
+                        Some(o) => Transform::from_matrix(o.matrix() * own.matrix()),
+                        None => own,
+                    }
+                });
                 Joint {
-                    name: doc
-                        .nodes()
-                        .nth(n)
+                    name: node
                         .and_then(|nd| nd.name().map(str::to_owned))
                         .unwrap_or_else(|| format!("joint_{j}")),
                     parent: p.and_then(|pn| node_to_joint.get(&pn).copied()),
                     inverse_bind: ibms.get(j).copied().unwrap_or(Mat4::IDENTITY),
+                    rest,
                 }
+            })
+            .collect();
+        let animations = doc
+            .animations()
+            .enumerate()
+            .filter_map(|(ai, anim)| {
+                let mut tracks: Vec<Track> = Vec::new();
+                for channel in anim.channels() {
+                    let Some(&j) = node_to_joint.get(&channel.target().node().index()) else {
+                        continue;
+                    };
+                    let reader = channel.reader(|b| Some(&buffers[b.index()]));
+                    let Some(times) = reader.read_inputs().map(|t| t.collect::<Vec<f32>>()) else {
+                        continue;
+                    };
+                    let interpolation = match channel.sampler().interpolation() {
+                        gltf::animation::Interpolation::Step => Interpolation::Step,
+                        gltf::animation::Interpolation::Linear => Interpolation::Linear,
+                        gltf::animation::Interpolation::CubicSpline => Interpolation::CubicSpline,
+                    };
+                    let k = match tracks.iter().position(|t| t.joint == j) {
+                        Some(k) => k,
+                        None => {
+                            tracks.push(Track::new(j));
+                            tracks.len() - 1
+                        }
+                    };
+                    let curve = |values| Curve {
+                        interpolation,
+                        times: times.clone(),
+                        values,
+                    };
+                    use gltf::animation::util::ReadOutputs;
+                    match reader.read_outputs() {
+                        Some(ReadOutputs::Translations(v)) => {
+                            tracks[k].translation = Some(curve(v.map(Vec3::from).collect()))
+                        }
+                        Some(ReadOutputs::Rotations(v)) => {
+                            let values = v.into_f32().map(Quat::from_array).collect();
+                            tracks[k].rotation = Some(Curve {
+                                interpolation,
+                                times: times.clone(),
+                                values,
+                            })
+                        }
+                        Some(ReadOutputs::Scales(v)) => {
+                            tracks[k].scale = Some(curve(v.map(Vec3::from).collect()))
+                        }
+                        _ => {}
+                    }
+                }
+                // Drop malformed curves rather than the whole clip.
+                for t in &mut tracks {
+                    t.translation = t.translation.take().filter(Curve::is_valid);
+                    t.rotation = t.rotation.take().filter(Curve::is_valid);
+                    t.scale = t.scale.take().filter(Curve::is_valid);
+                    if let Some(o) = offsets[t.joint] {
+                        t.premultiply(o);
+                    }
+                }
+                tracks.retain(|t| {
+                    t.translation.is_some() || t.rotation.is_some() || t.scale.is_some()
+                });
+                tracks.sort_by_key(|t| t.joint);
+                (!tracks.is_empty()).then(|| Animation {
+                    name: anim
+                        .name()
+                        .map_or_else(|| format!("animation_{ai}"), str::to_owned),
+                    tracks,
+                })
             })
             .collect();
         skeletons.push(Skeleton {
             name: skin.name().unwrap_or("skin").to_owned(),
             joints,
+            animations,
         });
     }
 

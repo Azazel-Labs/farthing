@@ -273,6 +273,27 @@ enum Cmd {
         /// Drop removed joints from the skeleton (default keeps indices, writes a remap).
         #[arg(long)]
         compact: bool,
+        /// Frames per second to sample a skeleton's clips at, for the planner's error
+        /// estimate (skeletons without clips use a bind-pose proxy).
+        #[arg(long, default_value_t = 15.0)]
+        pose_fps: f32,
+    },
+    /// Bake a skeleton's clips into a GPU pose palette (FANM), and optionally a skinned mesh's
+    /// vertex animation texture (FVAT), reporting the error of each clip.
+    Anim {
+        input: PathBuf,
+        /// The pose palette file (.fanm).
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Which skeleton (index).
+        #[arg(long, default_value_t = 0)]
+        skeleton: usize,
+        #[arg(long, default_value_t = 30.0)]
+        fps: f32,
+        /// Also bake the first skinned mesh of the skeleton into this vertex animation
+        /// texture file (.fvat).
+        #[arg(long)]
+        vat: Option<PathBuf>,
     },
     /// Plan impostor captures (directions, cameras, atlas layout) as JSON.
     ImpostorPlan {
@@ -904,6 +925,7 @@ fn main() -> Result<()> {
             ratio,
             influences,
             compact,
+            pose_fps,
         } => {
             let mut s = load(&input)?;
             if s.skeletons.is_empty() {
@@ -918,10 +940,12 @@ fn main() -> Result<()> {
                     .map(|i| i.mesh)
                     .collect();
                 let meshes: Vec<&Mesh> = mesh_ids.iter().map(|&m| &s.meshes[m]).collect();
+                let poses = (!s.skeletons[si].animations.is_empty())
+                    .then(|| farthing::anim::sample_poses(&s.skeletons[si], pose_fps));
                 let red = farthing::bones::plan_bone_reduction(
                     &s.skeletons[si],
                     &meshes,
-                    None,
+                    poses.as_deref(),
                     &farthing::bones::BoneReductionOptions {
                         max_bones,
                         ratio,
@@ -941,10 +965,59 @@ fn main() -> Result<()> {
                     }
                     s.skeletons[si] = sk;
                 }
-                reports.push(json!({"skeleton": s.skeletons[si].name, "kept": red.kept_count(), "removed": red.removed, "remap": red.remap}));
+                reports.push(json!({"skeleton": s.skeletons[si].name, "kept": red.kept_count(), "removed": red.removed, "remap": red.remap, "poses": poses.as_ref().map_or(0, Vec::len)}));
             }
             save(&s, &output)?;
             print(json!({"skeletons": reports}));
+        }
+        Cmd::Anim {
+            input,
+            output,
+            skeleton,
+            fps,
+            vat,
+        } => {
+            use farthing::anim::{bake, vat as fvat};
+            let s = load(&input)?;
+            let Some(sk) = s.skeletons.get(skeleton) else {
+                bail!("{} has no skeleton {skeleton}", input.display());
+            };
+            let opts = bake::BakeOptions {
+                fps,
+                ..Default::default()
+            };
+            let palette = bake::bake(sk, &opts);
+            let bytes = palette.to_bytes();
+            std::fs::write(&output, &bytes)?;
+            let mesh = s
+                .instances
+                .iter()
+                .filter(|i| i.skeleton == Some(skeleton))
+                .map(|i| &s.meshes[i.mesh])
+                .find(|m| m.skin.is_some());
+            let clip_json = |e: &bake::BakeError| {
+                json!(e.clips.iter().map(|c| json!({"name": c.name, "quantization": c.quantization, "interpolation": c.interpolation})).collect::<Vec<_>>())
+            };
+            let error = mesh.map(|m| bake::measure(&palette, sk, m)).transpose()?;
+            let mut report = json!({
+                "joints": palette.joint_count,
+                "frames": palette.frame_count(),
+                "clips": palette.clips.iter().map(|c| json!({"name": c.name, "frames": c.frame_count, "duration": c.duration, "looping": c.looping})).collect::<Vec<_>>(),
+                "bytes": bytes.len(),
+                "size": error.as_ref().map(|e| e.size),
+                "error": error.as_ref().map(clip_json),
+            });
+            if let Some(path) = vat {
+                let Some(m) = mesh else {
+                    bail!("skeleton {skeleton} skins no mesh to bake a vertex animation from");
+                };
+                let v = fvat::bake_vat(sk, m, &opts)?;
+                let vbytes = v.to_bytes();
+                std::fs::write(&path, &vbytes)?;
+                let e = fvat::measure_vat(&v, sk, m)?;
+                report["vat"] = json!({"vertices": v.vertex_count, "bytes": vbytes.len(), "error": clip_json(&e)});
+            }
+            print(report);
         }
         Cmd::ImpostorPlan {
             input,

@@ -148,6 +148,26 @@ gains a *Size* column (GLB, PLY or packed GPU bytes).
   its first quarter and first sixteenth (a progressive cloud's prefixes are its LODs), each
   shaped from its surface footprint. They are drawn as screen-space Gaussians, blended
   back to front, or as opaque discs. Each level downloads as a 3DGS-layout `.ply`.
+- **GPU crowd.** For a skinned, animated model (the Fox sample). The worker bakes the
+  skeleton's clips into a pose palette (`farthing::anim::bake`). It builds three levels from
+  the first skinned mesh:
+  - the whole mesh on every bone;
+  - a reduced mesh on fewer bones (`plan_bone_reduction` over the clips' poses, then
+    `simplify`);
+  - a coarser mesh baked to vertex animation (`farthing::anim::vat`).
+
+  The engine (`engine-poc/src/crowd.rs`, WebGPU only) draws thousands of units from them:
+  - a compute pass culls the units and picks each one's level by its radius on screen;
+  - one indirect instanced draw per level;
+  - every vertex shader samples the palette by the unit's clip and start time, cross-fading
+    from its previous clip.
+
+  The page keeps the units in squads of 25 that change clip together. It writes a squad only
+  when it changes clip, so its upload is one contiguous range. The panel counts those writes
+  and how many units each level drew. You can set the crowd size (up to 50,000), tint units by
+  level, and turn culling off. *Bones: before and after* puts two units side by side: one on
+  every bone, one on the reduced bones, with the same mesh and clip, so you see what the bone
+  reduction alone changes.
 
 ## Build and run
 
@@ -167,13 +187,18 @@ Any static file server works if it serves `.js` as JavaScript. Opening `index.ht
 also optimizes the module for size. CI installs it (binaryen 133), so the deployed page
 always gets the smaller module.
 
-**Sample models.** `fetch_samples.py` downloads a few CC0 models from the
+**Sample models.** `fetch_samples.py` downloads a few models from the
 [Khronos glTF Sample Assets](https://github.com/KhronosGroup/glTF-Sample-Assets), pinned to
 one commit, into `web/samples/` with an `index.json`, and each model's screenshot from that
 repo as its thumbnail. The page shows them as cards in the sidebar. They
 aren't committed: CI fetches them when it builds the page, and `cargo test` runs the pipeline
-on each one when they're present. The script refuses any model whose metadata lists a license
-other than CC0. To change the set, edit `SAMPLES` in the script.
+on each one when they're present. Most are CC0. The script refuses any model whose metadata
+lists a license other than CC0, or CC BY 4.0 for a model named in `ATTRIBUTED`. That is the
+Fox: model by PixelMannen (CC0), with rigging and animation by tomkranis and the glTF
+conversion by AsoboStudio and scurest (CC BY 4.0). Its index entry carries an attribution
+built from the model's metadata. The page shows it, with links to the source and the license,
+while the model is open. To change the
+set, edit `SAMPLES` in the script.
 
 `index.html?model=<url>` loads a model on start, for example `?model=samples/Lantern.glb`.
 

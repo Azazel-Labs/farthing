@@ -286,6 +286,11 @@ pub fn compact_skeleton(skeleton: &Skeleton, red: &BoneReduction) -> (Skeleton, 
         Skeleton {
             name: skeleton.name.clone(),
             joints,
+            animations: skeleton
+                .animations
+                .iter()
+                .map(|a| a.remap_joints(&new_index))
+                .collect(),
         },
         new_index,
     )
@@ -316,6 +321,10 @@ mod tests {
                 name: format!("j{i}"),
                 parent: if i == 0 { None } else { Some(i - 1) },
                 inverse_bind: Mat4::from_translation(Vec3::new(0.0, -(i as f32), 0.0)),
+                rest: crate::Transform {
+                    translation: Vec3::Y * (i.min(1) as f32),
+                    ..crate::Transform::IDENTITY
+                },
             })
             .collect();
         let mut pos = Vec::new();
@@ -343,6 +352,7 @@ mod tests {
             Skeleton {
                 name: "chain".into(),
                 joints,
+                animations: Vec::new(),
             },
             m,
         )

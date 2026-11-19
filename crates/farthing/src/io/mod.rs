@@ -69,7 +69,7 @@ fn ext(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::glam::{Mat4, Vec2, Vec3, Vec4};
-    use crate::{Instance, Joint, Mesh, MorphTarget, Skeleton, Skin};
+    use crate::{Instance, Joint, Mesh, MorphTarget, Skeleton, Skin, Transform};
 
     fn sample_scene() -> Scene {
         let mut m = Mesh::new(
@@ -98,13 +98,19 @@ mod tests {
                     name: "root".into(),
                     parent: None,
                     inverse_bind: Mat4::IDENTITY,
+                    rest: Transform::IDENTITY,
                 },
                 Joint {
                     name: "tip".into(),
                     parent: Some(0),
                     inverse_bind: Mat4::from_translation(-Vec3::Y),
+                    rest: Transform {
+                        translation: Vec3::Y,
+                        ..Transform::IDENTITY
+                    },
                 },
             ],
+            animations: Vec::new(),
         });
         s.instances[0] = Instance {
             name: "quad".into(),

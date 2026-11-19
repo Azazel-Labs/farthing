@@ -777,15 +777,20 @@ fn samples_reduce_and_bake() {
     };
     let index: Vec<serde_json::Value> = serde_json::from_slice(&index).unwrap();
     assert!(!index.is_empty());
+    // SAMPLE=<part of a file name> runs just the matching samples.
+    let only = std::env::var("SAMPLE").ok();
     for sample in &index {
         let file = sample["file"].as_str().unwrap();
+        if only.as_ref().is_some_and(|o| !file.contains(o.as_str())) {
+            continue;
+        }
         let t0 = std::time::Instant::now();
         let bytes = std::fs::read(dir.join(file)).unwrap();
         PEAK.store(LIVE.load(Relaxed), Relaxed);
         let mut demo =
             Demo::load(vec![(file.into(), bytes)]).unwrap_or_else(|e| panic!("{file}: {e}"));
         let info = demo.info();
-        assert!(info.triangles > 1000, "{file}: {info:?}");
+        assert!(info.triangles > 500, "{file}: {info:?}");
         let opts = LodOptions {
             bake_from: 3,
             atlas: 256,
@@ -910,13 +915,18 @@ fn samples_reduce_and_bake() {
             assert!(w[1].triangles < w[0].triangles, "{file}: {:?}", w[1]);
         }
 
-        // The other modes with the page's defaults, each held to the same budget.
+        // The other modes with the page's defaults, each held to the same budget; the crowd
+        // where there is a skeleton to animate it.
+        let crowd = info.skinned.then_some(DemoMode::Crowd);
         for mode in [
             DemoMode::Presets,
             DemoMode::Clusters,
             DemoMode::Hlod,
             DemoMode::Splats,
-        ] {
+        ]
+        .into_iter()
+        .chain(crowd)
+        {
             let t0 = std::time::Instant::now();
             PEAK.store(LIVE.load(Relaxed), Relaxed);
             let run = run_mode(&mut demo, mode, LodOptions::default());
@@ -1013,7 +1023,13 @@ fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
             assert_eq!(run.levels.len(), 11, "original + 10 configurations");
             for (info, has_scene) in &run.levels[1..] {
                 assert!(info.label.is_some() && info.note.is_some(), "{info:?}");
-                assert!(info.triangles < original, "{info:?}");
+                // Strict seams can't collapse an edge whose sides differ; the Fox's every edge
+                // is a UV seam (it's flat shaded, no vertex shared), so that preset keeps it all.
+                let strict = info.label.as_deref() == Some("Strict seams");
+                assert!(
+                    info.triangles < original || strict && info.triangles == original,
+                    "{info:?}"
+                );
                 assert!(has_scene);
                 // The compact GLB without textures: no more than the download, which embeds them.
                 let bytes = info.bytes.unwrap();
@@ -1093,6 +1109,54 @@ fn check_mode(demo: &Demo, mode: DemoMode, run: &Run, diagonal: f32) {
                 assert_eq!(Some(ply.len() as u64), json["bytes"].as_u64());
             }
         }
+        DemoMode::Crowd => {
+            let (kind, json, buffers) = &run.data[0];
+            assert_eq!(kind, "crowd");
+            // Palette; two skinned levels of six arrays; the vertex animation, its uvs and
+            // indices; the whole mesh's joints and weights on the reduced bones.
+            assert_eq!(buffers.len(), 1 + 6 + 6 + 3 + 2);
+            let Buffer::U8(fanm) = &buffers[0] else {
+                panic!("the palette should be bytes")
+            };
+            let palette = farthing::anim::bake::PosePalette::from_bytes(fanm).unwrap();
+            assert_eq!(palette.clips.len(), json["clips"].as_array().unwrap().len());
+            let Buffer::U8(fvat) = &buffers[13] else {
+                panic!("the vertex animation should be bytes")
+            };
+            let vat = farthing::anim::vat::VertexAnimation::from_bytes(fvat).unwrap();
+            assert_eq!(vat.frame_count(), palette.frame_count());
+            let levels = json["levels"].as_array().unwrap();
+            let tris = |l: usize| levels[l]["triangles"].as_u64().unwrap();
+            assert_eq!(tris(0) as usize, original);
+            assert!(tris(1) < tris(0) && tris(2) < tris(1), "{json}");
+            assert_eq!(
+                vat.vertex_count as u64,
+                levels[2]["vertices"].as_u64().unwrap()
+            );
+            let joints = palette.joint_count;
+            for level in [0, 1] {
+                let v = levels[level]["vertices"].as_u64().unwrap() as usize;
+                let at = 1 + 6 * level;
+                assert_eq!(u32s(&buffers[at + 3]).len(), 4 * v);
+                assert!(u32s(&buffers[at + 3]).iter().all(|&j| j < joints));
+                assert_eq!(u32s(&buffers[at + 5]).len() as u64, 3 * tris(level));
+            }
+            // The middle level skins with the kept bones only, as does the comparison.
+            let kept = json["bones"].as_u64().unwrap() as usize;
+            assert!(kept < joints as usize, "{json}");
+            for at in [1 + 6 + 3, 16] {
+                let mut used: Vec<u32> = u32s(&buffers[at]).to_vec();
+                used.sort_unstable();
+                used.dedup();
+                assert!(used.len() <= kept, "{} bones used of {kept}", used.len());
+            }
+            let size = json["size"].as_f64().unwrap();
+            assert!(json["bone_gap"].as_f64().unwrap() < 0.5 * size, "{json}");
+            assert!(
+                json["palette_error"].as_f64().unwrap() < 0.03 * size,
+                "{json}"
+            );
+        }
     }
 }
 
@@ -1119,4 +1183,16 @@ fn sphere_runs_every_mode() {
     // A splat run keeps PLYs but no GLB levels.
     assert!(demo.level_glb(1, false).is_err());
     assert!(demo.level_ply(1).is_ok());
+    // A crowd needs a skeleton, and says so.
+    let e = demo
+        .run(
+            &LodOptions {
+                mode: DemoMode::Crowd,
+                ..small
+            },
+            &|| 0.0,
+            &mut |_| {},
+        )
+        .unwrap_err();
+    assert!(e.contains("skinned"), "{e}");
 }

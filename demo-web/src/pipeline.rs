@@ -10,8 +10,8 @@
 //!   `bake_from`) are geometry-only proxies of the whole scene with fresh UVs and base color,
 //!   normal and roughness/metalness maps baked from the original. Every finished level and
 //!   baked texture is reported through an [`Event`] as soon as it exists.
-//! * The other example modes ([`DemoMode`]: option examples, cluster DAG, HLOD tree, splats)
-//!   live in [`crate::modes`]; [`Demo::run`] dispatches on [`LodOptions::mode`].
+//! * The other example modes ([`DemoMode`]: option examples, cluster DAG, HLOD tree, splats,
+//!   GPU crowd) live in [`crate::modes`]; [`Demo::run`] dispatches on [`LodOptions::mode`].
 
 use crate::cook::{CookOptions, Cooked, CookedInfo, TextureCompression, bare, cook};
 use crate::modes::Extra;
@@ -74,6 +74,9 @@ pub enum DemoMode {
     Hlod,
     /// Progressive surfel cloud turned into Gaussian splats ([`farthing::impostor`]).
     Splats,
+    /// A skinned model's levels for a GPU crowd: pose palette, bone LODs, vertex animation
+    /// ([`farthing::anim`], [`farthing::bones`]).
+    Crowd,
 }
 
 /// Largest shared atlas side: a 2048² bake holds a few hundred megabytes at its peak (the
@@ -225,6 +228,10 @@ pub struct LodOptions {
     pub splat_footprints: bool,
     /// HLOD: render visibility (triangle IDs) on the GPU when WebGL2 is available.
     pub gpu_visibility: bool,
+    /// Crowd: bones the middle level keeps.
+    pub crowd_bones: usize,
+    /// Crowd: fraction of the triangles the middle level keeps (the far level a quarter of it).
+    pub crowd_ratio: f32,
 }
 
 impl Default for LodOptions {
@@ -268,6 +275,8 @@ impl Default for LodOptions {
             splat_count: 20_000,
             splat_footprints: true,
             gpu_visibility: true,
+            crowd_bones: 12,
+            crowd_ratio: 0.4,
         }
     }
 }
@@ -802,6 +811,7 @@ impl Demo {
             DemoMode::Clusters => crate::modes::run_clusters(self, opts, now, emit),
             DemoMode::Hlod => crate::modes::run_hlod(self, opts, now, emit),
             DemoMode::Splats => crate::modes::run_splats(self, opts, now, emit),
+            DemoMode::Crowd => crate::modes::run_crowd(self, opts, now, emit),
         }
     }
 
