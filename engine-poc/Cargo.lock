@@ -238,7 +238,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "farthing"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "glam 0.34.3",
  "gltf",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "farthing-poc-engine"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "bytemuck",
