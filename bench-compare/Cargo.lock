@@ -86,6 +86,7 @@ dependencies = [
  "meshopt",
  "mimalloc",
  "nalgebra",
+ "rayon",
  "rectangle-pack",
  "serde_json",
  "snugly 0.1.2",

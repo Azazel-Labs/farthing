@@ -1151,6 +1151,12 @@ it with the same scheme assembled from meshoptimizer 0.7's own primitives, as it
 clusterlod.h). A group that keeps more than 85% of its triangles passes through to the next level,
 for every method. Both use 128-triangle, 255-vertex clusters.
 
+"meshopt par" and "meshopt attr par" are the same builds with each level's groups simplified,
+re-split and bounded concurrently on rayon's pool, the way clusterlod.h lets a caller run them.
+Results are committed in group order, so their DAGs are identical to the serial ones (checked
+cut by cut on five assets). Only build time and peak heap differ. The tables below predate
+them and compare farthing against the serial baseline.
+
 **How quality is scored.** The camera sits 4 bounding radii out (1080p, 60° vertical FOV). The
 screen-error threshold is swept from 0.02 to 200 px in steps of ×1.5. Each cut is
 `dag.select` → `to_mesh`, and its mean surface distance to the source is *measured* (40k
@@ -1207,8 +1213,9 @@ What the numbers say:
 - **Fast mode** (`ClusterOptions::fast()`, `Quality::Fast` group reductions) builds about 2×
   faster, with geometric error as low or lower. It keeps normals and UVs less faithfully, which
   this table, measuring positions only, doesn't show.
-- **Speed.** The meshopt baseline here is serial. clusterlod.h itself runs groups in parallel,
-  and zeux reports about 10.6M triangles/s on 16 threads. That is faster than farthing's
+- **Speed.** The meshopt rows here are serial, so farthing's multi-thread lead over them is not
+  like for like; rerun with the `par` rows (`ONLY="meshopt attr par"`) for that. clusterlod.h
+  itself runs groups in parallel, and zeux reports about 10.6M triangles/s on 16 threads. That is faster than farthing's
   roughly 0.5M (default) and 0.9M (fast) triangles/s in this run. farthing's levels are
   parallel: groups are reduced at the same time, and clustering uses a parallel spatial
   bisection and parallel adjacency. With the Windows system allocator, parallel scaling stalls;

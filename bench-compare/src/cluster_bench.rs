@@ -13,6 +13,7 @@ use farthing::cluster::{
 };
 use farthing::metrics::surface_distance;
 use glam::Vec3;
+use rayon::prelude::*;
 use serde_json::json;
 use std::time::Instant;
 
@@ -52,8 +53,16 @@ fn mo_cluster(m: &Mesh, idx: Vec<u32>, level: u32, err: f32, lod: Option<Sphere>
     }
 }
 
-/// The clusterlod.h scheme with meshoptimizer's own primitives.
-fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
+/// What reducing one group produces, before it is given a group id.
+struct GroupOut {
+    produced: Vec<Cluster>,
+    error: f32,
+    bounds: Sphere,
+}
+
+/// The clusterlod.h scheme with meshoptimizer's own primitives. `parallel` reduces each level's
+/// groups concurrently on rayon's pool; the DAG is the same either way.
+fn meshopt_dag(m: &Mesh, attrs: bool, parallel: bool) -> ClusterDag {
     let pos: Vec<[f32; 3]> = m.positions.iter().map(|p| p.to_array()).collect();
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, pos.len() * 12) };
@@ -123,17 +132,16 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
         let locks: Vec<bool> = (0..m.vertex_count())
             .map(|v| border[pid[v] as usize])
             .collect();
-        let mut next = Vec::new();
-        let mut progress = false;
-        for mem in &groups {
+        // One group's work, reading only the clusters built so far: simplify, re-split and
+        // bound the result. None means the group passes through to the next level.
+        let reduce_group = |clusters: &[Cluster], mem: &[u32]| -> Option<GroupOut> {
+            if mem.len() < 2 {
+                return None;
+            }
             let idx: Vec<u32> = mem
                 .iter()
-                .flat_map(|&c| dag.clusters[c as usize].indices.clone())
+                .flat_map(|&c| clusters[c as usize].indices.iter().copied())
                 .collect();
-            if mem.len() < 2 {
-                next.extend_from_slice(mem);
-                continue;
-            }
             let target = (idx.len() / 3 / 2) * 3;
             let mut err = 0.0f32;
             let flags = meshopt::SimplifyOptions::Sparse | meshopt::SimplifyOptions::ErrorAbsolute;
@@ -164,29 +172,44 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
                 )
             };
             if out.len() as f32 > 0.85 * idx.len() as f32 {
-                next.extend_from_slice(mem);
-                continue;
+                return None;
             }
-            progress = true;
-            let gi = dag.groups.len() as u32;
             let bounds = Sphere::enclose(
                 &mem.iter()
-                    .map(|&c| dag.clusters[c as usize].lod_bounds)
+                    .map(|&c| clusters[c as usize].lod_bounds)
                     .collect::<Vec<_>>(),
             );
             let error = mem
                 .iter()
-                .map(|&c| dag.clusters[c as usize].lod_error)
+                .map(|&c| clusters[c as usize].lod_error)
                 .fold(err, f32::max);
+            let produced = split(&out)
+                .into_iter()
+                .map(|c| mo_cluster(m, c, level + 1, error, Some(bounds)))
+                .collect();
+            Some(GroupOut {
+                produced,
+                error,
+                bounds,
+            })
+        };
+        let mut next = Vec::new();
+        let mut progress = false;
+        let mut commit = |dag: &mut ClusterDag, mem: &[u32], r: Option<GroupOut>| {
+            let Some(r) = r else {
+                next.extend_from_slice(mem);
+                return;
+            };
+            progress = true;
+            let gi = dag.groups.len() as u32;
             for &c in mem {
                 let c = &mut dag.clusters[c as usize];
-                c.parent_error = error;
-                c.parent_bounds = bounds;
+                c.parent_error = r.error;
+                c.parent_bounds = r.bounds;
                 c.parent_group = gi;
             }
             let mut produced = Vec::new();
-            for c in split(&out) {
-                let mut cl = mo_cluster(m, c, level + 1, error, Some(bounds));
+            for mut cl in r.produced {
                 cl.group = gi;
                 produced.push(dag.clusters.len() as u32);
                 next.push(dag.clusters.len() as u32);
@@ -194,11 +217,27 @@ fn meshopt_dag(m: &Mesh, attrs: bool) -> ClusterDag {
             }
             dag.groups.push(farthing::cluster::ClusterGroup {
                 level,
-                children: mem.clone(),
+                children: mem.to_vec(),
                 clusters: produced,
-                error,
-                bounds,
+                error: r.error,
+                bounds: r.bounds,
             });
+        };
+        if parallel {
+            // Groups of one level are independent (clusterlod.h leaves them to the caller to
+            // run concurrently). Committing in group order keeps the DAG identical to serial.
+            let results: Vec<Option<GroupOut>> = groups
+                .par_iter()
+                .map(|mem| reduce_group(&dag.clusters, mem))
+                .collect();
+            for (mem, r) in groups.iter().zip(results) {
+                commit(&mut dag, mem, r);
+            }
+        } else {
+            for mem in &groups {
+                let r = reduce_group(&dag.clusters, mem);
+                commit(&mut dag, mem, r);
+            }
         }
         if !progress {
             break;
@@ -213,7 +252,7 @@ pub fn cluster_mode(assets: &[String]) {
     let mut rows = Vec::new();
     let targets = [0.25f32, 0.5, 1.0, 2.0];
     println!(
-        "{:<18} {:<14} {:>7} {:>8} {:>8} {:>6} {:>6} {:>8} | tris for measured mean error ≤ px {:?}",
+        "{:<18} {:<16} {:>7} {:>8} {:>8} {:>6} {:>6} {:>8} | tris for measured mean error ≤ px {:?}",
         "asset", "method", "tris", "build ms", "peak MB", "levels", "roots", "fill", targets
     );
     for path in assets {
@@ -237,8 +276,10 @@ pub fn cluster_mode(assets: &[String]) {
                 "farthing fast",
                 Box::new(|| build_cluster_dag(&m, &ClusterOptions::fast()).unwrap()),
             ),
-            ("meshopt", Box::new(|| meshopt_dag(&m, false))),
-            ("meshopt attr", Box::new(|| meshopt_dag(&m, true))),
+            ("meshopt", Box::new(|| meshopt_dag(&m, false, false))),
+            ("meshopt attr", Box::new(|| meshopt_dag(&m, true, false))),
+            ("meshopt par", Box::new(|| meshopt_dag(&m, false, true))),
+            ("meshopt attr par", Box::new(|| meshopt_dag(&m, true, true))),
         ];
         for (label, build) in &methods {
             if std::env::var("ONLY").is_ok_and(|o| o != *label) {
@@ -287,7 +328,7 @@ pub fn cluster_mode(assets: &[String]) {
                 .map(|&e| need(e).map_or("-".into(), |t| t.to_string()))
                 .collect();
             println!(
-                "{:<18} {:<14} {:>7} {:>8.0} {:>8.1} {:>6} {:>6} {:>8.3} | {}",
+                "{:<18} {:<16} {:>7} {:>8.0} {:>8.1} {:>6} {:>6} {:>8.3} | {}",
                 name,
                 label,
                 m.triangle_count(),
