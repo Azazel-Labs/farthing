@@ -280,10 +280,12 @@ slot is just a name and an id. farthing never knows what a material looks like. 
 feature reads and writes glTF, GLB and OBJ. It also reads quantized, meshopt-compressed and
 Draco-compressed glTF, such as gltfpack's output, decoded by
 [polysmelt](https://crates.io/crates/polysmelt). It bakes texture transforms (offset and scale)
-into the UVs; rotated transforms are ignored. The `formats` feature adds FBX, OBJ with its MTL,
-3MF, 3DS, PLY, STL and MagicaVoxel, read into glTF by polysmelt, and `usd` adds USD (`.usd`,
-`.usda`, `.usdc`, `.usdz`). All of them are pure Rust and build for
-WebAssembly. The `farthing` CLI reads `formats`.
+into the UVs; rotated transforms are ignored. The `formats` feature adds every other format
+polysmelt reads into triangle meshes: FBX, OBJ with its MTL, COLLADA, SketchUp, 3MF, AMF, 3DS,
+PLY, STL, OFF, DXF, X3D and VRML, VRM, MagicaVoxel, DirectX `.x`, LightWave, AC3D,
+MilkShape 3D, Blitz3D, MD2, MD3, MD5, IQM, SMD, PMX and PMD, OGRE, OpenFlight, OpenGEX,
+Irrlicht and XGL, with WebP, TGA, BMP, GIF, TIFF, PSD and DDS textures. `usd` adds USD
+(`.usd`, `.usda`, `.usdc`, `.usdz`). All of them are pure Rust and build for WebAssembly. The `farthing` CLI reads `formats`.
 
 ```rust
 let scene = farthing::io::load("model.glb")?;                   // .glb, .gltf, .obj (+ `formats`)

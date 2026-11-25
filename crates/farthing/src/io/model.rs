@@ -7,45 +7,48 @@ use crate::{Error, Result, Scene};
 use polysmelt::assets::{Assets, Memory};
 use std::borrow::Cow;
 use std::path::Path;
-#[cfg(feature = "formats")]
-use std::path::PathBuf;
 
-/// The extensions (lowercase, without the dot) of the model formats [`load_model`] reads in
-/// this build: glTF always, the others with the `formats` and `usd` features.
-pub const MODEL_EXTENSIONS: &[&str] = &[
-    "glb",
-    "gltf",
-    #[cfg(feature = "formats")]
-    "fbx",
-    #[cfg(feature = "formats")]
-    "obj",
-    #[cfg(feature = "formats")]
-    "3mf",
-    #[cfg(feature = "formats")]
-    "3ds",
-    #[cfg(feature = "formats")]
-    "ply",
-    #[cfg(feature = "formats")]
-    "stl",
-    #[cfg(feature = "formats")]
-    "vox",
-    #[cfg(feature = "usd")]
-    "usdz",
-    #[cfg(feature = "usd")]
-    "usd",
-    #[cfg(feature = "usd")]
-    "usda",
-    #[cfg(feature = "usd")]
-    "usdc",
-];
+/// [`MODEL_EXTENSIONS`] for each combination of features, from one list of each.
+macro_rules! model_extensions {
+    (gltf: [$($g:literal),*], formats: [$($f:literal),*], usd: [$($u:literal),*]) => {
+        /// The extensions (lowercase, without the dot) of the model formats [`load_model`] reads
+        /// in this build: glTF always, the others with the `formats` and `usd` features. When a
+        /// set of files holds more than one model, the one listed first is the model.
+        #[cfg(not(feature = "formats"))]
+        pub const MODEL_EXTENSIONS: &[&str] = &[$($g),*];
+        /// The extensions (lowercase, without the dot) of the model formats [`load_model`] reads
+        /// in this build: glTF always, the others with the `formats` and `usd` features. When a
+        /// set of files holds more than one model, the one listed first is the model.
+        #[cfg(all(feature = "formats", not(feature = "usd")))]
+        pub const MODEL_EXTENSIONS: &[&str] = &[$($g,)* $($f),*];
+        /// The extensions (lowercase, without the dot) of the model formats [`load_model`] reads
+        /// in this build: glTF always, the others with the `formats` and `usd` features. When a
+        /// set of files holds more than one model, the one listed first is the model.
+        #[cfg(feature = "usd")]
+        pub const MODEL_EXTENSIONS: &[&str] = &[$($g,)* $($f,)* $($u),*];
+    };
+}
+
+// Scenes before the meshes they place (`.irr` before `.irrmesh`). Files that only hold motion
+// (`.vmd`, `.md5anim`, `.vta`, `.vrma`, OGRE `.skeleton`) are a model's companions, not models.
+model_extensions! {
+    gltf: ["glb", "gltf"],
+    formats: [
+        "fbx", "obj", "dae", "zae", "kmz", "skp", "3mf", "amf", "3ds", "ply", "stl", "off", "dxf",
+        "x3d", "x3dv", "x3dz", "wrl", "wrz", "vrm", "vox", "x", "lwo", "ac", "ms3d", "b3d", "md2",
+        "md3", "md5mesh", "iqm", "smd", "pmx", "pmd", "mesh", "flt", "ogex", "irr", "irrmesh",
+        "xgl", "zgl"
+    ],
+    usd: ["usdz", "usd", "usda", "usdc"]
+}
 
 /// Loads a model from memory, in any format of [`MODEL_EXTENSIONS`]. `name` is the model's path
 /// among `files`, which hold it and the files it refers to (glTF buffers and images, MTL
 /// libraries, textures, USD layers) by relative, `/`-separated path. A reference is looked up
 /// next to the model, then anywhere by file name. Works without a file system (WebAssembly).
 ///
-/// Textures come in as PNG or JPEG; with the `formats` feature, WebP, TGA and BMP ones are
-/// converted to PNG.
+/// Textures come in as PNG or JPEG; with the `formats` feature, WebP, TGA, BMP, GIF, TIFF, PSD
+/// and DDS ones are converted to PNG.
 pub fn load_model(
     name: &str,
     files: impl IntoIterator<Item = (String, Vec<u8>)>,
@@ -73,7 +76,7 @@ pub fn load_model(
         convert(
             polysmelt::Loader::new()
                 .keep(polysmelt::document::Keep::MESHES)
-                .read_with(bytes.clone(), name, &Textures(&memory)),
+                .read_with(bytes.clone(), name, &memory),
         )
     }
     #[cfg(not(feature = "formats"))]
@@ -88,10 +91,10 @@ pub(super) fn load_file(path: &Path, ext: &str) -> Result<Scene> {
         return Err(unsupported(ext));
     }
     let dir = path.parent().unwrap_or(Path::new(""));
-    let folder = polysmelt::assets::Folder::new(dir);
     let doc = polysmelt::Loader::new()
         .keep(polysmelt::document::Keep::MESHES)
-        .open_with(path, &Textures(&folder));
+        .assets(polysmelt::assets::Folder::new(dir))
+        .open(path);
     convert(doc).map(|(scene, _)| scene)
 }
 
@@ -121,39 +124,6 @@ pub(super) fn extension(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-/// Assets whose textures polysmelt can't embed as they are (TGA, BMP) are converted to PNG.
-#[cfg(feature = "formats")]
-struct Textures<'a>(&'a dyn Assets);
-
-#[cfg(feature = "formats")]
-impl Assets for Textures<'_> {
-    fn find(&self, reference: &str, model_dir: &Path) -> Option<PathBuf> {
-        self.0.find(reference, model_dir)
-    }
-
-    fn read(&self, path: &Path) -> Option<Cow<'_, [u8]>> {
-        self.0.read(path)
-    }
-
-    fn image(&self, bytes: &[u8], name: &Path) -> Option<polysmelt::mesh::Image> {
-        self.0.image(bytes, name).or_else(|| {
-            // TGA has no signature to guess from, so the name says the format.
-            let decoded = match image::ImageFormat::from_path(name) {
-                Ok(format) => image::load_from_memory_with_format(bytes, format),
-                Err(_) => image::load_from_memory(bytes),
-            }
-            .ok()?;
-            let mut png = std::io::Cursor::new(Vec::new());
-            decoded.write_to(&mut png, image::ImageFormat::Png).ok()?;
-            polysmelt::mesh::Image::from_png_or_jpeg(png.into_inner())
-        })
-    }
-
-    fn color_texture_for(&self, model: &Path) -> Option<PathBuf> {
-        self.0.color_texture_for(model)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,10 +146,50 @@ mod tests {
     }
 
     #[test]
+    fn polysmelt_reads_every_extension_listed() {
+        for ext in MODEL_EXTENSIONS {
+            assert!(polysmelt::Format::from_extension(ext).is_some(), "{ext}");
+        }
+    }
+
+    #[test]
     fn rejects_what_it_cannot_read() {
         let e = load_model("a.xyz", files(&[("a.xyz", b"")])).unwrap_err();
         assert!(e.to_string().contains("glb, gltf"), "{e}");
         assert!(load_model("missing.glb", files(&[])).is_err());
+    }
+
+    #[cfg(feature = "formats")]
+    #[test]
+    fn reads_off_and_collada() {
+        let off = b"OFF
+4 2 0
+0 0 0
+1 0 0
+1 1 0
+0 1 0
+3 0 1 2
+3 0 2 3
+";
+        let (scene, _) = load_model("a.off", files(&[("a.off", off)])).unwrap();
+        assert_eq!(scene.triangle_count(), 2);
+        let dae = br##"<?xml version="1.0"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <library_geometries><geometry id="g"><mesh>
+    <source id="p"><float_array id="pa" count="9">0 0 0 1 0 0 0 1 0</float_array>
+      <technique_common><accessor source="#pa" count="3" stride="3">
+        <param name="X" type="float"/><param name="Y" type="float"/><param name="Z" type="float"/>
+      </accessor></technique_common></source>
+    <vertices id="v"><input semantic="POSITION" source="#p"/></vertices>
+    <triangles count="1"><input semantic="VERTEX" source="#v" offset="0"/><p>0 1 2</p></triangles>
+  </mesh></geometry></library_geometries>
+  <library_visual_scenes><visual_scene id="s"><node>
+    <instance_geometry url="#g"/>
+  </node></visual_scene></library_visual_scenes>
+  <scene><instance_visual_scene url="#s"/></scene>
+</COLLADA>"##;
+        let (scene, _) = load_model("m/a.DAE", files(&[("m/a.DAE", dae)])).unwrap();
+        assert_eq!(scene.triangle_count(), 1);
     }
 
     #[cfg(feature = "formats")]

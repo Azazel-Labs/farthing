@@ -1,8 +1,8 @@
 //! glTF and OBJ import and export (feature `io`, on by default).
 //!
 //! Load and save [`Scene`]s as glTF 2.0 (`.gltf` / `.glb`) and Wavefront OBJ. With the
-//! `formats` feature, also load FBX, OBJ with its MTL, 3MF, 3DS, PLY, STL and MagicaVoxel, and
-//! with `usd`, USD ([`MODEL_EXTENSIONS`], [`load_model`]).
+//! `formats` feature, also load FBX, OBJ with its MTL, COLLADA, SketchUp, X3D and the other
+//! mesh formats polysmelt reads, and with `usd`, USD ([`MODEL_EXTENSIONS`], [`load_model`]).
 //!
 //! Material handling follows the farthing boundary: scenes only carry named material slots.
 //! [`GltfMaterial`] exposes the glTF material description as a *host-side convenience*, so a
