@@ -36,7 +36,7 @@ formats = [
     "image/tga",
     "image/bmp",
 ]
-# USD as well (`.usd`, `.usda`, `.usdc`, `.usdz`). Its reader needs Rust 1.96.
+# USD as well (`.usd`, `.usda`, `.usdc`, `.usdz`).
 usd = ["formats", "polysmelt/usd"]
 
 [dependencies]

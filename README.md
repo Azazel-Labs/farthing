@@ -6,7 +6,7 @@
 [![CI](https://github.com/Azazel-Labs/farthing/actions/workflows/ci.yml/badge.svg)](https://github.com/Azazel-Labs/farthing/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/farthing.svg)](https://crates.io/crates/farthing)
 [![docs.rs](https://img.shields.io/docsrs/farthing)](https://docs.rs/farthing)
-[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange?logo=rust)](https://www.rust-lang.org)
+[![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange?logo=rust)](https://www.rust-lang.org)
 [![License: MIT-0](https://img.shields.io/badge/license-MIT--0-blue)](LICENSE)
 [![Live demo](https://img.shields.io/badge/demo-try_it_in_your_browser-8a2be2)](https://azazel-labs.github.io/farthing/)
 
@@ -282,7 +282,7 @@ Draco-compressed glTF, such as gltfpack's output, decoded by
 [polysmelt](https://crates.io/crates/polysmelt). It bakes texture transforms (offset and scale)
 into the UVs; rotated transforms are ignored. The `formats` feature adds FBX, OBJ with its MTL,
 3MF, 3DS, PLY, STL and MagicaVoxel, read into glTF by polysmelt, and `usd` adds USD (`.usd`,
-`.usda`, `.usdc`, `.usdz`; it needs Rust 1.96). All of them are pure Rust and build for
+`.usda`, `.usdc`, `.usdz`). All of them are pure Rust and build for
 WebAssembly. The `farthing` CLI reads `formats`.
 
 ```rust

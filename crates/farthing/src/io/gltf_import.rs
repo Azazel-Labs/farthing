@@ -190,18 +190,17 @@ fn decode_encodings(
             }
         }
     }
-    let (name, ext) = if bytes.starts_with(b"glTF") {
-        ("model.glb", "glb")
+    let name = if bytes.starts_with(b"glTF") {
+        "model.glb"
     } else {
-        ("model.gltf", "gltf")
+        "model.gltf"
     };
     // Everything farthing reads: the meshes and what shapes them, and the skins' animations.
-    let keep = polysmelt::document::Keep {
-        animations: true,
-        ..polysmelt::document::Keep::MESHES
-    };
-    let mut doc =
-        polysmelt::formats::load_bytes(bytes, name, ext, &files, keep).map_err(invalid)?;
+    let keep = polysmelt::document::Keep::MESHES.with_animations(true);
+    let mut doc = polysmelt::Loader::new()
+        .keep(keep)
+        .read_with(bytes.to_vec(), name, &files)
+        .map_err(invalid)?;
     doc.decode().map_err(invalid)?;
     Ok(Some(doc.to_glb().map_err(invalid)?))
 }

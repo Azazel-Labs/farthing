@@ -59,18 +59,18 @@ jobs:
           cache-on-failure: true
       - run: cargo test --workspace --locked
 
-  # The minimum supported Rust (rust-version in Cargo.toml) still builds everything. `+1.88`
+  # The minimum supported Rust (rust-version in Cargo.toml) still builds everything. `+1.96`
   # overrides the `stable` channel in rust-toolchain.toml.
   msrv:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: cargo +1.88 check --workspace --all-targets --locked
-      - run: cargo +1.88 check -p farthing --no-default-features --locked
+      - run: cargo +1.96 check --workspace --all-targets --locked
+      - run: cargo +1.96 check -p farthing --no-default-features --locked
 
   # The browser demo: its native tests, then the WebAssembly build that Pages serves.
   demo:

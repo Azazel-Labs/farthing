@@ -70,13 +70,11 @@ pub fn load_model(
     }
     #[cfg(feature = "formats")]
     {
-        convert(polysmelt::formats::load_bytes(
-            bytes,
-            name,
-            &ext,
-            &Textures(&memory),
-            polysmelt::document::Keep::MESHES,
-        ))
+        convert(
+            polysmelt::Loader::new()
+                .keep(polysmelt::document::Keep::MESHES)
+                .read_with(bytes.clone(), name, &Textures(&memory)),
+        )
     }
     #[cfg(not(feature = "formats"))]
     unreachable!("without `formats`, every extension listed is glTF")
@@ -91,12 +89,9 @@ pub(super) fn load_file(path: &Path, ext: &str) -> Result<Scene> {
     }
     let dir = path.parent().unwrap_or(Path::new(""));
     let folder = polysmelt::assets::Folder::new(dir);
-    let doc = polysmelt::formats::load(
-        path,
-        ext,
-        &Textures(&folder),
-        polysmelt::document::Keep::MESHES,
-    );
+    let doc = polysmelt::Loader::new()
+        .keep(polysmelt::document::Keep::MESHES)
+        .open_with(path, &Textures(&folder));
     convert(doc).map(|(scene, _)| scene)
 }
 
@@ -104,7 +99,7 @@ pub(super) fn load_file(path: &Path, ext: &str) -> Result<Scene> {
 /// written as a GLB and imported.
 #[cfg(feature = "formats")]
 fn convert(
-    doc: polysmelt::Result<polysmelt::document::Document<'_>>,
+    doc: polysmelt::Result<polysmelt::document::Document>,
 ) -> Result<(Scene, Vec<GltfMaterial>)> {
     let invalid = |e: polysmelt::Error| Error::InvalidInput(e.to_string());
     let mut doc = doc.map_err(invalid)?;

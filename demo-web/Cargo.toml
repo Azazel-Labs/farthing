@@ -14,7 +14,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Every model format polysmelt reads (all pure Rust); USD is what needs Rust 1.96.
+# Every model format polysmelt reads (all pure Rust).
 farthing = { path = "../crates/farthing", features = ["usd"] }
 glam = "0.34"
 # Texture compression (BC, ETC2, ASTC, KTX2 + Zstd). CPU only: no wgpu, no CLI. Its Zstd is C,
