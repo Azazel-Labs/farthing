@@ -90,6 +90,11 @@ enum Cmd {
         /// Fast mode: a lean single-threaded loop, several times faster, slightly higher error.
         #[arg(long)]
         fast: bool,
+        /// Realtime mode: clustering plus a short collapse tail, for a frame budget (a 100k
+        /// triangle mesh in about 15 ms). Higher error than the default, lower than other
+        /// methods that fast.
+        #[arg(long, conflicts_with = "fast")]
+        realtime: bool,
     },
     /// Build a LOD chain (writes lod0..N and lods.json into a directory).
     Lods {
@@ -539,6 +544,7 @@ fn main() -> Result<()> {
             strict_seams,
             symmetry,
             fast,
+            realtime,
         } => {
             let mut s = load(&input)?;
             let diag = s.bounds().diagonal();
@@ -573,7 +579,9 @@ fn main() -> Result<()> {
                     } else {
                         farthing::reduce::Symmetry::Off
                     },
-                    quality: if fast {
+                    quality: if realtime {
+                        farthing::reduce::Quality::Realtime
+                    } else if fast {
                         farthing::reduce::Quality::Fast
                     } else {
                         farthing::reduce::Quality::Best

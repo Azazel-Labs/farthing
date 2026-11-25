@@ -1185,10 +1185,154 @@ fn exp_mode(assets: &[String]) {
 
 mod pack_bench;
 
+/// `realtime <assets...>`: every mesh of each asset as one, reduced to a fixed triangle count
+/// (`RT_TARGET`, default 3000). Time is the best of `RT_RUNS` (default 5) after one warm-up.
+fn realtime_mode(assets: &[String]) {
+    let target: usize = std::env::var("RT_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    let runs: usize = std::env::var("RT_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let only: Option<Vec<String>> = std::env::var("RD_METHODS")
+        .ok()
+        .map(|v| v.split(',').map(String::from).collect());
+    let mut summary: std::collections::BTreeMap<String, Vec<(f32, f32, f32, f32, f64)>> =
+        Default::default();
+    println!(
+        "{:<18} {:>7} {:<20} {:>6} {:>8} {:>9} {:>9} {:>7} {:>8} {:>9}",
+        "asset", "input", "method", "tris", "hausd%", "mean%", "uv p90", "n deg", "ms", "peak MB"
+    );
+    for path in assets {
+        let m = load(path);
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let opts = |quality| SimplifyOptions {
+            target_triangles: Some(target),
+            quality,
+            ..lf_opts_env()
+        };
+        let methods: Vec<(&str, Box<dyn Fn() -> Mesh>)> = vec![
+            (
+                "farthing",
+                Box::new(|| {
+                    simplify(&m, &opts(farthing::reduce::Quality::Best))
+                        .unwrap()
+                        .mesh
+                }),
+            ),
+            (
+                "farthing fast",
+                Box::new(|| {
+                    simplify(&m, &opts(farthing::reduce::Quality::Fast))
+                        .unwrap()
+                        .mesh
+                }),
+            ),
+            (
+                "farthing realtime",
+                Box::new(|| {
+                    simplify(&m, &opts(farthing::reduce::Quality::Realtime))
+                        .unwrap()
+                        .mesh
+                }),
+            ),
+            (
+                "meshopt attr perm",
+                Box::new(|| meshopt_reduce(&m, target, true, true)),
+            ),
+            (
+                "meshopt",
+                Box::new(|| meshopt_reduce(&m, target, false, false)),
+            ),
+            ("meshopt sloppy", Box::new(|| meshopt_sloppy(&m, target))),
+        ];
+        for (label, f) in methods {
+            if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == label)) {
+                continue;
+            }
+            let _ = f();
+            let mut best = f64::MAX;
+            let mut peak = 0usize;
+            let mut r = None;
+            for _ in 0..runs {
+                let base = reset_peak();
+                let t = Instant::now();
+                let out = f();
+                best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                peak = peak.max(PEAK.load(std::sync::atomic::Ordering::Relaxed) - base);
+                r = Some(out);
+            }
+            let r = r.unwrap();
+            let d = surface_distance(&m, &r, 40000);
+            let (_, u90, nd) = attribute_error(&m, &r);
+            println!(
+                "{:<18} {:>7} {:<20} {:>6} {:>8.3} {:>9.4} {:>9.5} {:>7.2} {:>8.2} {:>9.1}",
+                name,
+                m.triangle_count(),
+                label,
+                r.triangle_count(),
+                d.relative_hausdorff * 100.0,
+                d.relative_mean * 100.0,
+                u90,
+                nd,
+                best,
+                peak as f64 / 1e6
+            );
+            summary.entry(label.to_string()).or_default().push((
+                d.relative_hausdorff,
+                d.relative_mean,
+                u90,
+                nd,
+                best,
+            ));
+        }
+    }
+    println!(
+        "
+SUMMARY (geometric means; lower is better)"
+    );
+    println!(
+        "{:<20} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "method", "hausd%", "mean%", "uv p90", "n deg", "ms"
+    );
+    for (label, v) in &summary {
+        let g = |f: &dyn Fn(&(f32, f32, f32, f32, f64)) -> f64| {
+            (v.iter().map(|x| f(x).max(1e-9).ln()).sum::<f64>() / v.len() as f64).exp()
+        };
+        println!(
+            "{:<20} {:>9.4} {:>9.5} {:>9.5} {:>8.3} {:>8.2}",
+            label,
+            g(&|x| x.0 as f64) * 100.0,
+            g(&|x| x.1 as f64) * 100.0,
+            g(&|x| x.2 as f64),
+            g(&|x| x.3 as f64),
+            g(&|x| x.4)
+        );
+    }
+}
+
+fn meshopt_sloppy(m: &Mesh, target: usize) -> Mesh {
+    let pos: Vec<[f32; 3]> = m.positions.iter().map(|p| p.to_array()).collect();
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(pos.as_ptr() as *const u8, pos.len() * 12) };
+    let adapter = meshopt::VertexDataAdapter::new(bytes, 12, 0).unwrap();
+    with_indices(
+        m,
+        meshopt::simplify_sloppy(&m.indices, &adapter, target * 3, 1.0, None),
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("reduce") => reduce_mode(&args[1..]),
+        Some("realtime") => realtime_mode(&args[1..]),
         Some("uv") => uv_mode(&args[1..]),
         Some("exp") => exp_mode(&args[1..]),
         Some("parts") => parts_mode(&args[1..]),

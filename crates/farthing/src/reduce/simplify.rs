@@ -115,7 +115,7 @@ pub struct SimplifyOptions {
     /// default 0.5 scored best in rendered comparisons (higher keeps improving geometry only).
     #[serde(default = "default_silhouette_weight")]
     pub silhouette_weight: f32,
-    /// [`Quality::Best`] (default) or [`Quality::Fast`].
+    /// [`Quality::Best`] (default), [`Quality::Fast`] or [`Quality::Realtime`].
     #[serde(default)]
     pub quality: Quality,
     /// Material ids that don't hide what is behind them (glass, visors, water). Part removal
@@ -148,6 +148,11 @@ pub enum Quality {
     /// several times faster. Uses the target, error, weight, border and lock options; ignores
     /// symmetry, part removal, silhouette weight, importance and skinning/morph weights.
     Fast,
+    /// Built for a frame budget: adaptive quadric clustering over a Morton-ordered octree,
+    /// then a short collapse tail from about twice the target. Linear in the input and tens
+    /// of times faster than [`Quality::Fast`] at large ratios, with seams and borders kept.
+    /// Uses the target, error, weight, border and lock options like `Fast`; ignores the rest.
+    Realtime,
 }
 
 fn default_silhouette_weight() -> f32 {
@@ -3245,6 +3250,21 @@ fn simplify_top(mesh: &Mesh, opts: &SimplifyOptions) -> Result<SimplifyResult> {
         }
         let target = resolve_target(mesh.triangle_count(), opts);
         let mut r = crate::reduce::fast::simplify_fast(mesh, opts, target)?;
+        // Vertices of deleted parts map onto the remaining surface.
+        crate::reduce::parts::remap_orphans(mesh, &mut r);
+        return Ok(r);
+    }
+    if opts.quality == Quality::Realtime {
+        mesh.validate()?;
+        if let Some(r) = opts.target_ratio
+            && !(0.0..=1.0).contains(&r)
+        {
+            return Err(Error::InvalidInput(format!(
+                "target_ratio {r} must be within 0..=1"
+            )));
+        }
+        let target = resolve_target(mesh.triangle_count(), opts);
+        let mut r = crate::reduce::realtime::simplify_realtime(mesh, opts, target)?;
         // Vertices of deleted parts map onto the remaining surface.
         crate::reduce::parts::remap_orphans(mesh, &mut r);
         return Ok(r);

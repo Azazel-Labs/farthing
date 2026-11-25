@@ -14,6 +14,7 @@ python3 pairwise.py results-reduce.json      # matched-triangle-count comparison
 cargo run --release --features xatlas -- uv <assets...>   # UV atlas table vs xatlas (needs libclang)
 cargo run --release -- remesh <assets...>    # voxel proxies vs baby_shark
 RD_RATIOS=0.01,0.003,0.001 cargo run --release -- reduce <assets...>   # aggressive targets
+cargo run --release -- realtime <assets...> # frame-budget reduction to RT_TARGET (3000)
 LF_OPTS='{"error_normalization":1.0}' cargo run --release -- reduce ... # option overrides
 cargo run --release -- pack                  # rectangle packers
 cargo run --release -- clusters <assets...>  # cluster LOD DAGs vs a clusterlod.h-style build
@@ -411,6 +412,68 @@ Same 8 assets × 4 ratios, geometric means, default thread count (2 cores):
 Fast mode is 4× faster than the default and still has lower Hausdorff, mean and UV error than
 meshoptimizer's attribute-aware mode; its normals are 1.6° worse. It doesn't do junction
 sliding or visibility-aware part removal (v14's aggressive-target work below), or symmetry.
+
+### Realtime mode (v21)
+
+`Quality::Realtime` (`farthing reduce --realtime`) is for reductions that must fit in a frame,
+such as streaming a heavy asset to a viewer. Edge collapse spends nearly all of its time on the
+first 90% of collapses, which barely affect the result; the visible error comes from the last
+ones. So stage one gets close to the target in linear time and only the tail is collapsed edge
+by edge:
+
+1. Vertices are radix-sorted by Morton code, so every octree cell is a contiguous range. Each
+   vertex carries a moment-matched quadric of its fan, plus border planes found without an edge
+   table (the next and previous corner-id sums, and their squares, cancel around a closed fan
+   and give an open fan's two border neighbors).
+2. Cells are split worst-first by quadric error plus a normal-cone term. Flat regions stay
+   coarse and curved ones refine, which a uniform grid can't do. Splitting stops at about 0.55
+   clusters per target triangle.
+3. Each cluster keeps the summed quadric of the original surface and is represented by its
+   member vertex of least error, so no vertex is invented and attributes stay exact. Members
+   joined by an edge inside the cluster share a wedge, so UV seams and hard edges survive as
+   separate wedges at one position.
+4. A lazy greedy collapse tail takes the roughly 2× overshoot down to the target. It uses the
+   inherited quadrics, a wedge-distance attribute cost, border sliding, and link and flip checks.
+
+Steps 1 to 3 run over a fixed number of chunks of the Morton order. Wedges, seams and clusters
+all lie inside one cell, so each chunk finishes on its own, and a shared union-find that keeps
+each set's smallest rank as its root makes the result identical for any thread count. A
+competitor can't get the same speedup by adding workers to edge collapse: the parallelism comes
+from the clusters being local by construction.
+
+Three large assets reduced to 3,000 triangles, every mesh as one (`RD_METHODS=... cargo run
+--release -- realtime <assets...>`). Machine: Core Ultra 7 155H pinned to 4 P-cores (8
+threads). Time is the best of 5 runs; peak MB counts heap allocated during the call.
+
+| asset | method | Hausdorff % | mean % | UV p90 | normals ° | ms | peak MB |
+|---|---|---|---|---|---|---|---|
+| ChronographWatch 100k | farthing realtime | 2.150 | 0.188 | **0.765** | **43.5** | 14.4 | 10.3 |
+| | meshopt sloppy | 2.670 | 0.370 | 2.241 | 64.3 | **6.7** | 9.9 |
+| | meshopt attr + permissive | **2.087** | 0.206 | 0.775 | 44.2 | 184 | 9.9 |
+| | farthing fast | 3.105 | 0.285 | 0.794 | 51.4 | 400 | 51.4 |
+| CarConcept 213k | farthing realtime | 3.725 | **0.212** | **17.70** | **45.6** | 20.0 | 17.4 |
+| | meshopt sloppy | **3.649** | 0.322 | 129.2 | 73.8 | **14.5** | 17.1 |
+| | meshopt attr + permissive | 6.103 | 0.323 | 29.38 | 55.9 | 302 | 17.1 |
+| | farthing fast | 8.043 | 0.369 | 80.70 | 64.4 | 1592 | 104.2 |
+| DragonAttenuation 135k | farthing realtime | 1.985 | 0.172 | 0.0123 | 13.0 | 11.6 | 13.5 |
+| | meshopt sloppy | 1.905 | 0.098 | 0.3417 | 13.0 | **11.1** | 9.9 |
+| | meshopt attr + permissive | **0.751** | 0.082 | 0.0045 | **6.2** | 449 | 9.9 |
+| | farthing fast | 0.754 | **0.037** | **0.0016** | 6.8 | 500 | 63.4 |
+
+Geometric means:
+
+| method | Hausdorff % | mean % | UV p90 | normals ° | ms |
+|---|---|---|---|---|---|
+| farthing realtime | 2.51 | 0.190 | 0.550 | 29.5 | 15.0 |
+| meshopt sloppy | 2.65 | 0.227 | 4.62 | 39.5 | **10.3** |
+| meshopt attr + permissive | **2.12** | 0.176 | **0.467** | **24.8** | 292 |
+| farthing fast | 2.66 | **0.157** | 0.471 | 28.2 | 683 |
+
+Realtime is about 20× faster than meshoptimizer's attribute-aware simplifier at a small cost in
+error, and better than its sloppy simplifier (the only method this fast) on every geometric
+mean, with 8× lower UV error. That's because sloppy ignores attributes and seams. The default
+reducer isn't listed: at these ratios it deletes hidden parts, and plain Hausdorff counts that
+against it.
 
 ### Aggressive targets (v14)
 

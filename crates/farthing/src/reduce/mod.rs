@@ -22,6 +22,7 @@ mod parts;
 pub(crate) use parts::parts_of;
 pub mod quad;
 mod quadric;
+mod realtime;
 pub mod repair;
 mod simplify;
 pub mod symmetry;

@@ -55,7 +55,9 @@ numbers (current defaults are slightly better) · every case:
 The price is speed: farthing is 5–9× slower than meshoptimizer because it measures error much
 more carefully. That's meant for a build step, not for every frame. A fast mode gets to about
 2× of meshoptimizer's speed and still has lower distance and UV error (normals are slightly
-worse).
+worse). A realtime mode is for a frame budget: it reduces a 100k-triangle model to 3k in about
+15 ms, 20× faster than meshoptimizer's attribute-aware simplifier, and beats its sloppy
+simplifier on every error measure ([details](docs/BENCHMARKS.md#realtime-mode-v21)).
 
 ## Each level takes over *where the difference is a pixel.*
 
@@ -334,6 +336,7 @@ let opts = SimplifyOptions {
     lock_border: true,         // open edges stay put, so tiles and modular pieces still line up
     error_normalization: 1.0,  // classic QEM: protects small features, costs overall fidelity
     quality: Quality::Fast,    // several times faster; skips symmetry and part removal
+                               // (Quality::Realtime: a frame budget, ~15 ms for 100k tris)
     ..Default::default()
 };
 ```
