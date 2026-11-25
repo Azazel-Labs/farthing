@@ -41,6 +41,7 @@
 // Data model.
 pub mod bvh;
 pub mod error;
+mod fxhash;
 pub mod host;
 pub mod image;
 pub mod math;

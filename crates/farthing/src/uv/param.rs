@@ -1,5 +1,6 @@
 //! Chart segmentation + per-chart flattening (LSCM or planar) + packing.
 
+use crate::fxhash::{HashMap, HashSet};
 use crate::math::{orthonormal_basis, triangle_area};
 use crate::uv::lscm::{layout_overlaps, lscm};
 use crate::{Error, Mesh, Result};
@@ -8,38 +9,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use snugly::{ChartMask, HoleFill, MaskPlacement, PackOptions, pack, rotate_point};
 use std::collections::VecDeque;
-
-/// Small-key hasher (multiply-rotate, as in rustc's FxHash): the maps here hold vertex, face and
-/// corner ids, where SipHash's DoS resistance only costs time. Output never depends on map
-/// iteration order (it is sorted wherever it matters), so the hasher does not change results.
-#[derive(Default, Clone, Copy)]
-struct Fx(u64);
-impl std::hash::Hasher for Fx {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(b as u64);
-        }
-    }
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-    }
-    #[inline]
-    fn write_u32(&mut self, i: u32) {
-        self.write_u64(i as u64);
-    }
-    #[inline]
-    fn write_usize(&mut self, i: usize) {
-        self.write_u64(i as u64);
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fx>>;
-type HashSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<Fx>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParamMethod {

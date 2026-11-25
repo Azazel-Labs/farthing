@@ -1,54 +1,61 @@
 //! Mesh repair: welding, degenerate and duplicate triangle removal, small-part removal.
 
 use crate::Mesh;
+use crate::fxhash::{HashMap, HashSet};
 use crate::math::triangle_area;
-use std::collections::{HashMap, HashSet};
 
 /// Merges vertices whose positions fall in the same `epsilon` grid cell (or match exactly when
 /// `epsilon == 0`) *and* whose other attributes are bit-identical. Returns the number of
 /// vertices removed.
 pub fn weld(mesh: &mut Mesh, epsilon: f32) -> usize {
-    let before = mesh.vertex_count();
-    let q = |x: f32| {
+    let n = mesh.vertex_count();
+    // Every vertex's key, laid end to end in one buffer: allocating one per vertex and hashing it
+    // with SipHash was most of the time a weld took.
+    let stride = 3 * if epsilon > 0.0 { 2 } else { 1 }
+        + mesh.normals.as_ref().map_or(0, |_| 3)
+        + mesh.tangents.as_ref().map_or(0, |_| 4)
+        + mesh.uvs.len() * 2
+        + mesh.colors.as_ref().map_or(0, |_| 4)
+        + mesh.skin.as_ref().map_or(0, |_| 8)
+        + mesh.morph_targets.len() * 3;
+    let mut keys = Vec::with_capacity(n * stride);
+    for v in 0..n {
+        let p = mesh.positions[v].to_array();
         if epsilon > 0.0 {
-            (x / epsilon).round() as i64
+            for x in p {
+                let cell = (x / epsilon).round() as i64;
+                keys.extend([cell as u32, (cell >> 32) as u32]);
+            }
         } else {
-            x.to_bits() as i64
+            keys.extend(p.map(f32::to_bits));
         }
-    };
-    let key_of = |v: usize| -> Vec<u32> {
-        let p = mesh.positions[v];
-        let mut k = vec![
-            q(p.x) as u32,
-            (q(p.x) >> 32) as u32,
-            q(p.y) as u32,
-            (q(p.y) >> 32) as u32,
-            q(p.z) as u32,
-            (q(p.z) >> 32) as u32,
-        ];
         if let Some(n) = &mesh.normals {
-            k.extend(n[v].to_array().map(f32::to_bits));
+            keys.extend(n[v].to_array().map(f32::to_bits));
+        }
+        if let Some(t) = &mesh.tangents {
+            keys.extend(t[v].to_array().map(f32::to_bits));
         }
         for s in &mesh.uvs {
-            k.extend(s[v].to_array().map(f32::to_bits));
+            keys.extend(s[v].to_array().map(f32::to_bits));
         }
         if let Some(c) = &mesh.colors {
-            k.extend(c[v].to_array().map(f32::to_bits));
+            keys.extend(c[v].to_array().map(f32::to_bits));
         }
         if let Some(s) = &mesh.skin {
-            k.extend(s.joints[v].map(u32::from));
-            k.extend(s.weights[v].map(f32::to_bits));
+            keys.extend(s.joints[v].map(u32::from));
+            keys.extend(s.weights[v].map(f32::to_bits));
         }
         for m in &mesh.morph_targets {
-            k.extend(m.position_deltas[v].to_array().map(f32::to_bits));
+            keys.extend(m.position_deltas[v].to_array().map(f32::to_bits));
         }
-        k
-    };
-    let mut map: HashMap<Vec<u32>, u32> = HashMap::new();
+    }
+    let mut map: HashMap<&[u32], u32> = HashMap::with_capacity_and_hasher(n, Default::default());
     let mut order = Vec::new();
-    let remap: Vec<u32> = (0..mesh.vertex_count())
-        .map(|v| {
-            *map.entry(key_of(v)).or_insert_with(|| {
+    let remap: Vec<u32> = keys
+        .chunks_exact(stride)
+        .enumerate()
+        .map(|(v, key)| {
+            *map.entry(key).or_insert_with(|| {
                 order.push(v as u32);
                 order.len() as u32 - 1
             })
@@ -58,7 +65,7 @@ pub fn weld(mesh: &mut Mesh, epsilon: f32) -> usize {
     out.indices = mesh.indices.iter().map(|&i| remap[i as usize]).collect();
     out.material_ids = std::mem::take(&mut mesh.material_ids);
     *mesh = out;
-    before - mesh.vertex_count()
+    n - mesh.vertex_count()
 }
 
 /// Strips per-wedge surface attributes (UVs, normals, tangents, colors) and welds by position,
@@ -97,7 +104,7 @@ pub fn remove_degenerate_triangles(mesh: &mut Mesh, min_area: f32) -> usize {
 pub fn remove_duplicate_triangles(mesh: &mut Mesh) -> usize {
     let before = mesh.triangle_count();
     let key = |p: glam::Vec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
-    let mut seen: HashSet<[[u32; 3]; 3]> = HashSet::new();
+    let mut seen: HashSet<[[u32; 3]; 3]> = HashSet::default();
     let mut idx = Vec::new();
     let mut mats = Vec::new();
     for t in 0..before {
@@ -118,7 +125,7 @@ pub fn remove_duplicate_triangles(mesh: &mut Mesh) -> usize {
 pub fn remove_small_parts(mesh: &mut Mesh, min_diagonal: f32) -> usize {
     let before = mesh.triangle_count();
     let key = |p: glam::Vec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
-    let mut pid: HashMap<[u32; 3], usize> = HashMap::new();
+    let mut pid: HashMap<[u32; 3], usize> = HashMap::default();
     let vp: Vec<usize> = mesh
         .positions
         .iter()
@@ -146,7 +153,7 @@ pub fn remove_small_parts(mesh: &mut Mesh, min_diagonal: f32) -> usize {
         let rc2 = find(&mut parent, rc);
         parent[rc2] = ra;
     }
-    let mut bounds: HashMap<usize, crate::Aabb> = HashMap::new();
+    let mut bounds: HashMap<usize, crate::Aabb> = HashMap::default();
     for (v, p) in mesh.positions.iter().enumerate() {
         let r = find(&mut parent, vp[v]);
         bounds.entry(r).or_default().extend(*p);
