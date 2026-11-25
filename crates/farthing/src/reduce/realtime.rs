@@ -117,48 +117,62 @@ fn spread(x: u32) -> u32 {
 /// blocks count their digits, then write their keys straight to place (relaxed atomic
 /// stores, plain stores on common targets). The order is the same however it is split.
 fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
+    // One scatter by the top 10 bits of the code, then each bucket (a few hundred keys,
+    // in cache) sorted on its own. Keys are distinct, so the order is the full sort's.
     let n = keys.len();
     let blk = (n / (4 * rayon::current_num_threads())).max(PAR_MIN);
-    let mut src: Vec<AtomicU64> = keys.into_iter().map(AtomicU64::new).collect();
-    let mut dst: Vec<AtomicU64> = (0..n)
+    let digit = |k: u64| (k >> (32 + 3 * DEPTH - 10)) as usize & 1023;
+    let mut hist: Vec<[u32; 1024]> = keys
+        .par_chunks(blk)
+        .map(|b| {
+            let mut h = [0u32; 1024];
+            for &k in b {
+                h[digit(k)] += 1;
+            }
+            h
+        })
+        .collect();
+    let mut start = [0u32; 1025];
+    let mut sum = 0u32;
+    for d in 0..1024 {
+        start[d] = sum;
+        for h in hist.iter_mut() {
+            let c = h[d];
+            h[d] = sum;
+            sum += c;
+        }
+    }
+    start[1024] = sum;
+    let dst: Vec<AtomicU64> = (0..n)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|_| AtomicU64::new(0))
         .collect();
-    for pass in 0..3 {
-        let shift = 32 + 10 * pass;
-        let digit = |k: u64| ((k >> shift) & 1023) as usize;
-        let mut hist: Vec<[u32; 1024]> = src
-            .par_chunks(blk)
-            .map(|b| {
-                let mut h = [0u32; 1024];
-                for k in b {
-                    h[digit(k.load(Relaxed))] += 1;
-                }
-                h
-            })
-            .collect();
-        let mut sum = 0u32;
-        for d in 0..1024 {
-            for h in hist.iter_mut() {
-                let c = h[d];
-                h[d] = sum;
-                sum += c;
+    keys.par_chunks(blk)
+        .zip(hist.par_iter_mut())
+        .for_each(|(b, h)| {
+            for &k in b {
+                let d = digit(k);
+                dst[h[d] as usize].store(k, Relaxed);
+                h[d] += 1;
             }
+        });
+    drop(keys);
+    let mut out: Vec<u64> = dst.into_iter().map(AtomicU64::into_inner).collect();
+    let mut buckets: Vec<&mut [u64]> = Vec::with_capacity(1024);
+    let mut rest = &mut out[..];
+    for d in 0..1024 {
+        let (b, r) = rest.split_at_mut((start[d + 1] - start[d]) as usize);
+        if b.len() > 1 {
+            buckets.push(b);
         }
-        src.par_chunks(blk)
-            .zip(hist.par_iter_mut())
-            .for_each(|(b, h)| {
-                for k in b {
-                    let k = k.load(Relaxed);
-                    let d = digit(k);
-                    dst[h[d] as usize].store(k, Relaxed);
-                    h[d] += 1;
-                }
-            });
-        std::mem::swap(&mut src, &mut dst);
+        rest = r;
     }
-    src.into_iter().map(AtomicU64::into_inner).collect()
+    buckets
+        .into_par_iter()
+        .with_min_len(8)
+        .for_each(|b| b.sort_unstable());
+    out
 }
 
 /// A refinement node: a range of fine cells, the leading Morton digits all its codes share
@@ -433,6 +447,9 @@ pub(crate) fn simplify_realtime(
             clock = std::time::Instant::now();
         }
     };
+    if prof {
+        eprintln!("  {nv} vertices, {nt} triangles");
+    }
     let bounds = mesh.bounds();
     let diag = bounds.diagonal().max(1e-12);
     let inv = 1.0 / diag;
@@ -1636,21 +1653,28 @@ impl Tail {
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(nc);
         // First costs exact, in parallel (they only read the state), so a cluster's first
         // turn at the top mostly holds.
-        let first: Vec<Option<u32>> = (0..nc as u32)
+        //
+        // A cluster's exact best is kept with the collapse count it was found at, and stands
+        // while no collapse since has changed what it reads (`dirty`): its triangles, its
+        // neighbors' quadrics, its wedges' areas and its constraint sides.
+        let mut cache: Vec<Option<(f32, u32, f32)>> = (0..nc as u32)
             .into_par_iter()
             .with_min_len(64)
             .map_init(
                 || Scratch::new(nc),
                 |s, p| {
                     self.gather(p, &mut s.loc);
-                    self.best(p, max_err2, true, s).map(|b| b.0.to_bits())
+                    self.best(p, max_err2, true, s)
                 },
             )
             .collect();
-        for (p, c) in first.into_iter().enumerate() {
+        let mut cache_at = vec![0u32; nc];
+        let mut dirty = vec![0u32; nc];
+        let mut done = 0u32;
+        for (p, c) in cache.iter().enumerate() {
             if let Some(c) = c {
                 queued[p] = true;
-                heap.push(Reverse((c, p as u32)));
+                heap.push(Reverse((c.0.to_bits(), p as u32)));
             }
         }
         let mut worst2 = 0f32;
@@ -1660,18 +1684,27 @@ impl Tail {
             if target.is_some_and(|t| alive_tris <= t) {
                 break;
             }
-            queued[p as usize] = false;
-            if gone[p as usize] {
+            let pu = p as usize;
+            queued[pu] = false;
+            if gone[pu] {
                 continue;
             }
-            self.gather(p, &mut s.loc);
-            let Some((c, q, g2)) = self.best(p, max_err2, true, &mut s) else {
+            let fresh = cache_at[pu] < dirty[pu];
+            if fresh {
+                self.gather(p, &mut s.loc);
+                cache[pu] = self.best(p, max_err2, true, &mut s);
+                cache_at[pu] = done;
+            }
+            let Some((c, q, g2)) = cache[pu] else {
                 continue;
             };
             if c.to_bits() > c0 && heap.peek().is_some_and(|Reverse((n, _))| c.to_bits() > *n) {
-                queued[p as usize] = true;
+                queued[pu] = true;
                 heap.push(Reverse((c.to_bits(), p)));
                 continue;
+            }
+            if !fresh {
+                self.gather(p, &mut s.loc);
             }
             let loc = std::mem::take(&mut s.loc);
             let ok = self.link_ok(&loc, p, q, &mut s)
@@ -1683,6 +1716,19 @@ impl Tail {
             }
             for &(pw, qw) in &map {
                 wremap[pw as usize] = qw;
+            }
+            // What changes: every cluster on p's triangles (their triangles do), every one on
+            // q's after (q's quadric does), and p's other constraint neighbor (its side does).
+            done += 1;
+            for k in &s.loc {
+                for &x in &k.c {
+                    dirty[x as usize] = done;
+                }
+            }
+            for &x in &self.side[pu] {
+                if x != u32::MAX {
+                    dirty[x as usize] = done;
+                }
             }
             alive_tris -= self.collapse(p, q, &map);
             gone[p as usize] = true;
@@ -1703,6 +1749,7 @@ impl Tail {
                 }
             }
             for &r in &touched {
+                dirty[r as usize] = done;
                 if queued[r as usize] {
                     continue;
                 }

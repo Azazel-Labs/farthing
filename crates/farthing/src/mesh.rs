@@ -5,6 +5,9 @@ use crate::{Error, Result};
 use glam::{Vec2, Vec3, Vec4};
 use std::collections::HashMap;
 
+/// Elements per task in the whole-mesh parallel scans.
+const PAR_CHUNK: usize = 1 << 14;
+
 /// Up to four joint influences per vertex.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Skin {
@@ -86,7 +89,11 @@ impl Mesh {
     }
 
     pub fn bounds(&self) -> Aabb {
-        Aabb::from_points(self.positions.iter())
+        use rayon::prelude::*;
+        self.positions
+            .par_chunks(PAR_CHUNK)
+            .map(Aabb::from_points)
+            .reduce(|| Aabb::EMPTY, |a, b| a.union(&b))
     }
 
     pub fn surface_area(&self) -> f32 {
@@ -142,12 +149,23 @@ impl Mesh {
         {
             return bad("morph target");
         }
-        if let Some(i) = self.indices.iter().find(|&&i| i as usize >= n) {
+        use rayon::prelude::*;
+        if let Some(i) = self
+            .indices
+            .par_iter()
+            .with_min_len(PAR_CHUNK)
+            .find_first(|&&i| i as usize >= n)
+        {
             return Err(Error::InvalidMesh(format!(
                 "index {i} out of range ({n} vertices)"
             )));
         }
-        if self.positions.iter().any(|p| !p.is_finite()) {
+        if self
+            .positions
+            .par_iter()
+            .with_min_len(PAR_CHUNK)
+            .any(|p| !p.is_finite())
+        {
             return Err(Error::InvalidMesh("non-finite position".into()));
         }
         Ok(())
