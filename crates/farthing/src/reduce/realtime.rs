@@ -23,6 +23,10 @@
 //!    and flip checks. Each live cluster has at most one heap entry, keyed by a geometry-only
 //!    lower bound and checked exactly when it surfaces, so most neighbors a collapse touches
 //!    are never costed again.
+//! 4. **Finish.** Each remaining free cluster moves along its surface normal to the minimum
+//!    of its summed quadric (never sideways, which would slide the texture under attributes
+//!    copied from one member), and each output normal is the area-weighted mean over every
+//!    input vertex merged into its wedge.
 //!
 //! Every pass before the tail runs in parallel over a fixed number of chunks of the Morton
 //! order, set by the vertex count alone. Wedges, seams and clusters all lie inside one octree

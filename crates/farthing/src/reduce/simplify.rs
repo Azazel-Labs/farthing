@@ -219,7 +219,8 @@ pub struct SimplifyResult {
     /// The symmetry plane used, if any (n.xyz, d with n·p + d = 0).
     pub symmetry_plane: Option<glam::Vec4>,
     /// For each output vertex, the input vertex it is an exact copy of (half-edge collapse),
-    /// so callers can carry custom per-vertex attributes across.
+    /// so callers can carry custom per-vertex attributes across. In realtime mode the copy's
+    /// position may be moved along the normal and its normal is a mean over merged vertices.
     pub source_vertex: Vec<u32>,
 }
 
