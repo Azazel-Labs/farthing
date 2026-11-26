@@ -1958,11 +1958,8 @@ impl Tail {
             for &(pw, qw) in &map {
                 wremap[pw as usize] = qw;
             }
-            // What changes: every cluster on p's triangles (their triangles do, and q may be a
-            // new neighbor), q itself, and p's other constraint neighbor (its side does). A
-            // neighbor of q alone keeps its triangles and its other targets' costs; only its
-            // cost onto q changes, and that only rises (q's quadric and wedge areas grew), so
-            // its best stands unless q was it.
+            // What changes: every cluster on p's triangles (their triangles do), every one on
+            // q's after (q's quadric does), and p's other constraint neighbor (its side does).
             done += 1;
             for k in &s.loc {
                 for &x in &k.c {
@@ -1993,9 +1990,7 @@ impl Tail {
                 }
             }
             for &r in &touched {
-                if r == q || cache[r as usize].is_none_or(|b| b.1 == q) {
-                    dirty[r as usize] = done;
-                }
+                dirty[r as usize] = done;
                 if queued[r as usize] || !self.movable(r) {
                     continue;
                 }
