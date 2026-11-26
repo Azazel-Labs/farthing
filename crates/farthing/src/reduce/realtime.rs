@@ -349,14 +349,6 @@ fn aunion(p: &[AtomicU32], mut a: u32, mut b: u32) {
     }
 }
 
-/// [`aunion`] for a set no other thread is touching: the same result, without the swap.
-fn aunion_own(p: &[AtomicU32], a: u32, b: u32) {
-    let (a, b) = (afind(p, a), afind(p, b));
-    if a != b {
-        p[a.max(b) as usize].store(a.min(b), Relaxed);
-    }
-}
-
 /// Splits a slice at the given ascending end offsets (the last is its length).
 fn split_ends<T>(mut s: &mut [T], ends: impl Iterator<Item = usize>) -> Vec<&mut [T]> {
     let mut out = Vec::new();
@@ -913,54 +905,28 @@ pub(crate) fn simplify_realtime(
     // in different cells has them in different clusters too (two corners in one cell share
     // an edge, hence a cluster), so the kept set is final here. Two edges of a triangle
     // connect all three corners.
-    //
-    // A cell's vertices lie in one chunk, so a chunk's own joins race with nobody and need
-    // no swap. A triangle can also join two vertices of another chunk's cell; those few joins
-    // wait and run one by one afterwards. Every set is rooted at its smallest member either
-    // way, so the result is the same.
-    let aparent: Vec<AtomicU32> = (0..nv as u32)
-        .into_par_iter()
-        .with_min_len(PAR_MIN)
-        .map(AtomicU32::new)
-        .collect();
-    type Kept = Vec<([u32; 3], u32)>;
-    let parts: Vec<(Kept, Vec<[u32; 2]>)> = (0..nch)
+    let aparent: Vec<AtomicU32> = (0..nv as u32).map(AtomicU32::new).collect();
+    let kept: Vec<Vec<([u32; 3], u32)>> = (0..nch)
         .into_par_iter()
         .map(|k| {
             let mut kept = Vec::new();
-            let mut late = Vec::new();
-            let (lo, hi) = (chunks[k][0] as u32, chunks[k][1] as u32);
-            let mut join = |a: u32, b: u32| {
-                if (lo..hi).contains(&a) {
-                    aunion_own(&aparent, a, b);
-                } else {
-                    late.push([a, b]);
-                }
-            };
             for &(r, t) in chunk_tris(k) {
                 let c = r.map(|r| cellr[r as usize]);
                 if c[0] == c[1] {
-                    join(r[0], r[1]);
+                    aunion(&aparent, r[0], r[1]);
                 } else if c[0] != c[2] && c[1] != c[2] {
                     kept.push((r, t));
                     continue;
                 }
                 if c[1] == c[2] {
-                    join(r[1], r[2]);
+                    aunion(&aparent, r[1], r[2]);
                 } else if c[0] == c[2] {
-                    join(r[0], r[2]);
+                    aunion(&aparent, r[0], r[2]);
                 }
             }
-            (kept, late)
+            kept
         })
         .collect();
-    let mut kept: Vec<Kept> = Vec::with_capacity(nch);
-    for (k, late) in parts {
-        kept.push(k);
-        for [a, b] in late {
-            aunion(&aparent, a, b);
-        }
-    }
     drop(routed);
     let kept = kept.concat();
     let mut parent: Vec<u32> = aparent.into_iter().map(AtomicU32::into_inner).collect();
