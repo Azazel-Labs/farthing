@@ -1122,6 +1122,57 @@ pub(crate) fn simplify_realtime(
                 }
                 j.warea[root] += vs[r].area / 3.0;
             }
+            // Wedges that meet at a position with the same UVs and colors differ in their
+            // normals alone (a hard edge, or unwelded faces): the texture runs on across them,
+            // so they take their attributes from one member, the nearest to the cluster's
+            // position among them all. Left apart, the wedge without a member at that position
+            // would shift the texture by the distance to its own nearest. Normals stay each
+            // wedge's own (its mean, set at output).
+            {
+                let mut class: Vec<u32> = (0..n as u32).collect();
+                fn find(c: &mut [u32], mut x: u32) -> u32 {
+                    while c[x as usize] != x {
+                        c[x as usize] = c[c[x as usize] as usize];
+                        x = c[x as usize];
+                    }
+                    x
+                }
+                let same = |a: usize, b: usize| {
+                    mesh.uvs.iter().all(|u| u[a] == u[b])
+                        && mesh.colors.as_ref().is_none_or(|c| c[a] == c[b])
+                };
+                for i in 1..n {
+                    let mut k = i;
+                    while k > 0 && spos[r0 + k - 1] == spos[r0 + i] {
+                        k -= 1;
+                        if same(vert(r0 + i) as usize, vert(r0 + k) as usize) {
+                            let (a, b) = (
+                                find(&mut class, j.parent[i] - base),
+                                find(&mut class, j.parent[k] - base),
+                            );
+                            class[a.max(b) as usize] = a.min(b);
+                            break;
+                        }
+                    }
+                }
+                let mut cbest = vec![(f32::INFINITY, u32::MAX); n];
+                for i in 0..n {
+                    let root = (j.parent[i] - base) as usize;
+                    if root == i {
+                        let c = find(&mut class, root as u32) as usize;
+                        if j.wbest[root] < cbest[c] {
+                            cbest[c] = j.wbest[root];
+                        }
+                    }
+                }
+                for i in 0..n {
+                    let root = (j.parent[i] - base) as usize;
+                    if root == i {
+                        let c = find(&mut class, root as u32) as usize;
+                        j.wbest[root] = cbest[c];
+                    }
+                }
+            }
             ChunkOut {
                 cq,
                 best,
