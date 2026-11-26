@@ -1665,6 +1665,13 @@ impl Tail {
         )
     }
 
+    /// Whether p has anywhere to go at all: not locked, and if constrained, a side to slide to.
+    #[inline]
+    fn movable(&self, p: u32) -> bool {
+        !self.locked[p as usize]
+            && (self.sdeg[p as usize] == 0 || self.side[p as usize] != [u32::MAX; 2])
+    }
+
     #[inline]
     fn can(&self, p: u32, q: u32) -> bool {
         !self.locked[p as usize]
@@ -1881,30 +1888,34 @@ impl Tail {
         let mut gone = vec![false; nc];
         let mut map = Vec::new();
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(nc);
-        // First costs exact, in parallel (they only read the state), so a cluster's first
-        // turn at the top mostly holds.
+        // First keys are lower bounds from geometry alone, in parallel (they only read the
+        // state): most clusters never reach the top, so their exact cost is never needed.
         //
         // A cluster's exact best is kept with the collapse count it was found at, and stands
         // while no collapse since has changed what it reads (`dirty`): its triangles, its
         // neighbors' quadrics, its wedges' areas and its constraint sides.
-        let mut cache: Vec<Option<(f32, u32, f32)>> = (0..nc as u32)
+        let first: Vec<Option<u32>> = (0..nc as u32)
             .into_par_iter()
             .with_min_len(64)
             .map_init(
                 || Scratch::new(nc),
                 |s, p| {
+                    if !self.movable(p) {
+                        return None;
+                    }
                     self.gather(p, &mut s.loc);
-                    self.best(p, max_err2, true, s)
+                    self.best(p, max_err2, false, s).map(|b| b.0.to_bits())
                 },
             )
             .collect();
+        let mut cache: Vec<Option<(f32, u32, f32)>> = vec![None; nc];
         let mut cache_at = vec![0u32; nc];
-        let mut dirty = vec![0u32; nc];
-        let mut done = 0u32;
-        for (p, c) in cache.iter().enumerate() {
-            if let Some(c) = c {
+        let mut dirty = vec![1u32; nc];
+        let mut done = 1u32;
+        for (p, key) in first.into_iter().enumerate() {
+            if let Some(key) = key {
                 queued[p] = true;
-                heap.push(Reverse((c.0.to_bits(), p as u32)));
+                heap.push(Reverse((key, p as u32)));
             }
         }
         let mut worst2 = 0f32;
@@ -1980,7 +1991,7 @@ impl Tail {
             }
             for &r in &touched {
                 dirty[r as usize] = done;
-                if queued[r as usize] {
+                if queued[r as usize] || !self.movable(r) {
                     continue;
                 }
                 self.gather(r, &mut s.loc);
