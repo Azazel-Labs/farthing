@@ -1909,6 +1909,10 @@ impl Tail {
         let mut collapses = 0;
         let mut touched: Vec<u32> = Vec::new();
         let mut batch: Vec<(u32, u32)> = Vec::new();
+        // The round a cluster was last popped in, and whether its turn there has come.
+        let mut in_round = vec![0u32; nc];
+        let mut spent = vec![false; nc];
+        let mut round = 0u32;
         let batch_cap: usize = std::env::var("RT_BATCH")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1933,11 +1937,13 @@ impl Tail {
                 (left / ROUND_SHARE).clamp(1, ROUND_MAX)
             };
             batch.clear();
+            round += 1;
             while batch.len() < size
                 && let Some(Reverse((key, p))) = heap.pop()
             {
                 queued[p as usize] = false;
                 if !gone[p as usize] {
+                    in_round[p as usize] = round;
                     batch.push((key, p));
                 }
             }
@@ -1945,12 +1951,17 @@ impl Tail {
                 break;
             }
             let stamp = done;
+            // A turn costing more than both its key and the cheapest entry left behind goes
+            // back in line whatever happens (the heap's top only falls during a round), so its
+            // checks are not worth doing.
+            let next = heap.peek().map_or(u32::MAX, |Reverse((n, _))| *n);
             let this = &*self;
             let (cache_r, cache_at_r, dirty_r) = (&cache, &cache_at, &dirty);
             let work = |s: &mut Scratch, &(key, p): &(u32, u32)| {
                 let pu = p as usize;
-                this.gather(p, &mut s.loc);
-                let best = if cache_at_r[pu] < dirty_r[pu] {
+                let fresh = cache_at_r[pu] < dirty_r[pu];
+                let best = if fresh {
+                    this.gather(p, &mut s.loc);
                     this.best(p, max_err2, true, s)
                 } else {
                     cache_r[pu]
@@ -1963,7 +1974,12 @@ impl Tail {
                     map: [(0, 0); 8],
                     nmap: 0,
                 };
-                if let Some((_, q, _)) = best {
+                if let Some((c, q, _)) = best
+                    && !(c.to_bits() > key && c.to_bits() > next)
+                {
+                    if !fresh {
+                        this.gather(p, &mut s.loc);
+                    }
                     let loc = std::mem::take(&mut s.loc);
                     let mut map = std::mem::take(&mut s.map);
                     turn.ok = this.link_ok(&loc, p, q, s)
@@ -1990,12 +2006,14 @@ impl Tail {
             for t in &turns {
                 cache[t.p as usize] = t.best;
                 cache_at[t.p as usize] = stamp;
+                spent[t.p as usize] = false;
             }
             turns.sort_unstable_by_key(|t| (t.best.map_or(u32::MAX, |b| b.0.to_bits()), t.p));
             for (i, turn) in turns.iter().enumerate() {
                 if target.is_some_and(|t| alive_tris <= t) {
                     // Done: the rest go back unspent.
                     for t in &turns[i..] {
+                        spent[t.p as usize] = true;
                         if !queued[t.p as usize] {
                             queued[t.p as usize] = true;
                             heap.push(Reverse((t.key, t.p)));
@@ -2004,6 +2022,7 @@ impl Tail {
                     break 'rounds;
                 }
                 let (p, pu) = (turn.p, turn.p as usize);
+                spent[pu] = true;
                 if dirty[pu] > stamp {
                     // An earlier collapse of this round changed its neighborhood: back in
                     // line, by a lower bound as for any touched cluster.
@@ -2086,7 +2105,7 @@ impl Tail {
                         continue;
                     }
                     // Members of this round still to come get their turn back there.
-                    if turns[i + 1..].iter().any(|t| t.p == r) {
+                    if in_round[r as usize] == round && !spent[r as usize] {
                         continue;
                     }
                     self.gather(r, &mut s.loc);
