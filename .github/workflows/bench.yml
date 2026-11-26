@@ -1,0 +1,68 @@
+# Timing on a GitHub runner, started by hand: builds bench-compare at two refs and times the
+# realtime reducer with the builds taking turns (scripts/bench-realtime.py). The table lands in
+# the run's summary. Hosted runners are shared, so read differences under a few percent as noise.
+name: Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Ref to compare against
+        default: main
+      head:
+        description: Ref to measure (defaults to the ref the run was started on)
+        default: ""
+      rounds:
+        description: Rounds per asset
+        default: "12"
+      os:
+        description: Runner
+        default: ubuntu-26.04
+
+permissions:
+  contents: read
+
+jobs:
+  realtime:
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.head || github.ref }}
+          path: head
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.base }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        id: assets
+        with:
+          path: assets
+          key: bench-assets-8f492390
+      - name: Fetch assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p assets
+          for n in ChronographWatch CarConcept DragonAttenuation; do
+            curl -fsSL -o assets/$n.glb \
+              https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/8f492390ddc7a2ae221a1369ef560589cf8c70fb/Models/$n/glTF-Binary/$n.glb
+          done
+      - name: Build
+        shell: bash
+        run: |
+          (cd base/bench-compare && cargo build --release --locked)
+          (cd head/bench-compare && cargo build --release --locked)
+      - name: Machine
+        shell: bash
+        run: |
+          { echo '```'; (lscpu 2>/dev/null | grep -E 'Model name|^CPU\(s\)|Thread|Core' || wmic cpu get name,numberofcores,numberoflogicalprocessors); echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Time
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          python3 head/scripts/bench-realtime.py assets "${{ inputs.rounds }}" \
+            base=base/bench-compare/target/release/bench-compare$ext \
+            head=head/bench-compare/target/release/bench-compare$ext | tee -a "$GITHUB_STEP_SUMMARY"
