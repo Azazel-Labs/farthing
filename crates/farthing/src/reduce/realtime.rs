@@ -1573,6 +1573,7 @@ impl Tail {
     fn relax(&mut self, cremap: &[u32], min_dot: f32) -> Vec<bool> {
         let nc = self.cpos.len();
         let mut moved = vec![false; nc];
+        let mut star: Vec<([Vec3; 3], Vec3, usize)> = Vec::new();
         for c in 0..nc {
             if cremap[c] != c as u32 || self.locked[c] || self.sdeg[c] != 0 {
                 continue;
@@ -1615,24 +1616,26 @@ impl Tail {
                 continue;
             }
             // Along the surface normal only: a sideways move would slide the texture, since
-            // the attributes stay those of the member vertex.
+            // the attributes stay those of the member vertex. The star is walked once: each
+            // triangle's corners, its normal, and which corner is this cluster's.
+            star.clear();
             let mut n = Vec3::ZERO;
             for t in self.live(c as u32) {
                 let v = self.tc[t].map(|x| self.cpos[x as usize]);
-                n += (v[1] - v[0]).cross(v[2] - v[0]);
+                let n0 = (v[1] - v[0]).cross(v[2] - v[0]);
+                n += n0;
+                let i = self.tc[t].iter().position(|&x| x == c as u32).unwrap();
+                star.push((v, n0, i));
             }
             let n = n.normalize_or_zero();
             let np = p + n * (np - p).dot(n);
             // Within a share of the shortest edge to a neighbor, and no triangle turned.
             let mut short2 = f32::INFINITY;
             let mut ok = true;
-            for t in self.live(c as u32) {
-                let v = self.tc[t].map(|x| self.cpos[x as usize]);
-                let i = self.tc[t].iter().position(|&x| x == c as u32).unwrap();
+            for &(v, n0, i) in &star {
                 for k in 1..3 {
                     short2 = short2.min((v[(i + k) % 3] - p).length_squared());
                 }
-                let n0 = (v[1] - v[0]).cross(v[2] - v[0]);
                 let mut w = v;
                 w[i] = np;
                 let n1 = (w[1] - w[0]).cross(w[2] - w[0]);
@@ -1835,12 +1838,27 @@ impl Tail {
         // costs more than the best found.
         s.cand
             .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        // A cluster with one wedge (most are) maps it onto q's wedge in their first shared
+        // triangle: the same cost as `wedge_map`'s, without scanning the star per candidate.
+        let single = s
+            .loc
+            .first()
+            .map(|k| k.w[k.i as usize])
+            .filter(|&w| s.loc.iter().all(|k| k.w[k.i as usize] == w));
         let mut best: Option<(f32, u32, f32)> = None;
         for &(g, q, g2) in s.cand.iter() {
             if best.is_some_and(|b| g >= b.0) {
                 break;
             }
-            let Some(ac) = self.wedge_map(&s.loc, q, &mut s.map) else {
+            let ac = match single {
+                Some(pw) => s
+                    .loc
+                    .iter()
+                    .find_map(|k| (0..3).find(|&j| k.c[j] == q).map(|j| k.w[j]))
+                    .map(|qw| self.warea[pw as usize] * self.adist(pw, qw) / self.avg_area as f32),
+                None => self.wedge_map(&s.loc, q, &mut s.map),
+            };
+            let Some(ac) = ac else {
                 continue;
             };
             let c = g + ac;
