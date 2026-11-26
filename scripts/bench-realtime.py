@@ -88,4 +88,26 @@ def main():
         table(cols + ["sum", "CALL"], scale)
 
 
+def scenes(assets_dir, rounds, builds):
+    """Every mesh of each asset reduced on its own: the sum of the meshes' best times."""
+    print("### Mesh by mesh\n")
+    rows = collections.OrderedDict((label, collections.OrderedDict()) for label, _ in builds)
+    paths = [os.path.join(assets_dir, n + ".glb") for n in ASSETS]
+    paths = [p for p in paths if os.path.exists(p)]
+    for ratio in ("0.1", "0.03"):
+        for _ in range(max(2, rounds // 4)):
+            for label, exe in builds:
+                out = subprocess.run([exe, "rtscene", ratio] + paths, capture_output=True, text=True)
+                for line in out.stdout.splitlines():
+                    m = re.match(r"SCENE (\w+) (\d+) meshes .*: ([\d.]+) ms in all", line)
+                    if m:
+                        key = f"{m[1]}, {m[2]} meshes, to {ratio}"
+                        rows[label][key] = min(rows[label].get(key, 1e9), float(m[3]))
+    cols = []
+    for r in rows.values():
+        cols += [c for c in r if c not in cols]
+    table(cols, rows)
+
+
 main()
+scenes(sys.argv[1], int(sys.argv[2]), [a.split("=", 1) for a in sys.argv[3:]])

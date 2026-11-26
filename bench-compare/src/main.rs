@@ -1131,6 +1131,51 @@ fn rtexport_mode(args: &[String]) {
     }
 }
 
+/// `rtscene <ratio> <assets...>`: the realtime reducer on every mesh of each asset on its own,
+/// as a host that keeps a scene's meshes apart would call it. Prints the sum over meshes of
+/// each mesh's best time of `RT_RUNS` (default 5).
+fn rtscene_mode(args: &[String]) {
+    let ratio: f64 = args[0].parse().unwrap();
+    let runs: usize = std::env::var("RT_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    for path in &args[1..] {
+        let scene = farthing::io::load(path).expect("load");
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let (mut total, mut largest) = (0.0, 0.0f64);
+        for m in &scene.meshes {
+            let mut m = m.clone();
+            if m.normals.is_none() {
+                m.compute_normals(60.0);
+            }
+            let opts = SimplifyOptions {
+                target_triangles: Some(((m.triangle_count() as f64 * ratio) as usize).max(4)),
+                quality: farthing::reduce::Quality::Realtime,
+                ..lf_opts_env()
+            };
+            let mut best = f64::MAX;
+            for _ in 0..runs {
+                let t = Instant::now();
+                let r = simplify(&m, &opts).unwrap();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(r);
+            }
+            total += best;
+            largest = largest.max(best);
+        }
+        println!(
+            "SCENE {name} {} meshes {} tris ratio {ratio}: {total:.2} ms in all, largest mesh {largest:.2} ms",
+            scene.meshes.len(),
+            scene.triangle_count()
+        );
+    }
+}
+
 fn lf_opts(target: usize) -> SimplifyOptions {
     let mut v = serde_json::to_value(SimplifyOptions::default()).unwrap();
     if let Ok(e) = std::env::var("LF_OPTS") {
@@ -1478,6 +1523,7 @@ fn main() {
         Some("parts") => parts_mode(&args[1..]),
         Some("export") => export_mode(&args[1..]),
         Some("rtexport") => rtexport_mode(&args[1..]),
+        Some("rtscene") => rtscene_mode(&args[1..]),
         Some("remesh") => remesh_mode(&args[1..]),
         Some("rmdiag") => rmdiag_mode(&args[1..]),
         Some("pack") => pack_bench::pack_mode(&args[1..]),
