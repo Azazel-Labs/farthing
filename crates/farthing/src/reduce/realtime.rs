@@ -96,7 +96,14 @@ fn plane(n: Vec3, d: f32, w: f32) -> [f32; 10] {
 
 #[inline]
 fn qeval(a: &[f64], x: f64, y: f64, z: f64) -> f64 {
-    let e = a[0] * x * x
+    qraw(a, x, y, z).max(0.0)
+}
+
+/// The quadric's value as it comes, rounding error below zero included, for sums of values
+/// that are clamped together.
+#[inline]
+fn qraw(a: &[f64], x: f64, y: f64, z: f64) -> f64 {
+    a[0] * x * x
         + 2.0 * a[1] * x * y
         + 2.0 * a[2] * x * z
         + 2.0 * a[3] * x
@@ -105,8 +112,7 @@ fn qeval(a: &[f64], x: f64, y: f64, z: f64) -> f64 {
         + 2.0 * a[6] * y
         + a[7] * z * z
         + 2.0 * a[8] * z
-        + a[9];
-    e.max(0.0)
+        + a[9]
 }
 
 #[inline]
@@ -1310,7 +1316,9 @@ pub(crate) fn simplify_realtime(
     }
 
     let alive_count = tw.len();
+    let hot = cpos.iter().zip(&cq).map(|(&p, q)| Hot::of(q, p)).collect();
     let mut st = Tail {
+        hot,
         cpos,
         cq,
         tw,
@@ -1468,6 +1476,8 @@ fn unchanged(mesh: &Mesh) -> SimplifyResult {
 /// The collapse tail over clusters (positions) and wedges, in exact greedy order: a heap of
 /// each cluster's cheapest collapse, kept current as neighborhoods change.
 struct Tail {
+    /// What a neighbor costing a collapse onto a cluster reads of it.
+    hot: Vec<Hot>,
     cpos: Vec<Vec3>,
     cq: Vec<Q>,
     /// Triangles by wedge and by cluster.
@@ -1814,18 +1824,19 @@ impl Tail {
                 }
             }
         }
+        // (Qp + Qq)(q) = Qp(q) + Qq(q), and the second term is q's own, kept in `hot` with
+        // its position: one short record per candidate instead of its whole quadric.
         let qp = &self.cq[p as usize];
+        let trace_p = qp[0] + qp[4] + qp[7];
         s.cand.clear();
         for &q in s.nbr.iter() {
             if !self.can(p, q) {
                 continue;
             }
-            let mut qq = self.cq[q as usize];
-            for (a, b) in qq.iter_mut().zip(qp) {
-                *a += b;
-            }
-            let raw = qeval_v(&qq, self.cpos[q as usize]);
-            let g2 = (raw / (qq[0] + qq[4] + qq[7]).max(1e-30)) as f32;
+            let h = &self.hot[q as usize];
+            let raw =
+                (qraw(qp, h.pos[0] as f64, h.pos[1] as f64, h.pos[2] as f64) + h.own).max(0.0);
+            let g2 = (raw / (trace_p + h.trace).max(1e-30)) as f32;
             if max_err2.is_some_and(|m| g2 > m) {
                 continue;
             }
@@ -1937,6 +1948,7 @@ impl Tail {
         for (a, b) in self.cq[q as usize].iter_mut().zip(qq) {
             *a += b;
         }
+        self.hot[q as usize] = Hot::of(&self.cq[q as usize], self.cpos[q as usize]);
         // Sliding along a constraint: p's other constraint neighbor now meets q.
         if self.sdeg[p as usize] == 2 {
             let [a, b] = self.side[p as usize];
@@ -2090,6 +2102,25 @@ impl Tail {
             }
         }
         (collapses, worst2, wremap, cremap)
+    }
+}
+
+/// A cluster as a collapse target: its position, its own quadric's value there, and the
+/// quadric's trace.
+#[derive(Clone, Copy)]
+struct Hot {
+    pos: [f32; 3],
+    own: f64,
+    trace: f64,
+}
+
+impl Hot {
+    fn of(q: &Q, p: Vec3) -> Hot {
+        Hot {
+            pos: p.to_array(),
+            own: qraw(q, p.x as f64, p.y as f64, p.z as f64),
+            trace: q[0] + q[4] + q[7],
+        }
     }
 }
 
