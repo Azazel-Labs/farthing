@@ -16,14 +16,21 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL: PeakAlloc = PeakAlloc;
 
-/// mimalloc with a live-bytes counter, so modes can report peak heap use.
+/// The allocator under the counter: mimalloc, or with the `system-alloc` feature the
+/// platform's own, as a program that sets no allocator gets.
+#[cfg(not(feature = "system-alloc"))]
+use mimalloc::MiMalloc as Inner;
+#[cfg(feature = "system-alloc")]
+use std::alloc::System as Inner;
+
+/// The allocator with a live-bytes counter, so modes can report peak heap use.
 pub struct PeakAlloc;
 static LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 unsafe impl std::alloc::GlobalAlloc for PeakAlloc {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.alloc(l) };
+        let p = unsafe { Inner.alloc(l) };
         if !p.is_null() {
             let now = LIVE.fetch_add(l.size(), std::sync::atomic::Ordering::Relaxed) + l.size();
             PEAK.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
@@ -31,11 +38,11 @@ unsafe impl std::alloc::GlobalAlloc for PeakAlloc {
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        unsafe { mimalloc::MiMalloc.dealloc(p, l) };
+        unsafe { Inner.dealloc(p, l) };
         LIVE.fetch_sub(l.size(), std::sync::atomic::Ordering::Relaxed);
     }
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
-        let q = unsafe { mimalloc::MiMalloc.realloc(p, l, new) };
+        let q = unsafe { Inner.realloc(p, l, new) };
         if !q.is_null() {
             if new >= l.size() {
                 let now = LIVE.fetch_add(new - l.size(), std::sync::atomic::Ordering::Relaxed)

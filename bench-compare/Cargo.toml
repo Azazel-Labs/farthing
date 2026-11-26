@@ -8,6 +8,7 @@ publish = false
 [workspace]
 
 [features]
+system-alloc = []
 # The xatlas UV baseline. Off by default because its bindings need libclang:
 # cargo run --release --features xatlas -- uv <assets...>
 xatlas = ["dep:xatlas-rs-v2"]
