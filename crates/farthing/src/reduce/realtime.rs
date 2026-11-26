@@ -1888,13 +1888,14 @@ impl Tail {
         let mut gone = vec![false; nc];
         let mut map = Vec::new();
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(nc);
-        // First keys are lower bounds from geometry alone, in parallel (they only read the
-        // state): most clusters never reach the top, so their exact cost is never needed.
+        // First costs exact, in parallel (they only read the state), so a cluster's first
+        // turn at the top mostly holds. (Lower bounds here and exact costs on demand were
+        // measured slower: that moves parallel work into the serial loop.)
         //
         // A cluster's exact best is kept with the collapse count it was found at, and stands
         // while no collapse since has changed what it reads (`dirty`): its triangles, its
         // neighbors' quadrics, its wedges' areas and its constraint sides.
-        let first: Vec<Option<u32>> = (0..nc as u32)
+        let mut cache: Vec<Option<(f32, u32, f32)>> = (0..nc as u32)
             .into_par_iter()
             .with_min_len(64)
             .map_init(
@@ -1904,18 +1905,17 @@ impl Tail {
                         return None;
                     }
                     self.gather(p, &mut s.loc);
-                    self.best(p, max_err2, false, s).map(|b| b.0.to_bits())
+                    self.best(p, max_err2, true, s)
                 },
             )
             .collect();
-        let mut cache: Vec<Option<(f32, u32, f32)>> = vec![None; nc];
         let mut cache_at = vec![0u32; nc];
-        let mut dirty = vec![1u32; nc];
-        let mut done = 1u32;
-        for (p, key) in first.into_iter().enumerate() {
-            if let Some(key) = key {
+        let mut dirty = vec![0u32; nc];
+        let mut done = 0u32;
+        for (p, c) in cache.iter().enumerate() {
+            if let Some(c) = c {
                 queued[p] = true;
-                heap.push(Reverse((key, p as u32)));
+                heap.push(Reverse((c.0.to_bits(), p as u32)));
             }
         }
         let mut worst2 = 0f32;
