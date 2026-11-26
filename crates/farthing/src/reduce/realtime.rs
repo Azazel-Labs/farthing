@@ -238,8 +238,14 @@ fn fan_ends(v: usize, s: &VSum, nv: usize) -> Option<[usize; 2]> {
 /// moment M = Σ Aᵢ nᵢnᵢᵀ has trace A, and with mean normal length |Σ Aᵢnᵢ| = A·cos θ for a
 /// cone of normals, M ≈ (A cos²θ) uuᵀ + (A sin²θ / 2)(I − uuᵀ). Flat fans give their exact
 /// plane; curved ones also resist tangential motion, as their faces would. Open fans add the
-/// border planes.
-fn vertex_quadric(v: usize, s: &VSum, upos: &[Vec3], bw: f32) -> [f32; 10] {
+/// border planes, except along an end edge where `meets` says another fan carries on.
+fn vertex_quadric(
+    v: usize,
+    s: &VSum,
+    upos: &[Vec3],
+    bw: f32,
+    meets: impl Fn(usize) -> bool,
+) -> [f32; 10] {
     // In terms of n = Σ Aᵢnᵢ itself (u = n / |n|), so one reciprocal serves every term.
     let n = Vec3::from_array(s.n);
     let (a, n2) = (s.area, n.length_squared());
@@ -272,6 +278,9 @@ fn vertex_quadric(v: usize, s: &VSum, upos: &[Vec3], bw: f32) -> [f32; 10] {
         // |e × u|² = |e|² sin²θ: the edge length squared for edges in the tangent plane.
         let w = bw * inv_n2;
         for o in ends {
+            if meets(o) {
+                continue;
+            }
             let m = (upos[o] - p).cross(n);
             let b = plane(m, -m.dot(p), w);
             for i in 0..10 {
@@ -571,7 +580,40 @@ pub(crate) fn simplify_realtime(
     }
     let avg_area = (total_area / live as f64).max(1e-30);
     let bw = opts.border_weight;
-    let vq = |r: usize| vertex_quadric(r, &vs[r], &spos, bw);
+    // An open fan's end edge is a border only if the surface stops there. Where another
+    // vertex at the same position, facing the same way, has an end edge to the same place,
+    // the two fans meet along it: a seam (split UVs or normals) or unwelded faces, where
+    // border planes would pin vertices for no reason. Vertices at one position share a Morton
+    // code, so they are neighbors in rank. (The back of a double-sided sheet is there too,
+    // facing the other way, and doesn't count.)
+    let meets = |r: usize, o: usize| {
+        let (c, p, to) = (code(r), spos[r], spos[o]);
+        let n = Vec3::from_array(vs[r].n);
+        let hit = |q: usize| {
+            if spos[q] != p {
+                return false;
+            }
+            let m = Vec3::from_array(vs[q].n);
+            n.dot(m) > -0.9 * (n.length_squared() * m.length_squared()).sqrt()
+                && fan_ends(q, &vs[q], nv).is_some_and(|e| e.iter().any(|&x| spos[x] == to))
+        };
+        let mut q = r;
+        while q > 0 && code(q - 1) == c {
+            q -= 1;
+            if hit(q) {
+                return true;
+            }
+        }
+        let mut q = r + 1;
+        while q < nv && code(q) == c {
+            if hit(q) {
+                return true;
+            }
+            q += 1;
+        }
+        false
+    };
+    let vq = |r: usize| vertex_quadric(r, &vs[r], &spos, bw, |o| meets(r, o));
     lap("faces");
 
     // Fine cells: the coarsest level with about FINE_PER_CLUSTER cells per wanted cluster,
