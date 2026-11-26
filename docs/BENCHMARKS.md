@@ -475,6 +475,55 @@ mean, with 8× lower UV error. That's because sloppy ignores attributes and seam
 reducer isn't listed: at these ratios it deletes hidden parts, and plain Hausdorff counts that
 against it.
 
+### Realtime mode, v22: finish step and seam-aware border planes
+
+Three changes, each judged by rendered images (`bench-compare rtexport`, then the engine PoC's
+`score`: every mesh of an asset reduced by the same ratio, rendered with its own textures from
+three views, PSNR against the original; 11 assets):
+
+1. Each output normal is the area-weighted mean over every input vertex merged into its wedge
+   (it was one member's).
+2. After the tail, each free cluster moves along its surface normal to the minimum of its
+   summed quadric, within a quarter of its shortest edge. Moving it freely scored worse on
+   detailed textures, because the UVs stay those of a member vertex.
+3. Border planes go only on true border edges. An open fan's end edge where another fan at
+   the same position (facing the same way) also ends is a seam or an unwelded edge; planes
+   there pinned most vertices of an unwelded mesh. A position hash in the sort key puts such
+   vertices next to each other, so the test reads only rank neighbors.
+
+Mean PSNR over the 11 assets (dB, higher is better):
+
+| | 10% of input | 3% of input |
+|---|---|---|
+| realtime, v21 | 21.98 | 18.64 |
+| + wedge normals | 22.55 | 19.12 |
+| + position solve along the normal | 22.74 | 19.29 |
+| + seam-aware border planes (v22) | **23.13** | **19.50** |
+| farthing fast | 24.02 | 18.94 |
+| farthing (default) | 23.81 | 18.76 |
+| meshopt attr + permissive | 24.01 | 19.47 |
+| meshopt sloppy | 18.94 | 17.06 |
+
+Realtime now leads every method at 3% and is 0.9 dB behind fast mode at 10%. The same three
+large assets at 3,000 triangles as above:
+
+| asset | Hausdorff % | mean % | UV p90 | normals ° |
+|---|---|---|---|---|
+| ChronographWatch | 2.491 (v21: 2.150) | 0.154 (0.188) | 0.742 (0.765) | 38.0 (43.5) |
+| CarConcept | 3.690 (3.725) | 0.175 (0.212) | 15.31 (17.70) | 41.2 (45.6) |
+| DragonAttenuation | 1.493 (1.985) | 0.113 (0.172) | 0.0515 (0.0123) | 10.6 (13.0) |
+| geometric mean | 2.39 (2.51) | 0.145 (0.190) | 0.836 (0.550) | 25.5 (29.5) |
+
+The mean error is now below fast mode's (0.157) and meshoptimizer's attribute-aware mode
+(0.176) at this count. The dragon scene's UV error rose (its cloth has no seam planes holding
+its unwelded vertices any more) while its rendered score went up 0.2 dB.
+
+Time, on a GitHub-hosted Linux runner (4 logical cores; `Bench` workflow, minimum over 60
+calls, v21 and v22 taking turns): ChronographWatch 9.4 → 9.9 ms, CarConcept 12.5 → 13.4 ms,
+DragonAttenuation 9.0 → 9.6 ms across the three changes. Local timings on the development
+machine are not comparable with the v21 table (it was busy), so that table's times stand for
+v21.
+
 ### Aggressive targets (v14)
 
 11 assets (the 8 above plus ABeautifulGame 1.5M tris, CarConcept 213k, ChronographWatch 100k)
