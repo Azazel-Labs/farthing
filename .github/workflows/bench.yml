@@ -18,12 +18,19 @@ on:
       os:
         description: Runner
         default: ubuntu-26.04
+      perf:
+        description: "Profile instead of timing: bench-compare arguments, such as 'realtime assets/CarConcept.glb'"
+        default: ""
+      perf_env:
+        description: "Environment for the profiled run, such as 'RT_TARGET=20000 RAYON_NUM_THREADS=1'"
+        default: "RT_RUNS=40"
 
 permissions:
   contents: read
 
 jobs:
   realtime:
+    if: inputs.perf == ''
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v7
@@ -67,3 +74,45 @@ jobs:
           $py head/scripts/bench-realtime.py assets "${{ inputs.rounds }}" \
             base=base/bench-compare/target/release/bench-compare$ext \
             head=head/bench-compare/target/release/bench-compare$ext | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Sampling profile of one bench-compare run (Linux only): hottest functions and source lines.
+  profile:
+    if: inputs.perf != ''
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.head || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        id: assets
+        with:
+          path: assets
+          key: bench-assets-8f492390
+      - name: Fetch assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p assets
+          for n in ChronographWatch CarConcept DragonAttenuation; do
+            curl -fsSL -o assets/$n.glb               https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/8f492390ddc7a2ae221a1369ef560589cf8c70fb/Models/$n/glTF-Binary/$n.glb
+          done
+      - name: Build
+        run: cd bench-compare && cargo build --release --locked
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
+          RUSTFLAGS: -C force-frame-pointers=yes
+      - name: Profile
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1)
+          env RD_METHODS="farthing realtime" ${{ inputs.perf_env }}             $PERF record -e cpu-clock -F 5000 -g -o perf.data --             bench-compare/target/release/bench-compare ${{ inputs.perf }} > /dev/null
+          {
+            echo '```'
+            $PERF report -i perf.data --stdio --no-children --sort symbol -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60
+            echo '--- by source line'
+            $PERF report -i perf.data --stdio --no-children --sort srcline -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
