@@ -65,7 +65,14 @@ pub fn peak() -> usize {
 mod cluster_bench;
 
 fn load(path: &str) -> Mesh {
-    let scene = farthing::io::load(path).expect("load");
+    let mut scene = farthing::io::load(path).expect("load");
+    // MESH=<i> keeps only the scene's i-th mesh.
+    if let Some(i) = std::env::var("MESH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        scene.instances.retain(|x| x.mesh == i);
+    }
     let (mut m, _) = scene.flatten();
     if m.normals.is_none() {
         m.compute_normals(60.0);
