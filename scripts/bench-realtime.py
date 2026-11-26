@@ -66,10 +66,12 @@ def main():
         for _ in range(rounds):
             for label, exe in builds:
                 merge(best[label], *run(exe, asset))
-        cols = list(next(iter(best.values())))
-        cols.remove("CALL")
+        # Every phase any build has, in the order first seen.
+        cols = []
         for b in best.values():
-            b["sum"] = sum(b[c] for c in cols)
+            cols += [c for c in b if c != "CALL" and c not in cols]
+        for b in best.values():
+            b["sum"] = sum(b.get(c, 0.0) for c in cols)
         print(f"### {name}\n")
         table(cols + ["sum", "CALL"], best)
         label, exe = builds[-1]
@@ -79,7 +81,7 @@ def main():
             row = collections.OrderedDict()
             for _ in range(max(2, rounds // 4)):
                 merge(row, *run(exe, asset, t))
-            row["sum"] = sum(row[c] for c in cols)
+            row["sum"] = sum(row.get(c, 0.0) for c in cols)
             scale[f"{t} thr"] = row
             t *= 2
         print(f"Thread scaling ({label}):\n")
