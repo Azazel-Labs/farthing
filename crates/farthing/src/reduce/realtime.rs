@@ -624,28 +624,34 @@ pub(crate) fn simplify_realtime(
             }
             let p = spos[r];
             let n = Vec3::from_array(vs[r].n);
-            let mut meet = |q: usize| {
-                if ends[q] == NONE {
-                    return;
+            let n2 = n.length_squared();
+            let meet = |mut mine: [u32; 2], q: usize| {
+                if (ends[q][0] != mine[0] && ends[q][0] != mine[1])
+                    && (ends[q][1] != mine[0] && ends[q][1] != mine[1])
+                {
+                    return mine;
                 }
+                // Facing within about 154° of each other (cos > −0.9), without the root.
                 let m = Vec3::from_array(vs[q].n);
-                if n.dot(m) <= -0.9 * (n.length_squared() * m.length_squared()).sqrt() {
-                    return;
+                let d = n.dot(m);
+                if d < 0.0 && d * d >= 0.81 * n2 * m.length_squared() {
+                    return mine;
                 }
                 for o in &mut mine {
                     if ends[q].contains(o) {
                         *o = u32::MAX;
                     }
                 }
+                mine
             };
             let mut q = r;
-            while q > 0 && spos[q - 1] == p {
+            while q > 0 && spos[q - 1] == p && mine != NONE {
                 q -= 1;
-                meet(q);
+                mine = meet(mine, q);
             }
             let mut q = r + 1;
-            while q < nv && spos[q] == p {
-                meet(q);
+            while q < nv && spos[q] == p && mine != NONE {
+                mine = meet(mine, q);
                 q += 1;
             }
             mine
