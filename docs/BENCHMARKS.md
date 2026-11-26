@@ -561,6 +561,15 @@ option yet.
 Realtime's normal-spread weight in cell splitting was retuned on these runs (0.5 to 0.125):
 +0.17 dB at 10%, +0.03 dB at 3%, specular error unchanged or lower.
 
+Realtime's wedges that meet at one position with the same UVs and colors (split by normals
+only: hard edges, unwelded faces) now take their attributes from one member, the nearest to
+the cluster's position among them all, and keep their own mean normal. Before, a wedge with
+no member at that position copied the UV of its own nearest member and shifted the texture
+by that distance; the dragon scene's checkered cloth showed it over its whole surface. Mean
+PSNR 23.29 to 23.87 dB at 10% and 19.53 to 19.88 dB at 3% (dragon scene 20.4 to 26.5 dB at
+10%), specular error unchanged. It costs 0.75 to 1.0 ms per call on the runner (about 7%:
+ChronographWatch 13.0 to 14.0 ms in that run), most of it reading each duplicate's UVs.
+
 ### Default reducer on seam-dense meshes (v22)
 
 The dragon scene's cloth has 62,570 vertices on 22,199 positions, split by normals only.
