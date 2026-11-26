@@ -1240,15 +1240,31 @@ pub(crate) fn simplify_realtime(
     // Each output vertex stands for every input vertex merged into its wedge: its normal is
     // their area-weighted mean, not the one member's the other attributes are copied from.
     if let (Some(src), Some(dst)) = (&mesh.normals, &mut out.normals) {
-        let mut sum = vec![Vec3::ZERO; dst.len()];
-        for v in 0..nv {
-            let r = rank[v] as usize;
-            let root = parent[r] as usize;
-            if wid[root] != u32::MAX {
-                let o = wout[wremap[wid[root] as usize] as usize];
-                if o != u32::MAX {
-                    sum[o as usize] += src[v] * vs[r].area;
+        // Summed over fixed spans of the Morton order and then span by span, so the result
+        // doesn't depend on the thread count.
+        let span = nv.div_ceil(8).max(PAR_MIN);
+        let n_out = dst.len();
+        let parts: Vec<Vec<Vec3>> = (0..nv.div_ceil(span))
+            .into_par_iter()
+            .map(|k| {
+                let mut sum = vec![Vec3::ZERO; n_out];
+                for r in k * span..((k + 1) * span).min(nv) {
+                    let root = parent[r] as usize;
+                    if wid[root] != u32::MAX {
+                        let o = wout[wremap[wid[root] as usize] as usize];
+                        if o != u32::MAX {
+                            sum[o as usize] += src[vert(r) as usize] * vs[r].area;
+                        }
+                    }
                 }
+                sum
+            })
+            .collect();
+        let mut parts = parts.into_iter();
+        let mut sum = parts.next().unwrap_or_default();
+        for part in parts {
+            for (a, b) in sum.iter_mut().zip(part) {
+                *a += b;
             }
         }
         for (n, s) in dst.iter_mut().zip(sum) {
