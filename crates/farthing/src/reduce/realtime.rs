@@ -1804,12 +1804,12 @@ impl Tail {
         if self.locked[p as usize] {
             return None;
         }
-        s.epoch += 1;
+        // A star has a handful of neighbors: a short scan, with no marks over all clusters
+        // (which every job of the parallel first pass would have to allocate).
         s.nbr.clear();
         for k in &s.loc {
             for &x in &k.c {
-                if x != p && s.mark[x as usize] != s.epoch {
-                    s.mark[x as usize] = s.epoch;
+                if x != p && !s.nbr.contains(&x) {
                     s.nbr.push(x);
                 }
             }
@@ -1987,7 +1987,7 @@ impl Tail {
             .into_par_iter()
             .with_min_len(64)
             .map_init(
-                || Scratch::new(nc),
+                || Scratch::new(0),
                 |s, p| {
                     if !self.movable(p) {
                         return None;
