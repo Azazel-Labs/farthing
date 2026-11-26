@@ -131,6 +131,22 @@ pub struct SimplifyOptions {
     /// of deleting a prominent part. 0 disables (stalls delete parts of any error).
     #[serde(default = "default_part_protection")]
     pub part_protection: f32,
+    /// How far reduced UV islands may reach into the texture gutter, as a share of the UV error
+    /// the collapses so far have accepted (the dearest collapse's cost ÷ √`uv_weight`, in
+    /// texture units). 0 (default) holds every island boundary within half a texel at 1024² of
+    /// its source island at any target; a seam vertex whose seam bends in UV can then only go
+    /// by stretching one island over its neighbor, which on meshes with seams nearly
+    /// everywhere costs far more shape and texture fidelity than the spill it avoids. 0.01 to
+    /// 0.05 give most of that back for a little gutter coverage at aggressive targets.
+    #[serde(default)]
+    pub gutter_tolerance: f32,
+    /// How glossy each material is, by material id, in 0..=1 (0 or missing: matte; see
+    /// [`crate::metrics::Gloss::weight`]). A highlight sits where the shading normal puts it,
+    /// so on glossy materials a deviating normal costs more, by up to the weight's share of a
+    /// fixed gain, and the reduction spends its error budget on matte surfaces first. Fast
+    /// mode only for now.
+    #[serde(default)]
+    pub material_gloss: Vec<f32>,
 }
 
 fn default_part_protection() -> f32 {
@@ -191,6 +207,8 @@ impl Default for SimplifyOptions {
             remove_parts: true,
             transparent_materials: Vec::new(),
             part_protection: default_part_protection(),
+            gutter_tolerance: 0.0,
+            material_gloss: Vec::new(),
             silhouette_weight: 0.5,
             quality: Quality::Best,
         }
@@ -607,6 +625,10 @@ struct State<'a> {
     strict: bool,
     /// Set once collapses stall: vertices with many wedges become collapse sources too.
     relaxed: bool,
+    /// Furthest (texture units) a UV island boundary may drift outward at this point of the
+    /// reduction: [`DRIFT_UV`], or more once collapses have accepted larger errors (see
+    /// [`SimplifyOptions::gutter_tolerance`]).
+    drift_cap: f64,
     /// Per-thread scratch buffers (marker array sized for this mesh), so `State` can be shared
     /// by parallel evaluations.
     scratch: thread_local::ThreadLocal<RefCell<Scratch>>,
@@ -1134,6 +1156,7 @@ impl<'a> State<'a> {
             dirty: vec![false; np],
             strict: opts.seams == SeamMode::Strict,
             relaxed: false,
+            drift_cap: DRIFT_UV,
             scratch: thread_local::ThreadLocal::new(),
             alpha: opts.error_normalization.clamp(0.0, 1.0) as f64,
         }
@@ -1304,6 +1327,7 @@ impl<'a> State<'a> {
         if shared == 0 {
             return None;
         }
+        let partnered = out.len();
         let mut tear = 0.0;
         let mut mh = None;
         // Candidates for p's unpartnered wedges: every wedge of q, not only those in the
@@ -1341,7 +1365,17 @@ impl<'a> State<'a> {
             let mut best: Option<(f64, u32, f64)> = Some((en + eo, pw, 0.0));
             for &qw in &q_wedges {
                 let (en, eo, w) = self.attr_eval_m(pw, &m, &h, qw);
-                let t = self.tear_error(pw, qw, eo, w);
+                // No tear if qw is on pw's UV island: pw has the UVs of a wedge of p that
+                // merges into a wedge with qw's UVs through a triangle p and q share (the
+                // wedges differ by normal only).
+                let linked = out[..partnered]
+                    .iter()
+                    .any(|&(a, b)| self.same_uv(pw, a) && self.same_uv(qw, b));
+                let t = if linked {
+                    0.0
+                } else {
+                    self.tear_error(pw, qw, eo, w)
+                };
                 let e = en + eo + t;
                 if best.is_none_or(|b| e < b.0) {
                     best = Some((e, qw, t));
@@ -1378,6 +1412,27 @@ impl<'a> State<'a> {
             return 0.0;
         }
         (w * a.uv_weight * TEAR_UV * TEAR_UV - eo).max(0.0)
+    }
+
+    /// Lets UV island boundaries drift by [`SimplifyOptions::gutter_tolerance`] times the UV
+    /// error a collapse of cost `cost` accepts (never less than [`DRIFT_UV`]).
+    fn widen_drift(&mut self, cost: f64) {
+        let share = self.opts.gutter_tolerance as f64;
+        if share > 0.0 && self.attrs.uv_weight > 0.0 && cost.is_finite() {
+            self.drift_cap = self
+                .drift_cap
+                .max(share * cost / self.attrs.uv_weight.sqrt());
+        }
+    }
+
+    /// Whether wedges `a` and `b` have the same UVs in every UV set.
+    #[inline]
+    fn same_uv(&self, a: u32, b: u32) -> bool {
+        a == b
+            || self.mesh.uvs.iter().all(|set| {
+                (set[a as usize] - set[b as usize]).length_squared() as f64
+                    <= TEAR_SAME_UV * TEAR_SAME_UV
+            })
     }
 
     /// Wedge mapping for collapsing p onto q into `out`: pairs (p's wedge, q's wedge it merges
@@ -1584,7 +1639,7 @@ impl<'a> State<'a> {
                 return Validity::Flip;
             }
         }
-        if !self.mesh.uvs.is_empty() {
+        if self.attrs.nuv > 0 {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
             let ok = match wedges {
                 Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift),
@@ -1774,7 +1829,7 @@ impl<'a> State<'a> {
                             reach = reach.max(gap(q2 + dir * t));
                         }
                     }
-                    if near + reach > DRIFT_UV {
+                    if near + reach > self.drift_cap {
                         return false;
                     }
                 }
@@ -2049,7 +2104,7 @@ impl<'a> State<'a> {
         self.p_corners(p, &mut corners);
         let ok = self.map_from_corners(&corners, q, &mut map).is_some();
         debug_assert!(ok);
-        if !self.mesh.uvs.is_empty() {
+        if self.attrs.nuv > 0 {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
             if ok {
                 self.uv_drift_with(&corners, q, &map, &mut drift);
@@ -2198,7 +2253,7 @@ impl<'a> State<'a> {
         let mut quadric = self.quadric[q as usize];
         quadric.add(&self.quadric[p as usize]);
         let mut drift = Vec::new();
-        if !self.mesh.uvs.is_empty() && ok {
+        if self.attrs.nuv > 0 && ok {
             self.uv_drift_with(&corners, q, &map, &mut drift);
         }
         self.scratch().borrow_mut().corners2 = corners;
@@ -2428,6 +2483,7 @@ fn run_loop(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 }
                 worst_geom2 = worst_geom2.max(geom);
                 alive_tris -= st.collapse(p, q);
+                st.widen_drift(cost);
                 collapses += 1;
                 heap.remove(p);
                 st.refresh(p, q, &mut heap);
@@ -2497,6 +2553,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
     let mut sub = 0u32;
     let mut ring = Vec::new();
     let (mut worst_geom2, mut collapses) = (0.0f64, 0usize);
+    let mut worst_cost = 0.0f64;
     let frac = batch_fraction();
     // Stall escalation: 1 = open the round to every candidate, 2 = re-rank everything, 3 = stop.
     let mut stall = 0u32;
@@ -2687,7 +2744,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 .collect();
             let (touched_ref, checked_ref, pre_ref) = (&touched, &checked_at, &pre);
             // (invalid, plan): no plan if the candidate is now invalid or dearer.
-            let plans: Vec<(bool, Option<(f64, CollapsePlan)>)> = winners
+            let plans: Vec<(bool, Option<((f64, f64), CollapsePlan)>)> = winners
                 .par_iter()
                 .with_min_len(4)
                 .map(|&li| {
@@ -2709,7 +2766,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     };
                     match eval {
                         Some((cost, geom)) if cost <= limit * 1.0001 + 1e-12 => {
-                            (false, Some((geom, shared.plan_collapse(p, q))))
+                            (false, Some(((geom, cost), shared.plan_collapse(p, q))))
                         }
                         e => (e.is_none(), None),
                     }
@@ -2723,7 +2780,8 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     newly_validated += 1;
                 }
                 match plan {
-                    Some((geom, plan)) => {
+                    Some(((geom, cost), plan)) => {
+                        worst_cost = worst_cost.max(cost);
                         let q = plan.q;
                         worst_geom2 = worst_geom2.max(geom);
                         alive_tris -= st.apply_collapse(&plan);
@@ -2836,6 +2894,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             };
             match eval {
                 Some((cost, geom)) if cost <= limit * 1.0001 + 1e-12 => {
+                    worst_cost = worst_cost.max(cost);
                     worst_geom2 = worst_geom2.max(geom);
                     alive_tris -= st.collapse(p, q);
                     collapses += 1;
@@ -2924,6 +2983,10 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         } else if executed > 0 {
             stall = 0;
         }
+        // From the next round on, UV island boundaries may drift by a share of the error the
+        // collapses so far accepted (the cap changes between rounds only, so every evaluation
+        // of a round sees the same one, on any number of threads).
+        st.widen_drift(worst_cost);
         // Re-rank changed positions in parallel (deterministic: applied in list order).
         full_list.sort_unstable();
         let ranked: Vec<(u32, Option<Candidate>)> = {
@@ -3822,6 +3885,46 @@ pub(crate) mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn normal_seams_stay_on_their_uv_island() {
+        // A wavy sheet with one UV chart and flat shading: every vertex is split by normals
+        // only. A wedge with no partner across the collapsed edge still belongs to the chart,
+        // so it must merge into the target's wedge there, not slide along with its own UVs
+        // (which put a UV seam through the chart and, piled up, stalled the reduction).
+        let wave = |p: Vec3| Vec3::new(p.x, (p.x * 0.7).sin() + (p.z * 0.5).cos(), p.z);
+        let chart = |p: Vec3| Vec2::new(p.x / 16.0, p.z / 16.0);
+        let g = grid(16);
+        let (mut pos, mut uv, mut nrm) = (Vec::new(), Vec::new(), Vec::new());
+        for t in 0..g.triangle_count() {
+            let tri = g.triangle_positions(t).map(wave);
+            let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize();
+            for p in tri {
+                pos.push(p);
+                uv.push(chart(p));
+                nrm.push(n);
+            }
+        }
+        let idx = (0..pos.len() as u32).collect();
+        let mut m = Mesh::new(pos, idx);
+        m.uvs = vec![uv];
+        m.normals = Some(nrm);
+        for target in [256, 64] {
+            let r = simplify(
+                &m,
+                &SimplifyOptions {
+                    target_triangles: Some(target),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(r.mesh.triangle_count() <= target);
+            for (v, p) in r.mesh.positions.iter().enumerate() {
+                let d = (r.mesh.uvs[0][v] - chart(*p)).length();
+                assert!(d < 1e-5, "target {target}: vertex {v} is {d} off its chart");
             }
         }
     }
