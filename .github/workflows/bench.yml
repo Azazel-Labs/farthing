@@ -18,6 +18,9 @@ on:
       os:
         description: Runner
         default: ubuntu-26.04
+      time_env:
+        description: "Environment for the timed runs, such as 'RT_TARGET=20000'"
+        default: ""
       perf:
         description: "Profile instead of timing: bench-compare arguments, such as 'realtime assets/CarConcept.glb'"
         default: ""
@@ -71,7 +74,7 @@ jobs:
         run: |
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           py=python3; [ "$RUNNER_OS" = Windows ] && py=python
-          $py head/scripts/bench-realtime.py assets "${{ inputs.rounds }}" \
+          env ${{ inputs.time_env }} $py head/scripts/bench-realtime.py assets "${{ inputs.rounds }}" \
             base=base/bench-compare/target/release/bench-compare$ext \
             head=head/bench-compare/target/release/bench-compare$ext | tee -a "$GITHUB_STEP_SUMMARY"
 
