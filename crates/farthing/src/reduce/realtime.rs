@@ -59,6 +59,9 @@ const COLOR_SCALE: f32 = 1e-3;
 /// its shortest edge.
 const RELAX_RIDGE: f64 = 1e-3;
 const RELAX_REACH: f32 = 0.25;
+/// Bit of a sort key where the 30-bit Morton code starts; below it, a position hash and
+/// the vertex index share the rest.
+const CODE_SHIFT: u32 = 34;
 /// Weight of the distance to a cluster's centroid in choosing its representative: enough to
 /// settle ties (flat regions, where every member's error is zero, and would otherwise all pick
 /// their cells' low corners and fold), too little to override real error.
@@ -122,16 +125,16 @@ fn spread(x: u32) -> u32 {
     x
 }
 
-/// Sorts `code << 32 | index` keys by their 30-bit code, then position, then index, in
+/// Sorts keys (code above `CODE_SHIFT`, tie-breaking bits below) in
 /// parallel: blocks count their top digits and write their keys straight to place (relaxed
 /// atomic stores, plain stores on common targets), then each bucket is sorted on its own.
 /// The order is the same however it is split.
-fn sort_by_code(keys: Vec<u64>, pos: &[Vec3]) -> Vec<u64> {
+fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
     // One scatter by the top 10 bits of the code, then each bucket (a few hundred keys,
     // in cache) sorted on its own. Keys are distinct, so the order is the full sort's.
     let n = keys.len();
     let blk = (n / (4 * rayon::current_num_threads())).max(PAR_MIN);
-    let digit = |k: u64| (k >> (32 + 3 * DEPTH - 10)) as usize & 1023;
+    let digit = |k: u64| (k >> (CODE_SHIFT + 3 * DEPTH - 10)) as usize & 1023;
     let mut hist: Vec<[u32; 1024]> = keys
         .par_chunks(blk)
         .map(|b| {
@@ -178,25 +181,10 @@ fn sort_by_code(keys: Vec<u64>, pos: &[Vec3]) -> Vec<u64> {
         }
         rest = r;
     }
-    buckets.into_par_iter().with_min_len(8).for_each(|b| {
-        b.sort_unstable();
-        // Within one code, by position: vertices at one position end up neighbors.
-        let at = |k: u64| {
-            let p = pos[k as u32 as usize] + Vec3::ZERO;
-            [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
-        };
-        let mut s = 0;
-        while s < b.len() {
-            let mut e = s + 1;
-            while e < b.len() && b[e] >> 32 == b[s] >> 32 {
-                e += 1;
-            }
-            if e - s > 2 {
-                b[s..e].sort_unstable_by_key(|&k| (at(k), k));
-            }
-            s = e;
-        }
-    });
+    buckets
+        .into_par_iter()
+        .with_min_len(8)
+        .for_each(|b| b.sort_unstable());
     out
 }
 
@@ -482,7 +470,9 @@ pub(crate) fn simplify_realtime(
     let center = (bounds.min + bounds.max) * 0.5;
     let ext = (bounds.max - bounds.min).max_element().max(1e-12);
 
-    // Morton order: `code << 32 | vertex`, sorted.
+    // Morton order: keys of code, position hash and vertex, sorted.
+    let index_bits = (usize::BITS - nv.saturating_sub(1).leading_zeros()).max(1);
+    let hash_bits = CODE_SHIFT - index_bits;
     let cell = (1u32 << DEPTH) as f32 / ext;
     let top = ((1u32 << DEPTH) - 1) as f32;
     let keys: Vec<u64> = (0..nv)
@@ -491,12 +481,18 @@ pub(crate) fn simplify_realtime(
         .map(|v| {
             let g = ((mesh.positions[v] - bounds.min) * cell).clamp(Vec3::ZERO, Vec3::splat(top));
             let c = (spread(g.x as u32) << 2) | (spread(g.y as u32) << 1) | spread(g.z as u32);
-            ((c as u64) << 32) | v as u64
+            // A hash of the exact position between code and index: vertices at one position
+            // sort next to each other (with the odd stranger whose hash collides).
+            let q = mesh.positions[v] + Vec3::ZERO;
+            let h = (q.x.to_bits() ^ q.y.to_bits().rotate_left(11) ^ q.z.to_bits().rotate_left(22))
+                .wrapping_mul(0x9E37_79B1);
+            let h = (h as u64 >> 1) >> (31 - hash_bits);
+            ((c as u64) << CODE_SHIFT) | (h << index_bits) | v as u64
         })
         .collect();
-    let keys = sort_by_code(keys, &mesh.positions);
-    let code = |r: usize| (keys[r] >> 32) as u32;
-    let vert = |r: usize| keys[r] as u32;
+    let keys = sort_by_code(keys);
+    let code = |r: usize| (keys[r] >> CODE_SHIFT) as u32;
+    let vert = |r: usize| (keys[r] & ((1 << index_bits) - 1)) as u32;
 
     // From here on vertices are Morton ranks: positions (unit-diagonal frame, centered) are
     // gathered once, triangle corners map through `rank`, and every per-vertex pass after
@@ -595,15 +591,29 @@ pub(crate) fn simplify_realtime(
     // of a double-sided sheet is there too, facing the other way, and doesn't count.)
     const NONE: [u32; 2] = [u32::MAX; 2];
     let bw = opts.border_weight;
-    let ends: Vec<[u32; 2]> = if bw > 0.0 {
+    // Each vertex's position, as the first rank at it; end edges are then compared by these
+    // alone, reading only a vertex's rank neighbors.
+    let first_at: Vec<u32> = if bw > 0.0 {
         (0..nv)
             .into_par_iter()
             .with_min_len(PAR_MIN)
-            .map(|r| fan_ends(r, &vs[r], nv).map_or(NONE, |e| e.map(|x| x as u32)))
+            .map(|r| {
+                let mut q = r;
+                while q > 0 && spos[q - 1] == spos[r] {
+                    q -= 1;
+                }
+                q as u32
+            })
             .collect()
     } else {
         Vec::new()
     };
+    let ends: Vec<[u32; 2]> = (0..first_at.len())
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|r| fan_ends(r, &vs[r], nv).map_or(NONE, |e| e.map(|x| first_at[x])))
+        .collect();
+    drop(first_at);
     let borders: Vec<[u32; 2]> = (0..ends.len())
         .into_par_iter()
         .with_min_len(PAR_MIN)
@@ -623,11 +633,7 @@ pub(crate) fn simplify_realtime(
                     return;
                 }
                 for o in &mut mine {
-                    if *o != u32::MAX
-                        && ends[q]
-                            .iter()
-                            .any(|&x| spos[x as usize] == spos[*o as usize])
-                    {
+                    if ends[q].contains(o) {
                         *o = u32::MAX;
                     }
                 }
