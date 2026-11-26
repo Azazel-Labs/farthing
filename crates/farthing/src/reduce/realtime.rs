@@ -62,6 +62,11 @@ const RELAX_REACH: f32 = 0.25;
 /// Bit of a sort key where the 30-bit Morton code starts; below it, a position hash and
 /// the vertex index share the rest.
 const CODE_SHIFT: u32 = 34;
+/// The tail's rounds: a round takes one in `ROUND_SHARE` of the collapses still to do, at most
+/// `ROUND_MAX`, and is worked out in parallel from `ROUND_PAR` entries up.
+const ROUND_SHARE: usize = 8;
+const ROUND_MAX: usize = 2048;
+const ROUND_PAR: usize = 64;
 /// Weight of the distance to a cluster's centroid in choosing its representative: enough to
 /// settle ties (flat regions, where every member's error is zero, and would otherwise all pick
 /// their cells' low corners and fold), too little to override real error.
@@ -1672,27 +1677,26 @@ impl Tail {
     }
 
     fn link_ok(&self, loc: &[Corner], p: u32, q: u32, s: &mut Scratch) -> bool {
-        s.epoch += 1;
-        let e1 = s.epoch;
+        // Neighborhoods are a handful of clusters: small lists beat marks over all of them.
+        s.ring.clear();
         let mut shared = 0;
         for k in loc {
             shared += k.c.contains(&q) as usize;
             for &x in &k.c {
-                s.mark[x as usize] = e1;
-            }
-        }
-        s.epoch += 1;
-        let e2 = s.epoch;
-        let mut common = 0;
-        for t in self.live(q) {
-            for &x in &self.tc[t] {
-                if x != p && x != q && s.mark[x as usize] == e1 {
-                    s.mark[x as usize] = e2;
-                    common += 1;
+                if x != p && x != q && !s.ring.contains(&x) {
+                    s.ring.push(x);
                 }
             }
         }
-        common <= shared
+        s.seen.clear();
+        for t in self.live(q) {
+            for &x in &self.tc[t] {
+                if x != p && x != q && s.ring.contains(&x) && !s.seen.contains(&x) {
+                    s.seen.push(x);
+                }
+            }
+        }
+        s.seen.len() <= shared
     }
 
     fn no_flip(&self, loc: &[Corner], q: u32, min_dot: f32) -> bool {
@@ -1724,12 +1728,10 @@ impl Tail {
         if self.locked[p as usize] {
             return None;
         }
-        s.epoch += 1;
         s.nbr.clear();
         for k in &s.loc {
             for &x in &k.c {
-                if x != p && s.mark[x as usize] != s.epoch {
-                    s.mark[x as usize] = s.epoch;
+                if x != p && !s.nbr.contains(&x) {
                     s.nbr.push(x);
                 }
             }
@@ -1873,13 +1875,12 @@ impl Tail {
         let mut wremap: Vec<u32> = (0..nw as u32).collect();
         let mut cremap: Vec<u32> = (0..nc as u32).collect();
         let mut alive_tris = self.alive.len();
-        let mut s = Scratch::new(nc);
+        let mut s = Scratch::default();
         // Lazy greedy: each live cluster has at most one heap entry, whose cost is checked
         // again when it surfaces (collapses mostly raise neighbors' costs). Clusters with no
         // allowed collapse wait out of the heap until a collapse changes their neighborhood.
         let mut queued = vec![false; nc];
         let mut gone = vec![false; nc];
-        let mut map = Vec::new();
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(nc);
         // First costs exact, in parallel (they only read the state), so a cluster's first
         // turn at the top mostly holds.
@@ -1890,13 +1891,10 @@ impl Tail {
         let mut cache: Vec<Option<(f32, u32, f32)>> = (0..nc as u32)
             .into_par_iter()
             .with_min_len(64)
-            .map_init(
-                || Scratch::new(nc),
-                |s, p| {
-                    self.gather(p, &mut s.loc);
-                    self.best(p, max_err2, true, s)
-                },
-            )
+            .map_init(Scratch::default, |s, p| {
+                self.gather(p, &mut s.loc);
+                self.best(p, max_err2, true, s)
+            })
             .collect();
         let mut cache_at = vec![0u32; nc];
         let mut dirty = vec![0u32; nc];
@@ -1910,83 +1908,192 @@ impl Tail {
         let mut worst2 = 0f32;
         let mut collapses = 0;
         let mut touched: Vec<u32> = Vec::new();
-        while let Some(Reverse((c0, p))) = heap.pop() {
+        let mut batch: Vec<(u32, u32)> = Vec::new();
+        let batch_cap: usize = std::env::var("RT_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // Rounds: the cheapest entries are popped together and their turns worked out in
+        // parallel against the state as it stands; then they are taken in cost order, and a
+        // turn stands unless an earlier collapse of the round changed what it read. The round
+        // shrinks with the collapses left to do, so the last ones go one by one in exact
+        // greedy order. Its size depends on counts alone, so the result is the same for any
+        // thread count.
+        'rounds: loop {
             if target.is_some_and(|t| alive_tris <= t) {
                 break;
             }
-            let pu = p as usize;
-            queued[pu] = false;
-            if gone[pu] {
-                continue;
-            }
-            let fresh = cache_at[pu] < dirty[pu];
-            if fresh {
-                self.gather(p, &mut s.loc);
-                cache[pu] = self.best(p, max_err2, true, &mut s);
-                cache_at[pu] = done;
-            }
-            let Some((c, q, g2)) = cache[pu] else {
-                continue;
+            let left = match target {
+                Some(t) => (alive_tris - t) / 2 + 1,
+                None => heap.len(),
             };
-            if c.to_bits() > c0 && heap.peek().is_some_and(|Reverse((n, _))| c.to_bits() > *n) {
-                queued[pu] = true;
-                heap.push(Reverse((c.to_bits(), p)));
-                continue;
-            }
-            if !fresh {
-                self.gather(p, &mut s.loc);
-            }
-            let loc = std::mem::take(&mut s.loc);
-            let ok = self.link_ok(&loc, p, q, &mut s)
-                && self.no_flip(&loc, q, min_dot)
-                && self.wedge_map(&loc, q, &mut map).is_some();
-            s.loc = loc;
-            if !ok {
-                continue;
-            }
-            for &(pw, qw) in &map {
-                wremap[pw as usize] = qw;
-            }
-            // What changes: every cluster on p's triangles (their triangles do), every one on
-            // q's after (q's quadric does), and p's other constraint neighbor (its side does).
-            done += 1;
-            for k in &s.loc {
-                for &x in &k.c {
-                    dirty[x as usize] = done;
+            let size = if batch_cap > 0 {
+                batch_cap
+            } else {
+                (left / ROUND_SHARE).clamp(1, ROUND_MAX)
+            };
+            batch.clear();
+            while batch.len() < size
+                && let Some(Reverse((key, p))) = heap.pop()
+            {
+                queued[p as usize] = false;
+                if !gone[p as usize] {
+                    batch.push((key, p));
                 }
             }
-            for &x in &self.side[pu] {
-                if x != u32::MAX {
-                    dirty[x as usize] = done;
-                }
+            if batch.is_empty() {
+                break;
             }
-            alive_tris -= self.collapse(p, q, &map);
-            gone[p as usize] = true;
-            cremap[p as usize] = q;
-            worst2 = worst2.max(g2);
-            collapses += 1;
-            // Waiting clusters around q may have an allowed collapse now.
-            s.epoch += 1;
-            touched.clear();
-            s.mark[q as usize] = s.epoch;
-            touched.push(q);
-            for t in self.live(q) {
-                for &x in &self.tc[t] {
-                    if s.mark[x as usize] != s.epoch {
-                        s.mark[x as usize] = s.epoch;
-                        touched.push(x);
+            let stamp = done;
+            let this = &*self;
+            let (cache_r, cache_at_r, dirty_r) = (&cache, &cache_at, &dirty);
+            let work = |s: &mut Scratch, &(key, p): &(u32, u32)| {
+                let pu = p as usize;
+                this.gather(p, &mut s.loc);
+                let best = if cache_at_r[pu] < dirty_r[pu] {
+                    this.best(p, max_err2, true, s)
+                } else {
+                    cache_r[pu]
+                };
+                let mut turn = Turn {
+                    key,
+                    p,
+                    best,
+                    ok: false,
+                    map: [(0, 0); 8],
+                    nmap: 0,
+                };
+                if let Some((_, q, _)) = best {
+                    let loc = std::mem::take(&mut s.loc);
+                    let mut map = std::mem::take(&mut s.map);
+                    turn.ok = this.link_ok(&loc, p, q, s)
+                        && this.no_flip(&loc, q, min_dot)
+                        && this.wedge_map(&loc, q, &mut map).is_some();
+                    if turn.ok {
+                        turn.nmap = map.len() as u8;
+                        turn.map[..map.len()].copy_from_slice(&map);
                     }
+                    s.loc = loc;
+                    s.map = map;
                 }
+                turn
+            };
+            let mut turns: Vec<Turn> = if batch.len() >= ROUND_PAR {
+                batch
+                    .par_iter()
+                    .with_min_len(16)
+                    .map_init(Scratch::default, work)
+                    .collect()
+            } else {
+                batch.iter().map(|e| work(&mut s, e)).collect()
+            };
+            for t in &turns {
+                cache[t.p as usize] = t.best;
+                cache_at[t.p as usize] = stamp;
             }
-            for &r in &touched {
-                dirty[r as usize] = done;
-                if queued[r as usize] {
+            turns.sort_unstable_by_key(|t| (t.best.map_or(u32::MAX, |b| b.0.to_bits()), t.p));
+            for (i, turn) in turns.iter().enumerate() {
+                if target.is_some_and(|t| alive_tris <= t) {
+                    // Done: the rest go back unspent.
+                    for t in &turns[i..] {
+                        if !queued[t.p as usize] {
+                            queued[t.p as usize] = true;
+                            heap.push(Reverse((t.key, t.p)));
+                        }
+                    }
+                    break 'rounds;
+                }
+                let (p, pu) = (turn.p, turn.p as usize);
+                if dirty[pu] > stamp {
+                    // An earlier collapse of this round changed its neighborhood: back in
+                    // line, by a lower bound as for any touched cluster.
+                    if !queued[pu] && !gone[pu] {
+                        self.gather(p, &mut s.loc);
+                        if let Some((c, _, _)) = self.best(p, max_err2, false, &mut s) {
+                            queued[pu] = true;
+                            heap.push(Reverse((c.to_bits(), p)));
+                        }
+                    }
                     continue;
                 }
-                self.gather(r, &mut s.loc);
-                if let Some((c, _, _)) = self.best(r, max_err2, false, &mut s) {
-                    queued[r as usize] = true;
-                    heap.push(Reverse((c.to_bits(), r)));
+                let Some((c, q, g2)) = turn.best else {
+                    continue;
+                };
+                if c.to_bits() > turn.key
+                    && heap.peek().is_some_and(|Reverse((n, _))| c.to_bits() > *n)
+                {
+                    queued[pu] = true;
+                    heap.push(Reverse((c.to_bits(), p)));
+                    continue;
+                }
+                self.gather(p, &mut s.loc);
+                let mut map = turn.map;
+                let mut nmap = turn.nmap as usize;
+                let mut ok = turn.ok;
+                if dirty[q as usize] > stamp {
+                    // The target changed since: its side of the checks again.
+                    let loc = std::mem::take(&mut s.loc);
+                    let mut m = std::mem::take(&mut s.map);
+                    ok = self.link_ok(&loc, p, q, &mut s)
+                        && self.no_flip(&loc, q, min_dot)
+                        && self.wedge_map(&loc, q, &mut m).is_some();
+                    if ok {
+                        nmap = m.len();
+                        map[..nmap].copy_from_slice(&m);
+                    }
+                    s.loc = loc;
+                    s.map = m;
+                }
+                if !ok {
+                    continue;
+                }
+                let map = &map[..nmap];
+                for &(pw, qw) in map {
+                    wremap[pw as usize] = qw;
+                }
+                // What changes: every cluster on p's triangles (their triangles do), every one
+                // on q's after (q's quadric does), and p's other constraint neighbor (its side
+                // does).
+                done += 1;
+                for k in &s.loc {
+                    for &x in &k.c {
+                        dirty[x as usize] = done;
+                    }
+                }
+                for &x in &self.side[pu] {
+                    if x != u32::MAX {
+                        dirty[x as usize] = done;
+                    }
+                }
+                alive_tris -= self.collapse(p, q, map);
+                gone[pu] = true;
+                cremap[pu] = q;
+                worst2 = worst2.max(g2);
+                collapses += 1;
+                // Waiting clusters around q may have an allowed collapse now.
+                touched.clear();
+                touched.push(q);
+                for t in self.live(q) {
+                    for &x in &self.tc[t] {
+                        if !touched.contains(&x) {
+                            touched.push(x);
+                        }
+                    }
+                }
+                for &r in &touched {
+                    dirty[r as usize] = done;
+                    if queued[r as usize] {
+                        continue;
+                    }
+                    // Members of this round still to come get their turn back there.
+                    if turns[i + 1..].iter().any(|t| t.p == r) {
+                        continue;
+                    }
+                    self.gather(r, &mut s.loc);
+                    if let Some((c, _, _)) = self.best(r, max_err2, false, &mut s) {
+                        queued[r as usize] = true;
+                        heap.push(Reverse((c.to_bits(), r)));
+                    }
                 }
             }
         }
@@ -2004,26 +2111,26 @@ struct Corner {
 }
 
 /// Per-thread working space for the tail's neighborhood queries.
+#[derive(Default)]
 struct Scratch {
-    mark: Vec<u32>,
-    epoch: u32,
     nbr: Vec<u32>,
+    ring: Vec<u32>,
+    seen: Vec<u32>,
     cand: Vec<(f32, u32, f32)>,
     map: Vec<(u32, u32)>,
     loc: Vec<Corner>,
 }
 
-impl Scratch {
-    fn new(n: usize) -> Scratch {
-        Scratch {
-            mark: vec![0; n],
-            epoch: 0,
-            nbr: Vec::new(),
-            cand: Vec::new(),
-            map: Vec::new(),
-            loc: Vec::new(),
-        }
-    }
+/// A popped cluster's turn, worked out against the state at the start of its round.
+#[derive(Clone, Copy)]
+struct Turn {
+    key: u32,
+    p: u32,
+    best: Option<(f32, u32, f32)>,
+    /// Whether the collapse passes its checks, and its wedge map.
+    ok: bool,
+    map: [(u32, u32); 8],
+    nmap: u8,
 }
 
 #[cfg(test)]
