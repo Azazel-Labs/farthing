@@ -122,10 +122,11 @@ fn spread(x: u32) -> u32 {
     x
 }
 
-/// Stable LSD radix sort of `code << 32 | index` keys by their 30-bit code, in parallel:
-/// blocks count their digits, then write their keys straight to place (relaxed atomic
-/// stores, plain stores on common targets). The order is the same however it is split.
-fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
+/// Sorts `code << 32 | index` keys by their 30-bit code, then position, then index, in
+/// parallel: blocks count their top digits and write their keys straight to place (relaxed
+/// atomic stores, plain stores on common targets), then each bucket is sorted on its own.
+/// The order is the same however it is split.
+fn sort_by_code(keys: Vec<u64>, pos: &[Vec3]) -> Vec<u64> {
     // One scatter by the top 10 bits of the code, then each bucket (a few hundred keys,
     // in cache) sorted on its own. Keys are distinct, so the order is the full sort's.
     let n = keys.len();
@@ -177,10 +178,25 @@ fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
         }
         rest = r;
     }
-    buckets
-        .into_par_iter()
-        .with_min_len(8)
-        .for_each(|b| b.sort_unstable());
+    buckets.into_par_iter().with_min_len(8).for_each(|b| {
+        b.sort_unstable();
+        // Within one code, by position: vertices at one position end up neighbors.
+        let at = |k: u64| {
+            let p = pos[k as u32 as usize] + Vec3::ZERO;
+            [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]
+        };
+        let mut s = 0;
+        while s < b.len() {
+            let mut e = s + 1;
+            while e < b.len() && b[e] >> 32 == b[s] >> 32 {
+                e += 1;
+            }
+            if e - s > 2 {
+                b[s..e].sort_unstable_by_key(|&k| (at(k), k));
+            }
+            s = e;
+        }
+    });
     out
 }
 
@@ -478,7 +494,7 @@ pub(crate) fn simplify_realtime(
             ((c as u64) << 32) | v as u64
         })
         .collect();
-    let keys = sort_by_code(keys);
+    let keys = sort_by_code(keys, &mesh.positions);
     let code = |r: usize| (keys[r] >> 32) as u32;
     let vert = |r: usize| keys[r] as u32;
 
@@ -575,7 +591,7 @@ pub(crate) fn simplify_realtime(
     // the surface stops there. Where another vertex at the same position, facing the same
     // way, has an end edge to the same place, the two fans meet along it: a seam (split UVs or
     // normals) or unwelded faces, where border planes would pin vertices for no reason.
-    // Vertices at one position share a Morton code, so they are neighbors in rank. (The back
+    // Vertices at one position are neighbors in rank (see `sort_by_code`). (The back
     // of a double-sided sheet is there too, facing the other way, and doesn't count.)
     const NONE: [u32; 2] = [u32::MAX; 2];
     let bw = opts.border_weight;
@@ -596,10 +612,10 @@ pub(crate) fn simplify_realtime(
             if mine == NONE {
                 return NONE;
             }
-            let (c, p) = (code(r), spos[r]);
+            let p = spos[r];
             let n = Vec3::from_array(vs[r].n);
             let mut meet = |q: usize| {
-                if ends[q] == NONE || spos[q] != p {
+                if ends[q] == NONE {
                     return;
                 }
                 let m = Vec3::from_array(vs[q].n);
@@ -617,12 +633,12 @@ pub(crate) fn simplify_realtime(
                 }
             };
             let mut q = r;
-            while q > 0 && code(q - 1) == c {
+            while q > 0 && spos[q - 1] == p {
                 q -= 1;
                 meet(q);
             }
             let mut q = r + 1;
-            while q < nv && code(q) == c {
+            while q < nv && spos[q] == p {
                 meet(q);
                 q += 1;
             }
