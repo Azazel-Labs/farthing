@@ -238,14 +238,8 @@ fn fan_ends(v: usize, s: &VSum, nv: usize) -> Option<[usize; 2]> {
 /// moment M = Σ Aᵢ nᵢnᵢᵀ has trace A, and with mean normal length |Σ Aᵢnᵢ| = A·cos θ for a
 /// cone of normals, M ≈ (A cos²θ) uuᵀ + (A sin²θ / 2)(I − uuᵀ). Flat fans give their exact
 /// plane; curved ones also resist tangential motion, as their faces would. Open fans add the
-/// border planes, except along an end edge where `meets` says another fan carries on.
-fn vertex_quadric(
-    v: usize,
-    s: &VSum,
-    upos: &[Vec3],
-    bw: f32,
-    meets: impl Fn(usize) -> bool,
-) -> [f32; 10] {
+/// border planes of `borders`, its end edges that are borders (`u32::MAX`: not one).
+fn vertex_quadric(v: usize, s: &VSum, upos: &[Vec3], bw: f32, borders: [u32; 2]) -> [f32; 10] {
     // In terms of n = Σ Aᵢnᵢ itself (u = n / |n|), so one reciprocal serves every term.
     let n = Vec3::from_array(s.n);
     let (a, n2) = (s.area, n.length_squared());
@@ -271,17 +265,15 @@ fn vertex_quadric(
         -mp.z,
         p.dot(mp),
     ];
-    if bw > 0.0
-        && let Some(ends) = fan_ends(v, s, upos.len())
-    {
+    if bw > 0.0 && borders != [u32::MAX; 2] {
         // Planes through the border edges, perpendicular to the surface, weighted by
         // |e × u|² = |e|² sin²θ: the edge length squared for edges in the tangent plane.
         let w = bw * inv_n2;
-        for o in ends {
-            if meets(o) {
+        for o in borders {
+            if o == u32::MAX {
                 continue;
             }
-            let m = (upos[o] - p).cross(n);
+            let m = (upos[o as usize] - p).cross(n);
             let b = plane(m, -m.dot(p), w);
             for i in 0..10 {
                 q[i] += b[i];
@@ -579,41 +571,74 @@ pub(crate) fn simplify_realtime(
         return Ok(unchanged(mesh));
     }
     let avg_area = (total_area / live as f64).max(1e-30);
+    // Border edges, worked out once per vertex: an open fan's end edge is a border only if
+    // the surface stops there. Where another vertex at the same position, facing the same
+    // way, has an end edge to the same place, the two fans meet along it: a seam (split UVs or
+    // normals) or unwelded faces, where border planes would pin vertices for no reason.
+    // Vertices at one position share a Morton code, so they are neighbors in rank. (The back
+    // of a double-sided sheet is there too, facing the other way, and doesn't count.)
+    const NONE: [u32; 2] = [u32::MAX; 2];
     let bw = opts.border_weight;
-    // An open fan's end edge is a border only if the surface stops there. Where another
-    // vertex at the same position, facing the same way, has an end edge to the same place,
-    // the two fans meet along it: a seam (split UVs or normals) or unwelded faces, where
-    // border planes would pin vertices for no reason. Vertices at one position share a Morton
-    // code, so they are neighbors in rank. (The back of a double-sided sheet is there too,
-    // facing the other way, and doesn't count.)
-    let meets = |r: usize, o: usize| {
-        let (c, p, to) = (code(r), spos[r], spos[o]);
-        let n = Vec3::from_array(vs[r].n);
-        let hit = |q: usize| {
-            if spos[q] != p {
-                return false;
-            }
-            let m = Vec3::from_array(vs[q].n);
-            n.dot(m) > -0.9 * (n.length_squared() * m.length_squared()).sqrt()
-                && fan_ends(q, &vs[q], nv).is_some_and(|e| e.iter().any(|&x| spos[x] == to))
-        };
-        let mut q = r;
-        while q > 0 && code(q - 1) == c {
-            q -= 1;
-            if hit(q) {
-                return true;
-            }
-        }
-        let mut q = r + 1;
-        while q < nv && code(q) == c {
-            if hit(q) {
-                return true;
-            }
-            q += 1;
-        }
-        false
+    let ends: Vec<[u32; 2]> = if bw > 0.0 {
+        (0..nv)
+            .into_par_iter()
+            .with_min_len(PAR_MIN)
+            .map(|r| fan_ends(r, &vs[r], nv).map_or(NONE, |e| e.map(|x| x as u32)))
+            .collect()
+    } else {
+        Vec::new()
     };
-    let vq = |r: usize| vertex_quadric(r, &vs[r], &spos, bw, |o| meets(r, o));
+    let borders: Vec<[u32; 2]> = (0..ends.len())
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|r| {
+            let mut mine = ends[r];
+            if mine == NONE {
+                return NONE;
+            }
+            let (c, p) = (code(r), spos[r]);
+            let n = Vec3::from_array(vs[r].n);
+            let mut meet = |q: usize| {
+                if ends[q] == NONE || spos[q] != p {
+                    return;
+                }
+                let m = Vec3::from_array(vs[q].n);
+                if n.dot(m) <= -0.9 * (n.length_squared() * m.length_squared()).sqrt() {
+                    return;
+                }
+                for o in &mut mine {
+                    if *o != u32::MAX
+                        && ends[q]
+                            .iter()
+                            .any(|&x| spos[x as usize] == spos[*o as usize])
+                    {
+                        *o = u32::MAX;
+                    }
+                }
+            };
+            let mut q = r;
+            while q > 0 && code(q - 1) == c {
+                q -= 1;
+                meet(q);
+            }
+            let mut q = r + 1;
+            while q < nv && code(q) == c {
+                meet(q);
+                q += 1;
+            }
+            mine
+        })
+        .collect();
+    drop(ends);
+    let vq = |r: usize| {
+        vertex_quadric(
+            r,
+            &vs[r],
+            &spos,
+            bw,
+            borders.get(r).copied().unwrap_or(NONE),
+        )
+    };
     lap("faces");
 
     // Fine cells: the coarsest level with about FINE_PER_CLUSTER cells per wanted cluster,
@@ -2036,21 +2061,25 @@ mod tests {
 
     #[test]
     fn uv_seam_survives() {
+        // Clusters across the seam keep a wedge per side, so no triangle's UVs wrap around
+        // (a wrapped triangle would show the whole texture squeezed into it).
         let m = sphere();
         let r = simplify(&m, &opts(0.05)).unwrap();
         let (o, uv) = (&r.mesh, &r.mesh.uvs[0]);
-        let mut seam = 0;
-        for v in 0..o.vertex_count() {
-            if uv[v].x == 0.0 && o.positions[v].y.abs() < 0.999 {
-                seam += 1;
-                let p = o.positions[v];
-                assert!(
-                    (0..o.vertex_count()).any(|w| o.positions[w] == p && uv[w].x == 1.0),
-                    "seam vertex {v} at {p} lost its other side"
-                );
-            }
+        for t in o.indices.chunks(3) {
+            let u = [
+                uv[t[0] as usize].x,
+                uv[t[1] as usize].x,
+                uv[t[2] as usize].x,
+            ];
+            let span =
+                u.iter().fold(0f32, |a, &x| a.max(x)) - u.iter().fold(1f32, |a, &x| a.min(x));
+            assert!(span < 0.5, "triangle {t:?} wraps the seam: u = {u:?}");
         }
-        assert!(seam >= 4, "seam gone: {seam} vertices left on it");
+        let sides = (0..o.vertex_count())
+            .filter(|&v| (0..v).any(|w| o.positions[w] == o.positions[v] && uv[w] != uv[v]))
+            .count();
+        assert!(sides >= 4, "seam gone: {sides} split vertices left");
     }
 
     #[test]
