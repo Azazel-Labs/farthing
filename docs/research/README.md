@@ -13,6 +13,8 @@ cost, and whether graphics has already absorbed it.
 | [optimization_topology.md](optimization_topology.md) | Persistent homology, non-manifold link conditions, nesting, parallel greedy |
 | [hpc_architecture.md](hpc_architecture.md) | Profiled hotspots, deterministic reservations, branch-free kernels |
 
+Experiments that were dropped, and why, are logged in [DEADENDS.md](DEADENDS.md).
+
 ## Where several reports agree
 
 - **Seal leaks per pocket, not globally (W3, W7).** Two reports independently propose ranking

@@ -212,7 +212,24 @@ fn attribute_error(orig: &Mesh, red: &Mesh) -> (f32, f32, f32) {
 
 fn with_indices(m: &Mesh, idx: Vec<u32>) -> Mesh {
     let mut r = m.clone();
-    r.material_ids = vec![0; idx.len() / 3];
+    // The simplifier returns triangles over the input's vertices in its own order: each takes
+    // the material most of its corners had in the input (glTF primitives share no vertices, so
+    // the corners agree unless the mesh was welded across materials).
+    let mut vmat = vec![0u32; m.vertex_count()];
+    for (t, &mat) in m.material_ids.iter().enumerate() {
+        for &v in &m.indices[t * 3..t * 3 + 3] {
+            vmat[v as usize] = mat;
+        }
+    }
+    r.material_ids = idx
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| {
+            let [a, b, c] = c.map(|v| vmat[v as usize]);
+            if b == c { b } else { a }
+        })
+        .collect();
     r.indices = idx;
     r.compact();
     r
@@ -991,6 +1008,70 @@ fn export_mode(args: &[String]) {
     .unwrap();
 }
 
+/// `rtexport <asset> <triangles> <out_dir>`: the asset reduced to about `triangles` in all (each
+/// mesh by its share; a value up to 1 is a ratio of the input) with every reducer, each written as a GLB for the engine PoC's `score`.
+fn rtexport_mode(args: &[String]) {
+    let (path, amount, out) = (
+        &args[0],
+        args[1].parse::<f64>().unwrap(),
+        std::path::Path::new(&args[2]),
+    );
+    std::fs::create_dir_all(out).unwrap();
+    let (scene, _) = farthing::io::load_gltf(path).expect("load");
+    let name = std::path::Path::new(path)
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let input = scene.triangle_count();
+    let total = if amount <= 1.0 {
+        (input as f64 * amount).round() as usize
+    } else {
+        amount as usize
+    };
+    let tag = &args[1];
+    use farthing::reduce::Quality;
+    type Reduce = Box<dyn Fn(&Mesh, usize) -> Mesh>;
+    let lf = |quality: Quality| -> Reduce {
+        Box::new(move |m, target| {
+            let opts = SimplifyOptions {
+                quality,
+                ..lf_opts(target)
+            };
+            simplify(m, &opts).unwrap().mesh
+        })
+    };
+    let methods: Vec<(&str, Reduce)> = vec![
+        ("best", lf(Quality::Best)),
+        ("fast", lf(Quality::Fast)),
+        ("realtime", lf(Quality::Realtime)),
+        ("mo_sloppy", Box::new(meshopt_sloppy)),
+        ("mo_perm", Box::new(|m, t| meshopt_reduce(m, t, true, true))),
+    ];
+    for (label, f) in methods {
+        let mut lod = scene.clone();
+        let mut ms = 0.0;
+        for (i, m) in scene.meshes.iter().enumerate() {
+            let mut m = m.clone();
+            if m.normals.is_none() {
+                m.compute_normals(60.0);
+            }
+            let share = m.triangle_count() as f64 / input.max(1) as f64;
+            let target = ((total as f64 * share).round() as usize).max(4);
+            let t = Instant::now();
+            lod.meshes[i] = f(&m, target);
+            ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        let file = out.join(format!("{name}_{tag}_{label}.glb"));
+        farthing::io::save_glb(&lod, &file, &farthing::io::ExportTextures::default()).unwrap();
+        println!(
+            "{name} {tag} {label}: {} of {input} tris, {ms:.1} ms, {} meshes",
+            lod.triangle_count(),
+            scene.meshes.len()
+        );
+    }
+}
+
 fn lf_opts(target: usize) -> SimplifyOptions {
     let mut v = serde_json::to_value(SimplifyOptions::default()).unwrap();
     if let Ok(e) = std::env::var("LF_OPTS") {
@@ -1337,6 +1418,7 @@ fn main() {
         Some("exp") => exp_mode(&args[1..]),
         Some("parts") => parts_mode(&args[1..]),
         Some("export") => export_mode(&args[1..]),
+        Some("rtexport") => rtexport_mode(&args[1..]),
         Some("remesh") => remesh_mode(&args[1..]),
         Some("rmdiag") => rmdiag_mode(&args[1..]),
         Some("pack") => pack_bench::pack_mode(&args[1..]),

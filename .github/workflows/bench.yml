@@ -57,12 +57,13 @@ jobs:
       - name: Machine
         shell: bash
         run: |
-          { echo '```'; (lscpu 2>/dev/null | grep -E 'Model name|^CPU\(s\)|Thread|Core' || wmic cpu get name,numberofcores,numberoflogicalprocessors); echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; (lscpu 2>/dev/null | grep -E 'Model name|^CPU\(s\)|Thread|Core' || powershell -c "(Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List | Out-String).Trim()" || echo unknown); echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           echo "base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
       - name: Time
         shell: bash
         run: |
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
-          python3 head/scripts/bench-realtime.py assets "${{ inputs.rounds }}" \
+          py=python3; [ "$RUNNER_OS" = Windows ] && py=python
+          $py head/scripts/bench-realtime.py assets "${{ inputs.rounds }}" \
             base=base/bench-compare/target/release/bench-compare$ext \
             head=head/bench-compare/target/release/bench-compare$ext | tee -a "$GITHUB_STEP_SUMMARY"

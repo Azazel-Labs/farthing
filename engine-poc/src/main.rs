@@ -648,6 +648,17 @@ fn score_mode(args: &[String]) -> Result<()> {
             .collect()
     };
     let reference = render(&mut engine, &original);
+    // SCORE_PNG=<dir> keeps the renders: `reference_view<i>.png` and `<file stem>_view<i>.png`.
+    let png = std::env::var_os("SCORE_PNG").map(std::path::PathBuf::from);
+    let keep = |stem: &str, images: &[Image]| {
+        if let Some(dir) = &png {
+            let _ = std::fs::create_dir_all(dir);
+            for (i, r) in images.iter().enumerate() {
+                let _ = r.save_png(dir.join(format!("{stem}_view{i}.png")), true);
+            }
+        }
+    };
+    keep("reference", &reference);
     let mut rows = Vec::new();
     for path in &args[1..] {
         let (mut lod, _) = farthing::io::load_gltf(path)?;
@@ -658,6 +669,8 @@ fn score_mode(args: &[String]) -> Result<()> {
             }
         }
         let r = render(&mut engine, &lod);
+        let stem = std::path::Path::new(path).file_stem().unwrap_or_default();
+        keep(&stem.to_string_lossy(), &r);
         let d: Vec<ImageDiff> = r
             .iter()
             .zip(&reference)
