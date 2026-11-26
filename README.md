@@ -57,7 +57,9 @@ more carefully. That's meant for a build step, not for every frame. A fast mode 
 2× of meshoptimizer's speed and still has lower distance and UV error (normals are slightly
 worse). A realtime mode is for a frame budget: it reduces a 100k-triangle model to 3k in about
 15 ms, 20× faster than meshoptimizer's attribute-aware simplifier, and beats its sloppy
-simplifier on every error measure ([details](docs/BENCHMARKS.md#realtime-mode-v21)).
+simplifier on every error measure ([details](docs/BENCHMARKS.md#realtime-mode-v21)). On Windows, give a
+program that calls it often a caching allocator such as mimalloc: the system heap makes each
+call 27 to 30% slower ([measured](docs/BENCHMARKS.md#realtime-mode-and-the-allocator-v22)).
 
 ## Each level takes over *where the difference is a pixel.*
 

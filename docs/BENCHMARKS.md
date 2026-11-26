@@ -524,6 +524,26 @@ DragonAttenuation 9.0 → 9.6 ms across the three changes. Local timings on the 
 machine are not comparable with the v21 table (it was busy), so that table's times stand for
 v21.
 
+### Realtime mode and the allocator (v22)
+
+A realtime call allocates 15 to 22 MB in a few dozen large blocks and frees them when it
+returns. What that costs depends on the program's allocator. Same code, same runner, the
+`Bench` workflow with `bench-compare`'s `system-alloc` feature against its default (mimalloc),
+3,000-triangle target, 4 logical cores:
+
+| asset | Windows, mimalloc | Windows, system allocator | Linux, mimalloc | Linux, system allocator |
+|---|---|---|---|---|
+| ChronographWatch | 15.6 ms | 19.8 ms | 17.2 ms | 17.9 ms |
+| CarConcept | 20.6 ms | 26.7 ms | 24.2 ms | 24.6 ms |
+| DragonAttenuation | 16.2 ms | 21.1 ms | 18.0 ms | 18.8 ms |
+
+(The two machines differ, so only compare within one system.) On Windows the system heap hands
+each large block back to the system at once, and the next call takes page faults on fresh
+zeroed pages again: 27 to 30% slower, spread over every phase that fills a new array (the face
+pass goes from 2.7 to 4.1 ms on the watch). On Linux it is 2 to 4%. A program that calls the
+realtime reducer repeatedly on Windows should set a caching global allocator such as mimalloc;
+every time in this document is measured with it.
+
 ### Specular error (v22)
 
 A still under fixed light hides shading-normal error on glossy surfaces; a moving light or
