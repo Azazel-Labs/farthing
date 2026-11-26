@@ -1128,8 +1128,10 @@ pub(crate) fn simplify_realtime(
             // position among them all. Left apart, the wedge without a member at that position
             // would shift the texture by the distance to its own nearest. Normals stay each
             // wedge's own (its mean, set at output).
+            // (A class's root is its smallest wedge root, kept in `class` only for wedges
+            // that joined one; most chunks of a welded mesh never allocate it.)
             {
-                let mut class: Vec<u32> = (0..n as u32).collect();
+                let mut class: Vec<u32> = Vec::new();
                 fn find(c: &mut [u32], mut x: u32) -> u32 {
                     while c[x as usize] != x {
                         c[x as usize] = c[c[x as usize] as usize];
@@ -1142,10 +1144,19 @@ pub(crate) fn simplify_realtime(
                         && mesh.colors.as_ref().is_none_or(|c| c[a] == c[b])
                 };
                 for i in 1..n {
+                    if spos[r0 + i - 1] != spos[r0 + i] {
+                        continue;
+                    }
                     let mut k = i;
                     while k > 0 && spos[r0 + k - 1] == spos[r0 + i] {
                         k -= 1;
+                        if j.parent[i] == j.parent[k] {
+                            break;
+                        }
                         if same(vert(r0 + i) as usize, vert(r0 + k) as usize) {
+                            if class.is_empty() {
+                                class = (0..n as u32).collect();
+                            }
                             let (a, b) = (
                                 find(&mut class, j.parent[i] - base),
                                 find(&mut class, j.parent[k] - base),
@@ -1155,21 +1166,21 @@ pub(crate) fn simplify_realtime(
                         }
                     }
                 }
-                let mut cbest = vec![(f32::INFINITY, u32::MAX); n];
-                for i in 0..n {
-                    let root = (j.parent[i] - base) as usize;
-                    if root == i {
-                        let c = find(&mut class, root as u32) as usize;
-                        if j.wbest[root] < cbest[c] {
-                            cbest[c] = j.wbest[root];
+                if !class.is_empty() {
+                    // The nearest member of each class, gathered at its root, then handed
+                    // back to every wedge of the class.
+                    for i in 0..n {
+                        if class[i] != i as u32 {
+                            let c = find(&mut class, i as u32) as usize;
+                            if j.wbest[i] < j.wbest[c] {
+                                j.wbest[c] = j.wbest[i];
+                            }
                         }
                     }
-                }
-                for i in 0..n {
-                    let root = (j.parent[i] - base) as usize;
-                    if root == i {
-                        let c = find(&mut class, root as u32) as usize;
-                        j.wbest[root] = cbest[c];
+                    for i in 0..n {
+                        if class[i] != i as u32 {
+                            j.wbest[i] = j.wbest[class[i] as usize];
+                        }
                     }
                 }
             }
