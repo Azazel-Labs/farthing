@@ -30,6 +30,40 @@ pub struct GltfMaterial {
     pub normal_texture: Option<(Texture, u32, f32)>,
 }
 
+impl GltfMaterial {
+    /// How this material reflects at `uv` (first UV set; textures on another set are read as
+    /// their factors alone), for [`crate::metrics::specular_error`] and
+    /// [`crate::reduce::SimplifyOptions::material_gloss`].
+    pub fn gloss(&self, uv: glam::Vec2) -> crate::metrics::Gloss {
+        let (mut rough, mut metal) = (self.roughness_factor, self.metallic_factor);
+        if let Some((t, 0)) = &self.metallic_roughness_texture {
+            let s = t.sample_bilinear(uv, true);
+            rough *= s.y;
+            metal *= s.z;
+        }
+        let mut base = self.base_color_factor;
+        if let Some((t, 0)) = &self.base_color_texture {
+            base *= t.sample_bilinear(uv, true);
+        }
+        let luminance = 0.2126 * base.x + 0.7152 * base.y + 0.0722 * base.z;
+        crate::metrics::Gloss::from_metallic_roughness(rough, metal, luminance)
+    }
+
+    /// The material's mean highlight weight over its textures (a 16 × 16 grid of UVs), for
+    /// [`crate::reduce::SimplifyOptions::material_gloss`].
+    pub fn gloss_weight(&self) -> f32 {
+        const N: usize = 16;
+        let mut sum = 0.0;
+        for y in 0..N {
+            for x in 0..N {
+                let uv = glam::Vec2::new(x as f32 + 0.5, y as f32 + 0.5) / N as f32;
+                sum += self.gloss(uv).weight();
+            }
+        }
+        sum / (N * N) as f32
+    }
+}
+
 /// Loads a glTF / GLB file. Each glTF mesh becomes one [`Mesh`] (primitives merged, material
 /// ids = slot index); each node with a mesh becomes an [`Instance`] with its world transform.
 ///

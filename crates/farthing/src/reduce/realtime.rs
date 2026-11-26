@@ -47,7 +47,7 @@ const DEPTH: u32 = 10;
 /// Stage-one clusters per target triangle.
 const CLUSTERS_PER_TRI: f32 = 0.55;
 /// Weight of the normal-cone term (opposite sheets in one cell) against quadric error.
-const NORMAL_KAPPA: f64 = 0.5;
+const NORMAL_KAPPA: f64 = 0.125;
 /// Share of `max_error` stage one may use, leaving the tail room to collapse.
 const STAGE1_ERROR_SHARE: f32 = 0.5;
 /// Attribute term scales, as in the fast reducer (positions in the unit-diagonal frame).
@@ -658,14 +658,22 @@ pub(crate) fn simplify_realtime(
         })
         .collect();
     drop(ends);
+    // Importance scales a vertex's error, so clusters stay finer and collapse later there.
+    let importance = opts.vertex_importance.as_deref();
     let vq = |r: usize| {
-        vertex_quadric(
+        let mut q = vertex_quadric(
             r,
             &vs[r],
             &spos,
             bw,
             borders.get(r).copied().unwrap_or(NONE),
-        )
+        );
+        if let Some(w) = importance.and_then(|i| i.get(vert(r) as usize)) {
+            for x in &mut q {
+                *x *= w.max(0.0);
+            }
+        }
+        q
     };
     lap("faces");
 

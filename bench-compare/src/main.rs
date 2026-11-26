@@ -1024,7 +1024,7 @@ fn rtexport_mode(args: &[String]) {
         std::path::Path::new(&args[2]),
     );
     std::fs::create_dir_all(out).unwrap();
-    let (scene, _) = farthing::io::load_gltf(path).expect("load");
+    let (scene, materials) = farthing::io::load_gltf(path).expect("load");
     let name = std::path::Path::new(path)
         .file_stem()
         .unwrap()
@@ -1038,11 +1038,37 @@ fn rtexport_mode(args: &[String]) {
     };
     let tag = &args[1];
     use farthing::reduce::Quality;
-    type Reduce = Box<dyn Fn(&Mesh, usize) -> Mesh>;
+    type Reduce<'a> = Box<dyn Fn(&Mesh, usize) -> Mesh + 'a>;
+    // GLOSS_GAIN=<k>: vertex importance 1 + k x highlight weight of the vertex's material.
+    let gain: f32 = std::env::var("GLOSS_GAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let materials = &materials;
     let lf = |quality: Quality| -> Reduce {
         Box::new(move |m, target| {
+            let importance = (gain > 0.0).then(|| {
+                let mut w = vec![0f32; m.vertex_count()];
+                for (t, tri) in m.indices.chunks(3).enumerate() {
+                    let Some(mat) = materials.get(m.material_ids[t] as usize) else {
+                        continue;
+                    };
+                    for &v in tri {
+                        let uv = m.uvs.first().map_or(Vec2::ZERO, |u| u[v as usize]);
+                        w[v as usize] = w[v as usize].max(mat.gloss(uv).weight());
+                    }
+                }
+                w.iter().map(|g| 1.0 + gain * g).collect()
+            });
             let opts = SimplifyOptions {
                 quality,
+                vertex_importance: importance,
+                // GLOSS=1: tell the reducer how glossy each material is.
+                material_gloss: if std::env::var_os("GLOSS").is_some() {
+                    materials.iter().map(|m| m.gloss_weight()).collect()
+                } else {
+                    Vec::new()
+                },
                 ..lf_opts(target)
             };
             simplify(m, &opts).unwrap().mesh
@@ -1064,6 +1090,8 @@ fn rtexport_mode(args: &[String]) {
         }
         let mut lod = scene.clone();
         let mut ms = 0.0;
+        // Specular error over the scene: each mesh weighed by its area and highlight weight.
+        let mut spec = [0f64; 4];
         for (i, m) in scene.meshes.iter().enumerate() {
             let mut m = m.clone();
             if m.normals.is_none() {
@@ -1074,13 +1102,31 @@ fn rtexport_mode(args: &[String]) {
             let t = Instant::now();
             lod.meshes[i] = f(&m, target);
             ms += t.elapsed().as_secs_f64() * 1e3;
+            let e = farthing::metrics::specular_error(
+                &m,
+                &lod.meshes[i],
+                |mat, uv| {
+                    materials
+                        .get(mat as usize)
+                        .map_or(farthing::metrics::Gloss::MATTE, |g| g.gloss(uv))
+                },
+                20000,
+            );
+            let (a, w) = (e.area as f64, e.area as f64 * e.weight as f64);
+            spec[0] += a;
+            spec[1] += w;
+            spec[2] += w * e.misplaced as f64;
+            spec[3] += w * e.normal_degrees as f64;
         }
         let file = out.join(format!("{name}_{tag}_{label}.glb"));
         farthing::io::save_glb(&lod, &file, &farthing::io::ExportTextures::default()).unwrap();
         println!(
-            "{name} {tag} {label}: {} of {input} tris, {ms:.1} ms, {} meshes",
+            "{name} {tag} {label}: {} of {input} tris, {ms:.1} ms, {} meshes, spec weight {:.3} misplaced {:.3} degrees {:.2}",
             lod.triangle_count(),
-            scene.meshes.len()
+            scene.meshes.len(),
+            spec[1] / spec[0].max(1e-30),
+            spec[2] / spec[1].max(1e-30),
+            spec[3] / spec[1].max(1e-30)
         );
     }
 }

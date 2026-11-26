@@ -219,6 +219,188 @@ pub fn surface_distance(a: &Mesh, b: &Mesh, samples: usize) -> SurfaceDistance {
     summarize(fwd, bwd, a.bounds().diagonal().max(1e-12))
 }
 
+/// How a surface point reflects: what a specular highlight on it looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Gloss {
+    /// Perceptual roughness in 0..=1, as glTF stores it (the lobe's width is its square).
+    pub roughness: f32,
+    /// Reflectance at normal incidence in 0..=1: about 0.04 for non-metals, the base color
+    /// for metals.
+    pub reflectance: f32,
+}
+
+impl Gloss {
+    /// A matte surface: no highlight to misplace.
+    pub const MATTE: Gloss = Gloss {
+        roughness: 1.0,
+        reflectance: 0.0,
+    };
+
+    /// From glTF's metallic-roughness model; `base_luminance` is the base color's luminance.
+    pub fn from_metallic_roughness(roughness: f32, metallic: f32, base_luminance: f32) -> Gloss {
+        let m = metallic.clamp(0.0, 1.0);
+        Gloss {
+            roughness: roughness.clamp(0.0, 1.0),
+            reflectance: (0.04 * (1.0 - m) + base_luminance.clamp(0.0, 1.0) * m).clamp(0.0, 1.0),
+        }
+    }
+
+    /// How much a highlight here draws the eye, in 0..=1: √reflectance × (1 − roughness).
+    /// The root keeps polished non-metals in play (their highlights are dim in energy but
+    /// plain to see); a wide lobe has little contrast whatever its strength.
+    pub fn weight(&self) -> f32 {
+        self.reflectance.max(0.0).sqrt() * (1.0 - self.roughness).clamp(0.0, 1.0)
+    }
+
+    /// Share of the highlight that lands in the wrong place when the shading normal is off by
+    /// `angle` radians, in 0..=1: one minus the overlap of two lobes of this roughness that far
+    /// apart, 1 − exp(−angle² / 4α²) with α = roughness² (the normal distribution's width).
+    /// α is held above `MIN_LOBE`: below it, normal maps and pixel size blur the lobe anyway.
+    pub fn misplaced(&self, angle: f32) -> f32 {
+        let a = (self.roughness * self.roughness).max(MIN_LOBE);
+        1.0 - (-(angle * angle) / (4.0 * a * a)).exp()
+    }
+}
+
+/// Narrowest lobe [`Gloss::misplaced`] credits, in radians (about 1.7°).
+const MIN_LOBE: f32 = 0.03;
+
+/// Specular fidelity of a reduced mesh (see [`specular_error`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpecularError {
+    /// Surface area of the original that was sampled (for combining several meshes: weigh
+    /// each by `area × weight`).
+    pub area: f32,
+    /// Mean highlight weight over the original's area in 0..=1: how specular the model is.
+    pub weight: f32,
+    /// Share of the weighted highlight that the reduced mesh puts in the wrong place, in
+    /// 0..=1, at the reduced mesh's own scale.
+    pub misplaced: f32,
+    /// `weight × misplaced`: the error as a share of the whole surface, so a small glossy
+    /// trim on a matte model scores low and a polished body scores high.
+    pub impact: f32,
+    /// Highlight-weighted mean angle, in degrees, between the original's mean shading normal
+    /// over each reduced triangle and the reduced mesh's there.
+    pub normal_degrees: f32,
+    /// Highlight-weighted mean spread, in degrees, of the original's normals within a
+    /// reduced triangle: detail below the reduced mesh's scale. It widens the highlight at
+    /// that scale (a renderer should add it to roughness), so it is not counted as error.
+    pub detail_degrees: f32,
+}
+
+/// How far the reduced mesh's highlights are from the original's.
+///
+/// A still under fixed light hides shading-normal error on glossy surfaces; a moving light or
+/// camera shows it as highlights that swim or sit in the wrong place. Area-weighted points on
+/// `original` (`samples`, or 16 per reduced triangle if that is more) are each matched to
+/// the closest point of `reduced`, and `gloss` (material id and first UV set at the point)
+/// says how wide and how strong the highlight is there.
+///
+/// The comparison is made per reduced triangle, the smallest patch the reduced mesh can
+/// shade on its own: the original's mean normal over the points landing on it against the
+/// reduced mesh's mean normal over the same points. A polished surface's highlight is
+/// misplaced entirely by a few degrees, a rough one's hardly at all. Finer detail of the
+/// original inside the triangle is gone whatever the reducer does; it spreads the original's
+/// highlight at this scale, so it widens the lobe compared against (as in Toksvig's
+/// roughness from normal variance) and is reported apart as `detail_degrees`. Normal maps
+/// are not applied. Deterministic.
+pub fn specular_error(
+    original: &Mesh,
+    reduced: &Mesh,
+    gloss: impl Fn(u32, glam::Vec2) -> Gloss + Sync,
+    samples: usize,
+) -> SpecularError {
+    let area: f64 = (0..original.triangle_count())
+        .map(|t| {
+            let [a, b, c] = original.triangle_positions(t);
+            triangle_area(a, b, c) as f64
+        })
+        .sum();
+    let points = sample_points(original, samples.max(16 * reduced.triangle_count()), 17);
+    if points.is_empty() || reduced.triangle_count() == 0 {
+        return SpecularError {
+            area: area as f32,
+            ..Default::default()
+        };
+    }
+    let bvh = triangle_bvh(reduced);
+    let uvs = original.uvs.first();
+    // Per point: reduced triangle, highlight weight, lobe width, and the two normals.
+    let each: Vec<(u32, f32, f32, Vec3, Vec3)> = points
+        .par_iter()
+        .map(|s| {
+            let tri = original.triangle(s.triangle as usize).map(|i| i as usize);
+            let b = s.barycentrics;
+            let uv = uvs.map_or(glam::Vec2::ZERO, |u| {
+                u[tri[0]] * b.x + u[tri[1]] * b.y + u[tri[2]] * b.z
+            });
+            let material = original
+                .material_ids
+                .get(s.triangle as usize)
+                .copied()
+                .unwrap_or(0);
+            let g = gloss(material, uv);
+            let n0 = shading_normal(original, s.triangle, b);
+            match bvh.closest_point(s.position, f32::INFINITY) {
+                Some(c) => (
+                    c.triangle,
+                    g.weight(),
+                    g.roughness * g.roughness,
+                    n0,
+                    shading_normal(reduced, c.triangle, c.barycentrics),
+                ),
+                None => (u32::MAX, g.weight(), g.roughness * g.roughness, n0, -n0),
+            }
+        })
+        .collect();
+    // Summed in sample order per reduced triangle, so the result doesn't depend on threads.
+    #[derive(Clone, Copy, Default)]
+    struct Patch {
+        w: f64,
+        lobe: f64,
+        n0: glam::DVec3,
+        n1: glam::DVec3,
+    }
+    let mut patches = vec![Patch::default(); reduced.triangle_count() + 1];
+    let mut total = 0f64;
+    for &(t, w, lobe, n0, n1) in &each {
+        let p = &mut patches[(t as usize).min(reduced.triangle_count())];
+        let w = w as f64;
+        p.w += w;
+        p.lobe += w * lobe as f64;
+        p.n0 += n0.as_dvec3() * w;
+        p.n1 += n1.as_dvec3() * w;
+        total += w;
+    }
+    let (mut misplaced, mut angle_sum, mut detail_sum) = (0f64, 0f64, 0f64);
+    for p in &patches {
+        if p.w <= 0.0 {
+            continue;
+        }
+        let angle = match (p.n0.try_normalize(), p.n1.try_normalize()) {
+            (Some(a), Some(b)) => a.dot(b).clamp(-1.0, 1.0).acos(),
+            _ => std::f64::consts::PI,
+        };
+        // Angular variance of the original's normals in the patch: 2 (1 − |mean|).
+        let variance = (2.0 * (1.0 - p.n0.length() / p.w)).max(0.0);
+        let lobe = (p.lobe / p.w).max(MIN_LOBE as f64);
+        let wide2 = lobe * lobe + variance;
+        misplaced += p.w * (1.0 - (-(angle * angle) / (4.0 * wide2)).exp());
+        angle_sum += p.w * angle;
+        detail_sum += p.w * variance.sqrt();
+    }
+    let weight = total / each.len() as f64;
+    let share = |x: f64| if total > 0.0 { x / total } else { 0.0 };
+    SpecularError {
+        area: area as f32,
+        weight: weight as f32,
+        misplaced: share(misplaced) as f32,
+        impact: (weight * share(misplaced)) as f32,
+        normal_degrees: share(angle_sum).to_degrees() as f32,
+        detail_degrees: share(detail_sum).to_degrees() as f32,
+    }
+}
+
 /// Like [`surface_distance`], counting only surface that can be seen from outside its own
 /// mesh: a sample (or vertex) stays if a ray from it escapes in at least one of 32 fixed
 /// directions. An enclosed part (a watch movement in its case) adds nothing, so deleting it
@@ -312,6 +494,66 @@ pub fn image_difference(a: &Image, b: &Image) -> ImageDiff {
 mod tests {
     use super::*;
     use crate::mesh::tests::cube;
+
+    #[test]
+    fn specular_error_follows_gloss_and_scale() {
+        // A latitude-longitude sphere with smooth normals.
+        let uv_sphere = |seg: u32, rings: u32| {
+            let mut m = Mesh::default();
+            for r in 0..=rings {
+                let phi = std::f32::consts::PI * r as f32 / rings as f32;
+                for s in 0..seg {
+                    let th = std::f32::consts::TAU * s as f32 / seg as f32;
+                    m.positions.push(Vec3::new(
+                        phi.sin() * th.cos(),
+                        phi.cos(),
+                        phi.sin() * th.sin(),
+                    ));
+                }
+            }
+            for r in 0..rings {
+                for s in 0..seg {
+                    let (a, b) = (r * seg + s, r * seg + (s + 1) % seg);
+                    let (c, d) = (a + seg, b + seg);
+                    for t in [[a, b, c], [b, d, c]] {
+                        let [x, y, z] = t.map(|i| m.positions[i as usize]);
+                        if (y - x).cross(z - x).length() > 1e-9 {
+                            m.indices.extend(t);
+                            m.material_ids.push(0);
+                        }
+                    }
+                }
+            }
+            m
+        };
+        let fine = {
+            let mut m = uv_sphere(96, 48);
+            m.compute_normals(180.0);
+            m
+        };
+        let polished = |_: u32, _: glam::Vec2| Gloss::from_metallic_roughness(0.1, 1.0, 1.0);
+        // The same mesh: nothing misplaced, however glossy.
+        let same = specular_error(&fine, &fine, polished, 4000);
+        assert!(same.weight > 0.8 && same.misplaced < 1e-3, "{same:?}");
+        // A coarse sphere with smooth normals follows the fine one's highlight closely; with
+        // faceted normals each face's highlight is off by up to half its angle.
+        let mut coarse = uv_sphere(16, 8);
+        coarse.compute_normals(180.0);
+        let smooth = specular_error(&fine, &coarse, polished, 4000);
+        let mut faceted = coarse.clone();
+        faceted.normals = None;
+        let flat = specular_error(&fine, &faceted, polished, 4000);
+        assert!(
+            flat.misplaced > 2.0 * smooth.misplaced.max(0.01),
+            "{smooth:?} {flat:?}"
+        );
+        // The same normals matter less on a rough surface and not at all on a matte one.
+        let rough = |_: u32, _: glam::Vec2| Gloss::from_metallic_roughness(0.9, 1.0, 1.0);
+        let r = specular_error(&fine, &faceted, rough, 4000);
+        assert!(r.misplaced < 0.25 * flat.misplaced, "{r:?} {flat:?}");
+        let matte = specular_error(&fine, &faceted, |_, _| Gloss::MATTE, 4000);
+        assert_eq!((matte.weight, matte.impact), (0.0, 0.0));
+    }
 
     #[test]
     fn identical_meshes_have_zero_distance() {

@@ -18,6 +18,36 @@ use crate::reduce::simplify::{SimplifyOptions, SimplifyResult};
 use crate::{Mesh, Result};
 use glam::Vec3;
 
+/// Largest extra cost of a deviating normal, on a material of gloss 1 (see
+/// [`SimplifyOptions::material_gloss`]).
+const GLOSS_NORMAL_GAIN: f32 = 30.0;
+
+/// Per vertex, the factor its normal is scaled by in the attribute distance: the root of
+/// 1 + gain × the glossiest material on its triangles. None when no material is glossy.
+fn vertex_gloss(mesh: &Mesh, opts: &SimplifyOptions) -> Option<Vec<f32>> {
+    if !opts.material_gloss.iter().any(|&g| g > 0.0) {
+        return None;
+    }
+    let gain = GLOSS_NORMAL_GAIN;
+    let mut g = vec![0f32; mesh.vertex_count()];
+    for (t, tri) in mesh.indices.chunks_exact(3).enumerate() {
+        let m = mesh.material_ids.get(t).copied().unwrap_or(0) as usize;
+        let w = opts
+            .material_gloss
+            .get(m)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        for &v in tri {
+            g[v as usize] = g[v as usize].max(w);
+        }
+    }
+    for x in &mut g {
+        *x = (1.0 + gain * *x).sqrt();
+    }
+    Some(g)
+}
+
 /// Symmetric 4×4 quadric: a00 a01 a02 a03 a11 a12 a13 a22 a23 a33.
 #[derive(Clone, Copy, Default)]
 struct Q([f32; 10]);
@@ -248,11 +278,13 @@ pub(crate) fn simplify_fast(
     if mesh.colors.is_some() && cw > 0.0 {
         dim += 4;
     }
+    let gloss = vertex_gloss(mesh, opts);
     let mut attr = Vec::with_capacity(nv * dim);
     if dim > 0 {
         for v in 0..nv {
             if let (Some(ns), true) = (&mesh.normals, nw > 0.0) {
-                attr.extend((ns[v] * nw).to_array());
+                let g = gloss.as_ref().map_or(1.0, |g| g[v]);
+                attr.extend((ns[v] * (nw * g)).to_array());
             }
             if uw > 0.0 {
                 for set in &mesh.uvs {
