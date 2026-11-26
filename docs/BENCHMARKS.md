@@ -524,6 +524,80 @@ DragonAttenuation 9.0 → 9.6 ms across the three changes. Local timings on the 
 machine are not comparable with the v21 table (it was busy), so that table's times stand for
 v21.
 
+### Specular error (v22)
+
+A still under fixed light hides shading-normal error on glossy surfaces; a moving light or
+camera shows it as highlights in the wrong place. `metrics::specular_error` measures that
+without a renderer. Points on the original are matched to the closest point of the reduced
+mesh; each material's roughness, metalness and base color (textures included) give the
+highlight's width and strength there; and per reduced triangle the original's mean shading
+normal is compared with the reduced mesh's. Detail of the original inside a reduced triangle
+is lost whatever the reducer does, so it widens the lobe compared against (roughness from
+normal variance) instead of counting as error. The score is the share of the model's
+highlight, weighted by area and gloss, that lands in the wrong place. A first version that
+compared point by point saturated on fine detail (63% "misplaced" on the dragon at 7° of
+error for every reducer) and no reducer setting moved it.
+
+Mean over 11 assets (`bench-compare rtexport` prints it per asset), with the image score
+beside it:
+
+| method | misplaced highlight, 10% | PSNR, 10% | misplaced highlight, 3% | PSNR, 3% |
+|---|---|---|---|---|
+| farthing (default) | 1.22% | 23.82 | 2.41% | 18.76 |
+| farthing realtime | **1.21%** | 23.29 | **1.51%** | **19.53** |
+| meshopt attr + permissive | 1.46% | 24.01 | 2.69% | 19.47 |
+| farthing fast | 2.05% | **24.02** | 3.50% | 18.94 |
+| farthing fast with `material_gloss` | 1.73% | 23.88 | 3.01% | 18.82 |
+| meshopt sloppy | 4.78% | 18.94 | 4.53% | 17.06 |
+
+Fast mode is the weak one: 24% of the watch's highlight misplaced at 10%, against 9% for
+realtime. `SimplifyOptions::material_gloss` (a weight per material, from
+`GltfMaterial::gloss_weight`) makes a deviating normal cost up to 30 times more on glossy
+materials in fast mode: 15% less specular error for 0.13 dB. Realtime did not respond to the
+same weighting in its tail or to importance in its clustering, and is already the lowest;
+the default reducer responded unevenly (BoomBox better, the watch worse), so neither uses the
+option yet.
+
+Realtime's normal-spread weight in cell splitting was retuned on these runs (0.5 to 0.125):
++0.17 dB at 10%, +0.03 dB at 3%, specular error unchanged or lower.
+
+### Default reducer on seam-dense meshes (v22)
+
+The dragon scene's cloth has 62,570 vertices on 22,199 positions, split by normals only.
+The default reducer treated a wedge with no partner across the collapsed edge as a UV tear
+unless it and its target wedge had the same UVs, which two wedges at different positions
+never do. Every such merge was priced as a full tear, so the wedge kept its own attributes
+at the new position instead, planting a real UV break inside one chart; the gutter guard
+then refused merges around it and the reduction locked up. A merge is now tear-free when the
+wedge has the UVs of a partnered wedge whose target has the target wedge's UVs.
+
+| case (Hausdorff % / mean % / UV p90 / normals °) | before | after | fast |
+|---|---|---|---|
+| cloth to 1,000 triangles | 3.051 / 0.1269 / 0.0924 / 5.15 | 0.506 / 0.0316 / 0.0009 / 1.56 | 0.431 / 0.0214 / 0.0009 / 3.16 |
+| cloth, welded first | 30.07 / 4.299 / 0.492 / 31.8 (stalls at 1,223) | 0.506 / 0.0315 / 0.0008 / 1.54 | 0.431 / 0.0215 / 0.0009 / 3.16 |
+| dragon scene as one mesh, 13,500 (cluster-parallel) | 1.586 / 0.0513 / 0.0034 / 2.59 | 0.527 / 0.0141 / 0.0004 / 1.90 | 0.280 / 0.0100 / 0.0004 / 2.71 |
+| 8 assets x 4 ratios, geometric means | 2.499 / 0.1895 / 0.0099 / 7.38, 94% reached | 2.396 / 0.1723 / 0.0084 / 6.93, 97% reached | 2.257 / 0.1413 / 0.0093 / 8.18 |
+
+Meshes with real UV seams everywhere (the dragon itself, the watch, the car) are a second
+problem, not fixed by default: removing a seam vertex along a seam that bends in UV always
+spills past the island's edge, the gutter guard (`DRIFT_UV`, 1/2048) forbids it, and the
+vertex can then only slide, at a price that drags the accepted geometric error up. On the
+dragon to 1,000 triangles, half of the UV validity checks fail on spill. The opt-in
+`gutter_tolerance` lets the cap grow with the dearest collapse made so far:
+
+| case | default | tolerance 0.01 | tolerance 0.05 | fast |
+|---|---|---|---|---|
+| dragon, 1,000 | 11.16 / 0.651 / 0.824 / 32.3 | 4.38 / 0.434 / 0.794 / 24.5 | 3.95 / 0.397 / 0.768 / 21.8 | 2.49 / 0.275 / 0.503 / 24.7 |
+| watch, 3,000 | 9.11 / 0.963 / 2.02 / 72.0 | 4.44 / 0.441 / 1.20 / 56.7 | 3.84 / 0.351 / 0.993 / 49.2 | 3.11 / 0.285 / 0.794 / 51.4 |
+| car, 3,000 | 10.64 / 1.272 / 213.8 / 77.7 | 7.24 / 0.491 / 110.5 / 66.9 | 7.51 / 0.463 / 102.5 / 64.3 | 8.04 / 0.369 / 80.7 / 64.4 |
+| 8 assets, means | 2.396 / 0.1723 / 0.0084 / 6.93 | 2.247 / 0.1640 / 0.0074 / 6.81 | 2.030 / 0.1512 / 0.0066 / 6.51 | 2.257 / 0.1413 / 0.0093 / 8.18 |
+| UV area over half a texel into the gutter (mean, worst) | 0.008%, 0.26% | 0.07%, 1.3% | 0.51%, 3.7% | |
+
+It is off by default: any tolerance fails `uv_islands_never_spill_into_the_gutter`. The
+closest-point UV metric also overstates slides (a seam moved by one edge length reads as a
+jump between islands), so the UV columns here are harsher on the default reducer than a
+render is.
+
 ### Aggressive targets (v14)
 
 11 assets (the 8 above plus ABeautifulGame 1.5M tris, CarConcept 213k, ChronographWatch 100k)
