@@ -1048,7 +1048,13 @@ fn rtexport_mode(args: &[String]) {
         ("mo_sloppy", Box::new(meshopt_sloppy)),
         ("mo_perm", Box::new(|m, t| meshopt_reduce(m, t, true, true))),
     ];
+    let only: Option<Vec<String>> = std::env::var("RD_METHODS")
+        .ok()
+        .map(|v| v.split(',').map(String::from).collect());
     for (label, f) in methods {
+        if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == label)) {
+            continue;
+        }
         let mut lod = scene.clone();
         let mut ms = 0.0;
         for (i, m) in scene.meshes.iter().enumerate() {

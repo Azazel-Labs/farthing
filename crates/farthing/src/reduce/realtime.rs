@@ -50,6 +50,11 @@ const STAGE1_ERROR_SHARE: f32 = 0.5;
 const NORMAL_SCALE: f32 = 1e-5;
 const UV_SCALE: f32 = 1e-3;
 const COLOR_SCALE: f32 = 1e-3;
+/// The position solve after the tail: its pull toward the cluster's current position, as a
+/// share of the quadric's mean curvature term, and how far a cluster may move, as a share of
+/// its shortest edge.
+const RELAX_RIDGE: f64 = 1e-3;
+const RELAX_REACH: f32 = 0.25;
 /// Weight of the distance to a cluster's centroid in choosing its representative: enough to
 /// settle ties (flat regions, where every member's error is zero, and would otherwise all pick
 /// their cells' low corners and fold), too little to override real error.
@@ -1018,7 +1023,6 @@ pub(crate) fn simplify_realtime(
             }
         })
         .collect();
-    drop(vs);
     drop(cellr);
     drop(cell_st);
     drop(locked_v);
@@ -1160,6 +1164,7 @@ pub(crate) fn simplify_realtime(
     lap("attrs");
     let max_err2 = opts.max_error.map(|e| (e * inv) * (e * inv));
     let (collapses, worst2, wremap, cremap) = st.run(target, max_err2, opts.min_face_dot);
+    let moved = st.relax(&cremap, opts.min_face_dot);
     lap("tail");
 
     // Output: one vertex per wedge still used, at its cluster's representative position.
@@ -1189,7 +1194,12 @@ pub(crate) fn simplify_realtime(
     let source_vertex: Vec<u32> = srcs.iter().map(|&w| wsrc[w as usize]).collect();
     let mut out = mesh.select_vertices(&source_vertex);
     for (o, &w) in srcs.iter().enumerate() {
-        out.positions[o] = mesh.positions[rep[wc[w as usize] as usize] as usize];
+        let c = wc[w as usize] as usize;
+        out.positions[o] = if moved[c] {
+            st.cpos[c] * diag + center
+        } else {
+            mesh.positions[rep[c] as usize]
+        };
     }
     out.indices = indices;
     out.material_ids = material_ids;
@@ -1223,6 +1233,27 @@ pub(crate) fn simplify_realtime(
             if o != u32::MAX { o } else { 0 }
         })
         .collect();
+    // Each output vertex stands for every input vertex merged into its wedge: its normal is
+    // their area-weighted mean, not the one member's the other attributes are copied from.
+    if let (Some(src), Some(dst)) = (&mesh.normals, &mut out.normals) {
+        let mut sum = vec![Vec3::ZERO; dst.len()];
+        for v in 0..nv {
+            let r = rank[v] as usize;
+            let root = parent[r] as usize;
+            if wid[root] != u32::MAX {
+                let o = wout[wremap[wid[root] as usize] as usize];
+                if o != u32::MAX {
+                    sum[o as usize] += src[v] * vs[r].area;
+                }
+            }
+        }
+        for (n, s) in dst.iter_mut().zip(sum) {
+            let l = s.length();
+            if l > 1e-20 {
+                *n = s / l;
+            }
+        }
+    }
     let rel = worst1.max(worst2 as f64).sqrt() as f32;
     lap("output");
     Ok(SimplifyResult {
@@ -1349,6 +1380,90 @@ impl Tail {
     fn star(&self, p: u32) -> &[u32] {
         let o = self.soff[p as usize] as usize;
         &self.pool[o..o + self.slen[p as usize] as usize]
+    }
+
+    /// Moves each remaining free cluster to the minimum of its summed quadric (it has stood
+    /// at one of its member vertices so far), where that stays inside its neighborhood and
+    /// turns no triangle. Returns which clusters moved.
+    fn relax(&mut self, cremap: &[u32], min_dot: f32) -> Vec<bool> {
+        let nc = self.cpos.len();
+        let mut moved = vec![false; nc];
+        for c in 0..nc {
+            if cremap[c] != c as u32 || self.locked[c] || self.sdeg[c] != 0 {
+                continue;
+            }
+            let p = self.cpos[c];
+            let q = &self.cq[c];
+            let l = RELAX_RIDGE * (q[0] + q[4] + q[7]) / 3.0;
+            if l <= 0.0 {
+                continue;
+            }
+            let a = [
+                [q[0] + l, q[1], q[2]],
+                [q[1], q[4] + l, q[5]],
+                [q[2], q[5], q[7] + l],
+            ];
+            let b = [
+                l * p.x as f64 - q[3],
+                l * p.y as f64 - q[6],
+                l * p.z as f64 - q[8],
+            ];
+            let det3 = |m: &[[f64; 3]; 3]| {
+                m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                    - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                    + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+            };
+            let d = det3(&a);
+            if d.abs() < 1e-300 {
+                continue;
+            }
+            let mut x = [0f64; 3];
+            for (k, xk) in x.iter_mut().enumerate() {
+                let mut m = a;
+                for (row, bi) in m.iter_mut().zip(b) {
+                    row[k] = bi;
+                }
+                *xk = det3(&m) / d;
+            }
+            let np = Vec3::new(x[0] as f32, x[1] as f32, x[2] as f32);
+            if !np.is_finite() {
+                continue;
+            }
+            // Along the surface normal only: a sideways move would slide the texture, since
+            // the attributes stay those of the member vertex.
+            let mut n = Vec3::ZERO;
+            for t in self.live(c as u32) {
+                let v = self.tc[t].map(|x| self.cpos[x as usize]);
+                n += (v[1] - v[0]).cross(v[2] - v[0]);
+            }
+            let n = n.normalize_or_zero();
+            let np = p + n * (np - p).dot(n);
+            // Within a share of the shortest edge to a neighbor, and no triangle turned.
+            let mut short2 = f32::INFINITY;
+            let mut ok = true;
+            for t in self.live(c as u32) {
+                let v = self.tc[t].map(|x| self.cpos[x as usize]);
+                let i = self.tc[t].iter().position(|&x| x == c as u32).unwrap();
+                for k in 1..3 {
+                    short2 = short2.min((v[(i + k) % 3] - p).length_squared());
+                }
+                let n0 = (v[1] - v[0]).cross(v[2] - v[0]);
+                let mut w = v;
+                w[i] = np;
+                let n1 = (w[1] - w[0]).cross(w[2] - w[0]);
+                let l1 = n1.length();
+                if !(l1 > 1e-12 && n0.dot(n1) >= min_dot.max(0.5) * n0.length() * l1) {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || (np - p).length_squared() > RELAX_REACH * RELAX_REACH * short2 {
+                continue;
+            }
+            self.cpos[c] = np;
+            moved[c] = true;
+        }
+        moved
     }
 
     fn live(&self, p: u32) -> impl Iterator<Item = usize> + '_ {
