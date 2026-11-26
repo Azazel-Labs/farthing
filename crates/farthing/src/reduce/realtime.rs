@@ -1673,6 +1673,13 @@ impl Tail {
         )
     }
 
+    /// Whether p has anywhere to go at all: not locked, and if constrained, a side to slide to.
+    #[inline]
+    fn movable(&self, p: u32) -> bool {
+        !self.locked[p as usize]
+            && (self.sdeg[p as usize] == 0 || self.side[p as usize] != [u32::MAX; 2])
+    }
+
     #[inline]
     fn can(&self, p: u32, q: u32) -> bool {
         !self.locked[p as usize]
@@ -1890,7 +1897,8 @@ impl Tail {
         let mut map = Vec::new();
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(nc);
         // First costs exact, in parallel (they only read the state), so a cluster's first
-        // turn at the top mostly holds.
+        // turn at the top mostly holds. (Lower bounds here and exact costs on demand were
+        // measured slower: that moves parallel work into the serial loop.)
         //
         // A cluster's exact best is kept with the collapse count it was found at, and stands
         // while no collapse since has changed what it reads (`dirty`): its triangles, its
@@ -1901,6 +1909,9 @@ impl Tail {
             .map_init(
                 || Scratch::new(nc),
                 |s, p| {
+                    if !self.movable(p) {
+                        return None;
+                    }
                     self.gather(p, &mut s.loc);
                     self.best(p, max_err2, true, s)
                 },
@@ -1988,7 +1999,7 @@ impl Tail {
             }
             for &r in &touched {
                 dirty[r as usize] = done;
-                if queued[r as usize] {
+                if queued[r as usize] || !self.movable(r) {
                     continue;
                 }
                 self.gather(r, &mut s.loc);
