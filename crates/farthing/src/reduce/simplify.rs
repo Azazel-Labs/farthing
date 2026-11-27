@@ -2635,80 +2635,96 @@ impl<'a> State<'a> {
         }
         let set = &self.mesh.uvs[0];
         let uv = |w: u32| set[w as usize].as_dvec2();
-        let same = |a: u32, b: u32| {
-            a == b || (uv(a) - uv(b)).length_squared() <= TEAR_SAME_UV * TEAR_SAME_UV
+        // Whether wedges a and b (with UVs ua and ub) have the same UV.
+        let same = |a: u32, ua: DVec2, b: u32, ub: DVec2| {
+            a == b || (ua - ub).length_squared() <= TEAR_SAME_UV * TEAR_SAME_UV
         };
         let mut price = 0.0;
         for &(pw, qw) in map {
             if pw == qw {
                 continue;
             }
-            // p's fan on pw's island, as indices into `corners`.
+            let (pu, uq) = (uv(pw), uv(qw));
+            // p's fan on pw's island, as indices into `corners`, with the UVs of each
+            // triangle's two ring corners.
             let mut fan = [0usize; FAN_MAX];
+            let mut ua = [DVec2::ZERO; FAN_MAX];
+            let mut ub = [DVec2::ZERO; FAN_MAX];
             let mut n = 0;
             for (i, c) in corners.iter().enumerate() {
-                if same(c.pw, pw) {
+                if c.pw == pw || (uv(c.pw) - pu).length_squared() <= TEAR_SAME_UV * TEAR_SAME_UV {
                     if n == FAN_MAX {
                         return price;
                     }
                     fan[n] = i;
+                    ua[n] = uv(c.a);
+                    ub[n] = uv(c.b);
                     n += 1;
                 }
             }
-            let fan = &fan[..n];
-            let at_q = |c: &Corner| (c.pa == q && same(c.a, qw)) || (c.pb == q && same(c.b, qw));
-            if !fan.iter().any(|&i| at_q(&corners[i])) {
+            let at_q = |i: usize| {
+                let c = &corners[fan[i]];
+                (c.pa == q && same(c.a, ua[i], qw, uq)) || (c.pb == q && same(c.b, ub[i], qw, uq))
+            };
+            if !(0..n).any(at_q) {
                 continue; // a tear: priced as one
             }
             // The fan in order round p: each triangle's second ring vertex is the next one's
             // first. If every triangle has a next one the fan is closed: no boundary to
-            // spill over, but its triangles can still turn over.
-            let follows = |d: &Corner, c: &Corner| d.pa == c.pb && same(d.a, c.b);
-            let closed = fan
-                .iter()
-                .all(|&i| fan.iter().any(|&j| follows(&corners[j], &corners[i])));
+            // spill over, but its triangles can still turn over. `next[i]` holds the
+            // triangles that follow triangle i (bit j for `fan[j]`).
+            let mut next = [0u32; FAN_MAX];
+            for (i, nx) in next[..n].iter_mut().enumerate() {
+                let c = &corners[fan[i]];
+                for j in 0..n {
+                    let d = &corners[fan[j]];
+                    if d.pa == c.pb && same(d.a, ua[j], c.b, ub[i]) {
+                        *nx |= 1 << j;
+                    }
+                }
+            }
+            let closed = next[..n].iter().all(|&m| m != 0);
             if closed && self.guarded {
                 continue;
             }
             let first = if closed {
-                fan[0]
+                0
             } else {
-                let mut firsts = fan
-                    .iter()
-                    .filter(|&&i| !fan.iter().any(|&j| follows(&corners[i], &corners[j])));
-                let (Some(&first), None) = (firsts.next(), firsts.next()) else {
+                // Triangles that follow none.
+                let all = next[..n].iter().fold(0u32, |a, &m| a | m);
+                let firsts = !all & ((1u32 << n) - 1);
+                if firsts.count_ones() != 1 {
                     continue;
-                };
-                first
+                }
+                firsts.trailing_zeros() as usize
             };
-            // Triangles and ring vertices in order, and where q is among them.
+            // Triangles and ring vertices in order (positions in `fan`), and where q is
+            // among them.
             let mut order = [0usize; FAN_MAX];
             let mut ring = [DVec2::ZERO; FAN_MAX + 1];
             let mut qi = None;
             let mut cur = first;
-            ring[0] = uv(corners[cur].a);
-            if corners[cur].pa == q && same(corners[cur].a, qw) {
+            ring[0] = ua[cur];
+            if corners[fan[cur]].pa == q && same(corners[fan[cur]].a, ua[cur], qw, uq) {
                 qi = Some(0);
             }
             let mut whole = true;
+            let mut used = 0u32;
             for k in 0..n {
-                let c = &corners[cur];
-                order[k] = cur;
-                ring[k + 1] = uv(c.b);
-                if qi.is_none() && c.pb == q && same(c.b, qw) {
+                let c = &corners[fan[cur]];
+                order[k] = fan[cur];
+                used |= 1 << cur;
+                ring[k + 1] = ub[cur];
+                if qi.is_none() && c.pb == q && same(c.b, ub[cur], qw, uq) {
                     qi = Some(k + 1);
                 }
                 if k + 1 < n {
-                    match fan
-                        .iter()
-                        .find(|&&j| follows(&corners[j], c) && !order[..=k].contains(&j))
-                    {
-                        Some(&next) => cur = next,
-                        None => {
-                            whole = false;
-                            break;
-                        }
+                    let open = next[cur] & !used;
+                    if open == 0 {
+                        whole = false;
+                        break;
                     }
+                    cur = open.trailing_zeros() as usize;
                 }
             }
             let (Some(qi), true) = (qi, whole) else {
@@ -2716,7 +2732,6 @@ impl<'a> State<'a> {
             };
             let ring = &ring[..=n];
             // All triangles must wind the same way round p.
-            let pu = uv(pw);
             let turn = (ring[0] - pu).perp_dot(ring[1] - pu);
             if turn == 0.0
                 || (1..n).any(|k| (ring[k] - pu).perp_dot(ring[k + 1] - pu) * turn <= 0.0)
@@ -2754,7 +2769,6 @@ impl<'a> State<'a> {
                 // for round-off cost nothing.)
                 if d < SPILL_MIN { 0.0 } else { d }
             };
-            let uq = uv(qw);
             for k in 0..n {
                 let c = &corners[order[k]];
                 if c.pa == q || c.pb == q {
