@@ -1205,6 +1205,33 @@ What changed in v7:
 Duck/Fox/BoomBox/Lantern/dragon mean error went from 0.0172/0.0213/0.0393/0.1065/0.0891
 (v6 defaults, 3000 tris) to 0.0153/0.0151/0.0249/0.0915/0.0394.
 
+### Realtime: borders, seam tips and hard edges (v24)
+
+Four changes from looking at why realtime trails the default on the watch and the helmet:
+
+- A vertex where a UV seam ends has an open fan whose two ends are copies of one position; it
+  was given two border planes (122 such vertices on the Duck, which has no border). No more.
+- A cluster on both a border and a junction slides along its border instead of being locked
+  (1,880 of 37,500 clusters at 10%).
+- Border clusters take part in the position solve along the normal.
+- In the tail, a wedge with no partner across the collapsed edge is kept when its normal
+  differs by more than about 29 degrees, instead of merging into the nearest wedge.
+
+Mean rendered PSNR over the 11 assets: 24.02 to 24.46 dB at 10%, 20.10 to 20.37 at 3%. Largest
+gains at 10%: WaterBottle +1.55, Lantern +1.32, Avocado +1.11, Fox +0.56. Largest loss: the
+watch, -0.16 at 10% and -0.10 at 3%. Specular impact unchanged. Same-run A/B on a 4-thread
+Linux runner: 14.34 to 14.64 ms and 18.21 to 17.97 ms per call at a 3,000-triangle target,
+29.98 to 30.99 and 31.60 to 32.27 ms at 20,000; the tail alone is 7 to 11% slower (the position
+solve runs on half as many clusters again).
+
+The watch and helmet themselves did not move. The helmet loses to seams leaving their line in
+stage one (in 294 of its 695 seam clusters the representative is not a seam vertex) and to
+struts thinner than a cell being pressed flat; the watch to plain geometric error in three
+large meshes (mean distance about twice the default's). Both want smaller cells, that is, a
+larger budget. Not measured: cracks between separately reduced meshes that share a border,
+whose border vertices can now move up to a quarter of their shortest edge along the normal
+(`lock_border` still pins them).
+
 ### The default reducer against the fast one (v24)
 
 The fast reducer rendered closer to the source than the default on 9 of 22 cases (11 assets
