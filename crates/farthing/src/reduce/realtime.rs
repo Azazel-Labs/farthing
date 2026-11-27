@@ -91,8 +91,9 @@ const FINE_PER_CLUSTER: usize = 4;
 /// sizes (RMS) of the centroid's planes, and its normal spread (the normal moment's
 /// principal 2x2 minors against its trace squared, 1/4 for a tube) is at least
 /// `THIN_SPREAD`. A candidate with at least `THIN_MIN_VERTS` vertices is cut into
-/// `THIN_SECTORS` cells around its axis when the error that removes is at least
-/// `THIN_GAIN` of what an octree split at the refinement threshold removes per cluster.
+/// `THIN_SECTORS` cells around its axis (three; `sector_of` assumes it) when the error that
+/// removes is at least `THIN_GAIN` of what an octree split at the refinement threshold
+/// removes per cluster.
 const THIN_CANCEL: f64 = 0.3;
 const THIN_DEPTH: f64 = 0.5;
 const THIN_SPREAD: f64 = 0.1;
@@ -942,8 +943,8 @@ fn realtime_pass(
     // A small target on a mesh with open borders: there the clusters a split takes from
     // other cells move the border's clusters, and a mesh beside it sharing the border
     // comes apart from it.
-    let small_open = k_target.is_some_and(|k| k < THIN_OPEN_MIN_TARGET)
-        && borders.par_iter().any(|b| *b != NONE);
+    let small_open =
+        k_target.is_some_and(|k| k < THIN_OPEN_MIN_TARGET) && borders.iter().any(|b| *b != NONE);
     let cheap_thin = |st: &[f64; NS], level: u32| -> bool {
         let area = st[10];
         if area <= 0.0 || small_open {
@@ -975,8 +976,15 @@ fn realtime_pass(
         ];
         let o1 = q[0] * d[0] + q[1] * d[1] + q[2] * d[2];
         let o2 = q[0] * d2[0] + q[1] * d2[1] + q[2] * d2[2];
-        let a = o2.atan2(o1) + std::f64::consts::PI;
-        ((a * THIN_SECTORS as f64 / std::f64::consts::TAU) as usize).min(THIN_SECTORS - 1)
+        // Three sectors of 120 degrees: within 60 degrees of d, then the side of d2.
+        let r3 = 3f64.sqrt();
+        if o1 > 0.0 && o2.abs() * (1.0 / r3) < o1 {
+            1
+        } else if o2 >= 0.0 {
+            2
+        } else {
+            0
+        }
     };
     // The full test for a cell `cheap_thin` passed, over its vertices: the part's
     // cross-section (the two directions its normals lie along) and whether cutting the cell
@@ -1166,13 +1174,23 @@ fn realtime_pass(
                 break;
             }
             let thr = heap.peek().map_or(0.0, |x| f64::from_bits(x.0));
-            let found: Vec<Option<Thin>> = pending
-                .par_iter()
+            let one = |&i: &u32| {
+                let n = &nodes[i as usize];
+                verify(fcells[n.fs as usize].s, fcells[n.fe as usize - 1].e, n, thr)
+            };
+            // In parallel only when there is enough work to pay for waking the pool.
+            let work: usize = pending
+                .iter()
                 .map(|&i| {
                     let n = &nodes[i as usize];
-                    verify(fcells[n.fs as usize].s, fcells[n.fe as usize - 1].e, n, thr)
+                    (fcells[n.fe as usize - 1].e - fcells[n.fs as usize].s) as usize
                 })
-                .collect();
+                .sum();
+            let found: Vec<Option<Thin>> = if work < PAR_MIN * 4 {
+                pending.iter().map(one).collect()
+            } else {
+                pending.par_iter().map(one).collect()
+            };
             let mut freed = false;
             for (&i, f) in pending.iter().zip(found) {
                 if let Some(t) = f {
@@ -1221,7 +1239,7 @@ fn realtime_pass(
     // one point and the part would vanish. Such a cell is cut into sectors around the part's
     // axis, each its own cell, so the part keeps a cross-section.
     let thin: Vec<Option<Thin>> = cells
-        .par_iter()
+        .iter()
         .map(|&(s, e, i)| match tstate[i as usize] {
             2 => Some(tinfo[&i]),
             1 => verify(s, e, &nodes[i as usize], 0.0),
