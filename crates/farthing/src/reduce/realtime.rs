@@ -13,7 +13,9 @@
 //!    by the quadric error at their area-weighted centroid plus a normal-cone term that splits
 //!    cells holding opposite sheets. Flat regions stay coarse and curved ones refine, like
 //!    greedy collapse and unlike a uniform grid. The split stops at about one cluster per
-//!    target triangle (about twice the target in triangles).
+//!    target triangle (about twice the target in triangles). A leaf cell holding a tube or
+//!    strut narrower than itself, which would fall to one point and vanish, is instead cut
+//!    into sectors around the part's axis when that removes enough error for its clusters.
 //! 2. **Clusters as vertices.** Each cluster keeps the summed quadric of the original surface
 //!    and is represented by its member vertex of least error (vertices are never invented, so
 //!    attributes stay exact). Members joined by an edge inside the cluster share a wedge:
@@ -84,6 +86,21 @@ const CODE_SHIFT: u32 = 34;
 const CENTROID_PULL: f64 = 1e-5;
 /// Fine cells per wanted cluster: the resolution refinement starts from.
 const FINE_PER_CLUSTER: usize = 4;
+/// Thin parts (see `verify` in `realtime_pass`): a cell is a candidate when its normals
+/// cancel by at least `THIN_CANCEL` of its area, its surface lies within `THIN_DEPTH` cell
+/// sizes (RMS) of the centroid's planes, and its normal spread (the normal moment's
+/// principal 2x2 minors against its trace squared, 1/4 for a tube) is at least
+/// `THIN_SPREAD`. A candidate with at least `THIN_MIN_VERTS` vertices is cut into
+/// `THIN_SECTORS` cells around its axis when the error that removes is at least
+/// `THIN_GAIN` of what an octree split at the refinement threshold removes per cluster.
+const THIN_CANCEL: f64 = 0.3;
+const THIN_DEPTH: f64 = 0.5;
+const THIN_SPREAD: f64 = 0.1;
+const THIN_MIN_VERTS: u32 = 4;
+const THIN_SECTORS: usize = 3;
+const THIN_GAIN: f64 = 0.05;
+/// No thin splits on a mesh with open borders whose cluster budget is below this.
+const THIN_OPEN_MIN_TARGET: usize = 300;
 
 /// Vertices per parallel chunk, and the most chunks; items per task for parallel maps.
 const CHUNK_VERTS: usize = 4096;
@@ -92,6 +109,8 @@ const PAR_MIN: usize = 4096;
 /// Refinement sums: quadric (10), area, area-weighted normal (3), area-weighted position (3).
 const NS: usize = 17;
 type Q = [f64; 10];
+/// A thin cell's split: its two cross-section directions and its centroid.
+type Thin = ([f64; 3], [f64; 3], [f64; 3]);
 
 #[inline]
 fn plane(n: Vec3, d: f32, w: f32) -> [f32; 10] {
@@ -128,6 +147,35 @@ fn qeval(a: &[f64], x: f64, y: f64, z: f64) -> f64 {
 #[inline]
 fn qeval_v(a: &[f64], p: Vec3) -> f64 {
     qeval(a, p.x as f64, p.y as f64, p.z as f64)
+}
+
+/// The leading eigenvector of a symmetric 3x3 matrix (xx, xy, xz, yy, yz, zz) and its
+/// eigenvalue, by power iteration from the column of the largest diagonal entry.
+fn lead_eig(m: &[f64; 6]) -> Option<([f64; 3], f64)> {
+    let mul = |d: [f64; 3]| {
+        [
+            m[0] * d[0] + m[1] * d[1] + m[2] * d[2],
+            m[1] * d[0] + m[3] * d[1] + m[4] * d[2],
+            m[2] * d[0] + m[4] * d[1] + m[5] * d[2],
+        ]
+    };
+    let mut d = if m[0] >= m[3] && m[0] >= m[5] {
+        [m[0], m[1], m[2]]
+    } else if m[3] >= m[5] {
+        [m[1], m[3], m[4]]
+    } else {
+        [m[2], m[4], m[5]]
+    };
+    let mut l = 0.0;
+    for _ in 0..10 {
+        let x = mul(d);
+        l = (x[0] * x[0] + x[1] * x[1] + x[2] * x[2]).sqrt();
+        if l.is_nan() || l <= 0.0 {
+            return None;
+        }
+        d = x.map(|v| v / l);
+    }
+    Some((d, l))
 }
 
 /// Spreads the low 10 bits of `x` three apart.
@@ -885,6 +933,115 @@ fn realtime_pass(
         let en = (area - nlen).max(0.0) * h * h * NORMAL_KAPPA;
         (e + en, e / area)
     };
+    // A cell that may hold a thin part, from its sums alone: its normals partly cancel, its
+    // surface lies close to the centroid's planes for its size, and its normals spread over
+    // more than one direction (a tube or strut, not a folded plate). Such a cell is counted
+    // as `THIN_SECTORS` clusters while it is a leaf.
+    // A small target on a mesh with open borders: there the clusters a split takes from
+    // other cells move the border's clusters, and a mesh beside it sharing the border
+    // comes apart from it.
+    let small_open = k_target.is_some_and(|k| k < THIN_OPEN_MIN_TARGET)
+        && borders.par_iter().any(|b| *b != NONE);
+    let cheap_thin = |st: &[f64; NS], level: u32| -> bool {
+        let area = st[10];
+        if area <= 0.0 || small_open {
+            return false;
+        }
+        let nlen = (st[11] * st[11] + st[12] * st[12] + st[13] * st[13]).sqrt();
+        if nlen > (1.0 - THIN_CANCEL) * area {
+            return false;
+        }
+        let e = qeval(st, st[14] / area, st[15] / area, st[16] / area);
+        let h = cube_to_unit * 0.5f64.powi(level as i32);
+        if e >= area * (THIN_DEPTH * h).powi(2) {
+            return false;
+        }
+        // The sum of the normal moment's principal 2x2 minors against its trace squared: 0
+        // for a plate, 1/4 for a tube, 1/3 for a ball.
+        let (a, b, c, d, f, g) = (st[0], st[1], st[2], st[4], st[5], st[7]);
+        let t = a + d + g;
+        let s2 = a * d - b * b + a * g - c * c + d * g - f * f;
+        s2 >= THIN_SPREAD * t * t
+    };
+    // The sector of a thin cell a position falls in, by its angle around the part's axis.
+    let sector_of = |p: Vec3, t: &Thin| -> usize {
+        let (d, d2, cen) = t;
+        let q = [
+            p.x as f64 - cen[0],
+            p.y as f64 - cen[1],
+            p.z as f64 - cen[2],
+        ];
+        let o1 = q[0] * d[0] + q[1] * d[1] + q[2] * d[2];
+        let o2 = q[0] * d2[0] + q[1] * d2[1] + q[2] * d2[2];
+        let a = o2.atan2(o1) + std::f64::consts::PI;
+        ((a * THIN_SECTORS as f64 / std::f64::consts::TAU) as usize).min(THIN_SECTORS - 1)
+    };
+    // The full test for a cell `cheap_thin` passed, over its vertices: the part's
+    // cross-section (the two directions its normals lie along) and whether cutting the cell
+    // into sectors around the axis is worth its extra clusters, against `thr`, what one more
+    // octree split removes at the current refinement threshold.
+    let verify = |s: u32, e: u32, n: &Node, thr: f64| -> Option<Thin> {
+        let st = &n.st;
+        if e - s < THIN_MIN_VERTS || !cheap_thin(st, n.level) {
+            return None;
+        }
+        // Not on an open border: its clusters keep their members' positions there, so a mesh
+        // beside it sharing the border keeps meeting it, which a different cut would undo.
+        if borders
+            .get(s as usize..e as usize)
+            .is_some_and(|b| b.iter().any(|b| *b != NONE))
+        {
+            return None;
+        }
+        let mut m = [0f64; 6];
+        for r in s as usize..e as usize {
+            let v = &vs[r];
+            if v.area <= 0.0 {
+                continue;
+            }
+            let (x, y, z) = (v.n[0] as f64, v.n[1] as f64, v.n[2] as f64);
+            let ia = 1.0 / v.area as f64;
+            m[0] += x * x * ia;
+            m[1] += x * y * ia;
+            m[2] += x * z * ia;
+            m[3] += y * y * ia;
+            m[4] += y * z * ia;
+            m[5] += z * z * ia;
+        }
+        let (d, l1) = lead_eig(&m)?;
+        // The second direction, from the moment with the first taken out, made orthogonal
+        // to it exactly.
+        let mut m2 = m;
+        m2[0] -= l1 * d[0] * d[0];
+        m2[1] -= l1 * d[0] * d[1];
+        m2[2] -= l1 * d[0] * d[2];
+        m2[3] -= l1 * d[1] * d[1];
+        m2[4] -= l1 * d[1] * d[2];
+        m2[5] -= l1 * d[2] * d[2];
+        let (d2, _) = lead_eig(&m2)?;
+        let k = d2[0] * d[0] + d2[1] * d[1] + d2[2] * d[2];
+        let d2 = [d2[0] - k * d[0], d2[1] - k * d[1], d2[2] - k * d[2]];
+        let l2 = (d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2]).sqrt();
+        if l2.is_nan() || l2 <= 0.0 {
+            return None;
+        }
+        let area = st[10];
+        let t = (
+            d,
+            d2.map(|v| v / l2),
+            [st[14] / area, st[15] / area, st[16] / area],
+        );
+        let mut parts = [[0f32; NS]; THIN_SECTORS];
+        for r in s as usize..e as usize {
+            vstats(&mut parts[sector_of(spos[r], &t)], &vq(r), &vs[r], spos[r]);
+        }
+        let after: f64 = parts
+            .iter()
+            .map(|p| err(&p.map(|x| x as f64), n.level).0)
+            .sum();
+        let gain = err(st, n.level).0 - after;
+        (gain >= THIN_GAIN * thr * (THIN_SECTORS - 1) as f64).then_some(t)
+    };
     let mut nodes: Vec<Node> = Vec::with_capacity(k_target.unwrap_or(1024) * 2);
     {
         let mut st = [0f64; NS];
@@ -962,21 +1119,69 @@ fn realtime_pass(
             std::cmp::Reverse(0),
         ));
     }
-    let mut count = 1usize;
+    // Thin state per node: 0 none, 1 counted as thin by its sums, 2 verified thin, 3 not
+    // thin after all. A node counted as thin is counted as `THIN_SECTORS` clusters while it
+    // is a leaf, so the budget stays the same; once it is reached the counted leaves are
+    // verified, and the budget freed by those that fail goes back to refinement.
+    let extra = THIN_SECTORS - 1;
+    let reserve = |n: &Node| cheap_thin(&n.st, n.level) as u8;
+    let mut tstate: Vec<u8> = vec![reserve(&nodes[0])];
+    let mut tinfo: std::collections::HashMap<u32, Thin> = std::collections::HashMap::new();
+    let mut count = 1 + tstate[0] as usize * extra;
     if let Some(k) = k_target {
-        while count < k {
-            let Some((_, std::cmp::Reverse(i))) = heap.pop() else {
-                break;
-            };
-            split(&mut nodes, &mut fcells, i as usize, &mut kids);
-            count += kids.len() - 1;
-            for &c in &kids {
-                let n = &nodes[c as usize];
-                if n.level == DEPTH {
-                    leaves.push(c);
-                } else {
-                    heap.push((err(&n.st, n.level).0.to_bits(), std::cmp::Reverse(c)));
+        loop {
+            while count < k {
+                let Some((_, std::cmp::Reverse(i))) = heap.pop() else {
+                    break;
+                };
+                if matches!(tstate[i as usize], 1 | 2) {
+                    count -= extra;
                 }
+                tstate[i as usize] = 0;
+                split(&mut nodes, &mut fcells, i as usize, &mut kids);
+                count += kids.len() - 1;
+                for &c in &kids {
+                    let n = &nodes[c as usize];
+                    let t = reserve(n);
+                    tstate.push(t);
+                    count += t as usize * extra;
+                    if n.level == DEPTH {
+                        leaves.push(c);
+                    } else {
+                        heap.push((err(&n.st, n.level).0.to_bits(), std::cmp::Reverse(c)));
+                    }
+                }
+            }
+            let pending: Vec<u32> = heap
+                .iter()
+                .map(|x| x.1.0)
+                .chain(leaves.iter().copied())
+                .filter(|&i| tstate[i as usize] == 1)
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            let thr = heap.peek().map_or(0.0, |x| f64::from_bits(x.0));
+            let found: Vec<Option<Thin>> = pending
+                .par_iter()
+                .map(|&i| {
+                    let n = &nodes[i as usize];
+                    verify(fcells[n.fs as usize].s, fcells[n.fe as usize - 1].e, n, thr)
+                })
+                .collect();
+            let mut freed = false;
+            for (&i, f) in pending.iter().zip(found) {
+                if let Some(t) = f {
+                    tstate[i as usize] = 2;
+                    tinfo.insert(i, t);
+                } else {
+                    tstate[i as usize] = 3;
+                    count -= extra;
+                    freed = true;
+                }
+            }
+            if !freed {
+                break;
             }
         }
     }
@@ -990,6 +1195,10 @@ fn realtime_pass(
                 continue;
             }
             split(&mut nodes, &mut fcells, i as usize, &mut kids);
+            tstate.resize(nodes.len(), 0);
+            for &c in &kids {
+                tstate[c as usize] = reserve(&nodes[c as usize]);
+            }
             rest.extend_from_slice(&kids);
         }
     } else {
@@ -1004,17 +1213,44 @@ fn realtime_pass(
         })
         .collect();
     cells.sort_unstable_by_key(|c| c.0);
-    let ncell = cells.len();
+    // Thin parts: a leaf cell holding a tube or strut narrower than the cell would fall to
+    // one point and the part would vanish. Such a cell is cut into sectors around the part's
+    // axis, each its own cell, so the part keeps a cross-section.
+    let thin: Vec<Option<Thin>> = cells
+        .par_iter()
+        .map(|&(s, e, i)| match tstate[i as usize] {
+            2 => Some(tinfo[&i]),
+            1 => verify(s, e, &nodes[i as usize], 0.0),
+            _ => None,
+        })
+        .collect();
+    let nsplit = thin.iter().filter(|t| t.is_some()).count();
+    if prof {
+        eprintln!("  thin cells {nsplit} of {}", cells.len());
+    }
+    let ncell = cells.len() + nsplit * extra;
     let mut cellr = vec![0u32; nv];
     let mut cell_st: Vec<[f64; NS]> = Vec::with_capacity(ncell);
     let mut chunks: Vec<[usize; 4]> = Vec::new();
-    let mut c0 = 0;
-    for (c, &(s, e, i)) in cells.iter().enumerate() {
-        cellr[s as usize..e as usize].fill(c as u32);
-        cell_st.push(nodes[i as usize].st);
-        if e as usize >= (chunks.len() + 1) * csize || c + 1 == ncell {
-            chunks.push([cells[c0].0 as usize, e as usize, c0, c + 1]);
-            c0 = c + 1;
+    let (mut r0, mut c0) = (0usize, 0usize);
+    for (k, &(s, e, i)) in cells.iter().enumerate() {
+        let c = cell_st.len();
+        if let Some((d, d2, cen)) = thin[k] {
+            let mut two = [[0f32; NS]; THIN_SECTORS];
+            for r in s as usize..e as usize {
+                let p = spos[r];
+                let side = sector_of(p, &(d, d2, cen));
+                cellr[r] = (c + side) as u32;
+                vstats(&mut two[side], &vq(r), &vs[r], p);
+            }
+            cell_st.extend(two.iter().map(|t| t.map(|x| x as f64)));
+        } else {
+            cellr[s as usize..e as usize].fill(c as u32);
+            cell_st.push(nodes[i as usize].st);
+        }
+        if e as usize >= (chunks.len() + 1) * csize || k + 1 == cells.len() {
+            chunks.push([r0, e as usize, c0, cell_st.len()]);
+            (r0, c0) = (e as usize, cell_st.len());
         }
     }
     drop(cells);
