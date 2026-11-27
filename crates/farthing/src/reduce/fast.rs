@@ -572,7 +572,13 @@ pub(crate) fn simplify_fast(
             }
             limit
         };
-        cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
+        // Keys are distinct (one candidate per edge), so any sort gives the same order.
+        if cands.len() < PAR_MIN {
+            cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
+        } else {
+            use rayon::prelude::*;
+            cands.par_sort_unstable_by_key(|c| (c.0, c.1, c.2));
+        }
         let mut done = 0;
         for &(cb, p, q, g2) in &cands {
             if target.is_some_and(|t| alive_tris <= t) {
