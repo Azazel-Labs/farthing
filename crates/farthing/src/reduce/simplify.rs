@@ -4166,22 +4166,31 @@ fn simplify_clustered(
             .clamp(glam::Vec3::ZERO, glam::Vec3::splat(1023.0));
         spread10(c.x as u32) | (spread10(c.y as u32) << 1) | (spread10(c.z as u32) << 2)
     };
-    let mut order: Vec<u32> = (0..tc as u32).collect();
-    order.par_sort_unstable_by_key(|&t| (code(t as usize), t));
+    // Keys are worked out once and sorted with their index (unique, so the order is the same
+    // as sorting by key on the fly).
+    let mut keyed: Vec<(u64, u32)> = (0..tc as u32)
+        .into_par_iter()
+        .map(|t| (code(t as usize), t))
+        .collect();
+    keyed.par_sort_unstable();
+    let order: Vec<u32> = keyed.into_iter().map(|(_, t)| t).collect();
     let k = tc.div_ceil(CLUSTER_TRIS);
     let chunk = tc.div_ceil(k);
     // 2. Positions used by more than one cluster are locked during the parallel phase.
-    let key = |v: usize| mesh.positions[v].to_array().map(f32::to_bits);
-    let mut vorder: Vec<u32> = (0..vc as u32).collect();
-    vorder.par_sort_unstable_by_key(|&v| (key(v as usize), v));
+    let mut vkeyed: Vec<([u32; 3], u32)> = (0..vc as u32)
+        .into_par_iter()
+        .map(|v| (mesh.positions[v as usize].to_array().map(f32::to_bits), v))
+        .collect();
+    vkeyed.par_sort_unstable();
     let mut group = vec![0u32; vc];
     let mut ng = 0u32;
-    for (i, &v) in vorder.iter().enumerate() {
-        if i > 0 && key(vorder[i - 1] as usize) != key(v as usize) {
+    for (i, &(key, v)) in vkeyed.iter().enumerate() {
+        if i > 0 && vkeyed[i - 1].0 != key {
             ng += 1;
         }
         group[v as usize] = ng;
     }
+    drop(vkeyed);
     let mut gcl = vec![u32::MAX; ng as usize + 1];
     let mut gborder = vec![false; ng as usize + 1];
     for (i, &t) in order.iter().enumerate() {
