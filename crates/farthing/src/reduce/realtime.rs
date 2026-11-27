@@ -23,7 +23,7 @@
 //!    and flip checks. Each live cluster has at most one heap entry, keyed by a geometry-only
 //!    lower bound and checked exactly when it surfaces, so most neighbors a collapse touches
 //!    are never costed again.
-//! 4. **Finish.** Each remaining free cluster moves along its surface normal to the minimum
+//! 4. **Finish.** Each remaining unlocked cluster moves along its surface normal to the minimum
 //!    of its summed quadric (never sideways, which would slide the texture under attributes
 //!    copied from one member), and each output normal is the area-weighted mean over every
 //!    input vertex merged into its wedge.
@@ -56,6 +56,10 @@ const RETRIES: usize = 2;
 /// Cost factor of a collapse that removes a folded triangle, so the tail takes folds out
 /// before anything else.
 const FOLD_BIAS: f32 = 1e-3;
+/// A wedge with no partner across a collapsed edge is kept, not merged into the nearest
+/// wedge, when its normal differs from that one's by more than this (squared difference of
+/// unit normals; 0.25 is about 29 degrees): a hard edge.
+const HARD_EDGE: f32 = 0.25;
 /// Weight of the normal-cone term (opposite sheets in one cell) against quadric error.
 const NORMAL_KAPPA: f64 = 0.125;
 /// Share of `max_error` stage one may use, leaving the tail room to collapse.
@@ -69,6 +73,8 @@ const COLOR_SCALE: f32 = 1e-3;
 /// its shortest edge.
 const RELAX_RIDGE: f64 = 1e-3;
 const RELAX_REACH: f32 = 0.25;
+/// The least move the position solve makes, as a share of the shortest edge, squared.
+const RELAX_LEAST: f32 = 1e-10;
 /// Bit of a sort key where the 30-bit Morton code starts; below it, a position hash and
 /// the vertex index share the rest.
 const CODE_SHIFT: u32 = 34;
@@ -656,7 +662,12 @@ fn realtime_pass(
     let ends: Vec<[u32; 2]> = (0..first_at.len())
         .into_par_iter()
         .with_min_len(PAR_MIN)
-        .map(|r| fan_ends(r, &vs[r], nv).map_or(NONE, |e| e.map(|x| first_at[x])))
+        .map(|r| {
+            let e = fan_ends(r, &vs[r], nv).map_or(NONE, |e| e.map(|x| first_at[x]));
+            // Both ends at one position: a seam ends at this vertex, and its fan closes
+            // across the seam's two sides. Not a border.
+            if e[0] == e[1] { NONE } else { e }
+        })
         .collect();
     drop(first_at);
     let borders: Vec<[u32; 2]> = (0..ends.len())
@@ -1385,6 +1396,7 @@ fn realtime_pass(
         warea,
         attr,
         dim,
+        nd2: if nd > 0 { nwt * nwt } else { 0.0 },
         avg_area,
         locked: clocked,
         side: vec![[u32::MAX; 2]; nc],
@@ -1428,7 +1440,11 @@ fn realtime_pass(
     let source_vertex: Vec<u32> = srcs.iter().map(|&w| wsrc[w as usize]).collect();
     let mut out = mesh.select_vertices(&source_vertex);
     for (o, &w) in srcs.iter().enumerate() {
-        let c = wc[w as usize] as usize;
+        // A wedge kept across a hard edge stands where its cluster ended up.
+        let mut c = wc[w as usize] as usize;
+        while cremap[c] as usize != c {
+            c = cremap[c] as usize;
+        }
         out.positions[o] = if moved[c] {
             st.cpos[c] * diag + center
         } else {
@@ -1549,6 +1565,8 @@ struct Tail {
     warea: Vec<f32>,
     attr: Vec<f32>,
     dim: usize,
+    /// Squared scale of the normals, a wedge's first three attributes (0: no normals).
+    nd2: f32,
     avg_area: f64,
     locked: Vec<bool>,
     /// The two neighbors along open-border or non-manifold edges a constrained cluster may
@@ -1586,10 +1604,12 @@ impl Tail {
                 self.slen[x] += 1;
             }
         }
-        // Open-border edges (one face) and junctions (more than two), as in the fast reducer:
-        // border clusters slide along their border, junction clusters along their junction,
-        // and clusters on both, or on more than two such edges, stay put. Each cluster
-        // counts its own edges from its triangles (twins left out), in parallel.
+        // Open-border edges (one face) and junctions (more than two): border clusters slide
+        // along their border, junction clusters along their junction, and clusters on more
+        // than two such edges stay put. A cluster on both slides along its border: after
+        // clustering most junctions are thin parts pressed flat, and locking every cluster
+        // where one meets a border left the tail the good clusters to take instead. Each
+        // cluster counts its own edges from its triangles (twins left out), in parallel.
         let this = &*self;
         let class: Vec<([u32; 2], u8, bool)> = (0..nc as u32)
             .into_par_iter()
@@ -1615,13 +1635,11 @@ impl Tail {
                     }
                     *d = d.saturating_add(1);
                 }
-                let mut lock = bdeg > 0 && jdeg > 0;
-                if !lock && jdeg > 0 {
+                if bdeg == 0 && jdeg > 0 {
                     bdeg = jdeg;
                     side = jside;
                 }
-                lock |= bdeg > 2;
-                (side, bdeg, lock)
+                (side, bdeg, bdeg > 2)
             })
             .collect();
         for (a, (side, sdeg, lock)) in class.into_iter().enumerate() {
@@ -1637,15 +1655,16 @@ impl Tail {
         &self.pool[o..o + self.slen[p as usize] as usize]
     }
 
-    /// Moves each remaining free cluster to the minimum of its summed quadric (it has stood
-    /// at one of its member vertices so far), where that stays inside its neighborhood and
-    /// turns no triangle. Returns which clusters moved.
+    /// Moves each remaining cluster that is not locked to the minimum of its summed quadric
+    /// (it has stood at one of its member vertices so far), where that stays inside its
+    /// neighborhood and turns no triangle. Border clusters move too: the move is along the
+    /// surface normal, which their border planes contain. Returns which clusters moved.
     fn relax(&mut self, cremap: &[u32], min_dot: f32) -> Vec<bool> {
         let nc = self.cpos.len();
         let mut moved = vec![false; nc];
         let mut star: Vec<([Vec3; 3], Vec3, usize)> = Vec::new();
         for c in 0..nc {
-            if cremap[c] != c as u32 || self.locked[c] || self.sdeg[c] != 0 {
+            if cremap[c] != c as u32 || self.locked[c] {
                 continue;
             }
             let p = self.cpos[c];
@@ -1715,7 +1734,10 @@ impl Tail {
                     break;
                 }
             }
-            if !ok || (np - p).length_squared() > RELAX_REACH * RELAX_REACH * short2 {
+            // A move too small to see is not made, so a cluster already in place keeps its
+            // member's exact position (a flat sheet's outline, a border shared with a neighbor).
+            let d2 = (np - p).length_squared();
+            if !ok || d2 > RELAX_REACH * RELAX_REACH * short2 || d2 <= RELAX_LEAST * short2 {
                 continue;
             }
             self.cpos[c] = np;
@@ -1767,7 +1789,9 @@ impl Tail {
 
     /// Wedge map p→q (wedges of p in triangles shared with q take q's wedge there, the rest
     /// the nearest of those) and its attribute cost, from p's gathered triangles; None when p
-    /// and q share no triangle.
+    /// and q share no triangle. A wedge of the rest whose nearest lies across a hard edge
+    /// maps to itself: it moves to q as it is, at the same cost, so the faces on its side
+    /// keep their own normal.
     fn wedge_map(&self, loc: &[Corner], q: u32, out: &mut Vec<(u32, u32)>) -> Option<f32> {
         out.clear();
         let mut pws: [u32; 8] = [u32::MAX; 8];
@@ -1791,6 +1815,10 @@ impl Tail {
             return None;
         }
         let shared = out.len();
+        let mut cost = out
+            .iter()
+            .map(|&(pw, qw)| self.warea[pw as usize] * self.adist(pw, qw))
+            .sum::<f32>();
         for &pw in &pws[..np] {
             if out[..shared].iter().any(|&(a, _)| a == pw) {
                 continue;
@@ -1800,14 +1828,17 @@ impl Tail {
                 .map(|&(_, qw)| (self.adist(pw, qw), qw))
                 .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
                 .unwrap();
-            out.push((pw, best.1));
+            cost += self.warea[pw as usize] * best.0;
+            let d = self.dim;
+            let (x, y) = (pw as usize * d, best.1 as usize * d);
+            let hard = self.nd2 > 0.0
+                && (0..3)
+                    .map(|k| (self.attr[x + k] - self.attr[y + k]).powi(2))
+                    .sum::<f32>()
+                    > HARD_EDGE * self.nd2;
+            out.push((pw, if hard { pw } else { best.1 }));
         }
-        Some(
-            out.iter()
-                .map(|&(pw, qw)| self.warea[pw as usize] * self.adist(pw, qw))
-                .sum::<f32>()
-                / self.avg_area as f32,
-        )
+        Some(cost / self.avg_area as f32)
     }
 
     /// Whether p has anywhere to go at all: not locked, and if constrained, a side to slide to.
@@ -1954,8 +1985,10 @@ impl Tail {
     /// Moves p onto q; returns the triangles removed.
     fn collapse(&mut self, p: u32, q: u32, map: &[(u32, u32)]) -> usize {
         for &(pw, qw) in map {
-            let a = self.warea[pw as usize];
-            self.warea[qw as usize] += a;
+            if pw != qw {
+                let a = self.warea[pw as usize];
+                self.warea[qw as usize] += a;
+            }
         }
         let mut removed = 0;
         let (po, pl) = (
