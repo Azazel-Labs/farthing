@@ -109,8 +109,10 @@ const PAR_MIN: usize = 4096;
 /// Refinement sums: quadric (10), area, area-weighted normal (3), area-weighted position (3).
 const NS: usize = 17;
 type Q = [f64; 10];
-/// A thin cell's split: its two cross-section directions and its centroid.
-type Thin = ([f64; 3], [f64; 3], [f64; 3]);
+/// A thin cell's axes: its two cross-section directions and its centroid.
+type Axes = ([f64; 3], [f64; 3], [f64; 3]);
+/// A thin cell's split: its axes and the refinement sums of its sectors.
+type Thin = (Axes, [[f32; NS]; THIN_SECTORS]);
 
 #[inline]
 fn plane(n: Vec3, d: f32, w: f32) -> [f32; 10] {
@@ -964,7 +966,7 @@ fn realtime_pass(
         s2 >= THIN_SPREAD * t * t
     };
     // The sector of a thin cell a position falls in, by its angle around the part's axis.
-    let sector_of = |p: Vec3, t: &Thin| -> usize {
+    let sector_of = |p: Vec3, t: &Axes| -> usize {
         let (d, d2, cen) = t;
         let q = [
             p.x as f64 - cen[0],
@@ -982,7 +984,10 @@ fn realtime_pass(
     // octree split removes at the current refinement threshold.
     let verify = |s: u32, e: u32, n: &Node, thr: f64| -> Option<Thin> {
         let st = &n.st;
-        if e - s < THIN_MIN_VERTS || !cheap_thin(st, n.level) {
+        // The split removes at most the cell's whole error.
+        let before = err(st, n.level).0;
+        let need = THIN_GAIN * thr * (THIN_SECTORS - 1) as f64;
+        if e - s < THIN_MIN_VERTS || before < need || !cheap_thin(st, n.level) {
             return None;
         }
         // Not on an open border: its clusters keep their members' positions there, so a mesh
@@ -1039,8 +1044,7 @@ fn realtime_pass(
             .iter()
             .map(|p| err(&p.map(|x| x as f64), n.level).0)
             .sum();
-        let gain = err(st, n.level).0 - after;
-        (gain >= THIN_GAIN * thr * (THIN_SECTORS - 1) as f64).then_some(t)
+        (before - after >= need).then_some((t, parts))
     };
     let mut nodes: Vec<Node> = Vec::with_capacity(k_target.unwrap_or(1024) * 2);
     {
@@ -1235,15 +1239,11 @@ fn realtime_pass(
     let (mut r0, mut c0) = (0usize, 0usize);
     for (k, &(s, e, i)) in cells.iter().enumerate() {
         let c = cell_st.len();
-        if let Some((d, d2, cen)) = thin[k] {
-            let mut two = [[0f32; NS]; THIN_SECTORS];
+        if let Some((t, parts)) = &thin[k] {
             for r in s as usize..e as usize {
-                let p = spos[r];
-                let side = sector_of(p, &(d, d2, cen));
-                cellr[r] = (c + side) as u32;
-                vstats(&mut two[side], &vq(r), &vs[r], p);
+                cellr[r] = (c + sector_of(spos[r], t)) as u32;
             }
-            cell_st.extend(two.iter().map(|t| t.map(|x| x as f64)));
+            cell_st.extend(parts.iter().map(|p| p.map(|x| x as f64)));
         } else {
             cellr[s as usize..e as usize].fill(c as u32);
             cell_st.push(nodes[i as usize].st);
