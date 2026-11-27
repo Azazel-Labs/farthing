@@ -1984,6 +1984,8 @@ impl Tail {
             }
         }
         let qp = &self.cq[p as usize];
+        // Most stars hold no fold; then no candidate needs checking for one.
+        let any_fold = s.loc.iter().any(|k| k.fold);
         s.cand.clear();
         for &q in s.nbr.iter() {
             if !self.can(p, q) {
@@ -1999,12 +2001,17 @@ impl Tail {
                 continue;
             }
             // A collapse that takes a fold out goes ahead of every ordinary one.
-            let fixes = s.loc.iter().any(|k| k.fold && k.c.contains(&q));
+            let fixes = any_fold && s.loc.iter().any(|k| k.fold && k.c.contains(&q));
             let g = (raw / self.avg_area) as f32;
-            s.cand.push((if fixes { g * FOLD_BIAS } else { g }, q, g2));
+            s.cand
+                .push((if fixes { g * FOLD_BIAS } else { g }, q, g2, fixes));
         }
         if !exact {
-            return s.cand.iter().copied().min_by(|a, b| a.0.total_cmp(&b.0));
+            return s
+                .cand
+                .iter()
+                .map(|c| (c.0, c.1, c.2))
+                .min_by(|a, b| a.0.total_cmp(&b.0));
         }
         // Cheapest geometry first; the attribute cost only adds, so stop once geometry alone
         // costs more than the best found.
@@ -2018,7 +2025,7 @@ impl Tail {
             .map(|k| k.w[k.i as usize])
             .filter(|&w| s.loc.iter().all(|k| k.w[k.i as usize] == w));
         let mut best: Option<(f32, u32, f32)> = None;
-        for &(g, q, g2) in s.cand.iter() {
+        for &(g, q, g2, fixes) in s.cand.iter() {
             if best.is_some_and(|b| g >= b.0) {
                 break;
             }
@@ -2033,7 +2040,6 @@ impl Tail {
             let Some(ac) = ac else {
                 continue;
             };
-            let fixes = s.loc.iter().any(|k| k.fold && k.c.contains(&q));
             let c = g + if fixes { ac * FOLD_BIAS } else { ac };
             if best.is_none_or(|b| c < b.0) {
                 best = Some((c, q, g2));
@@ -2284,7 +2290,7 @@ struct Scratch {
     mark: Vec<u32>,
     epoch: u32,
     nbr: Vec<u32>,
-    cand: Vec<(f32, u32, f32)>,
+    cand: Vec<(f32, u32, f32, bool)>,
     map: Vec<(u32, u32)>,
     loc: Vec<Corner>,
 }
