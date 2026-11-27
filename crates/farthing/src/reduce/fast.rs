@@ -461,7 +461,9 @@ pub(crate) fn simplify_fast(
     let mut bits: Vec<u32> = Vec::new();
     let mut map: Vec<(u32, u32)> = Vec::new();
     let mut stall = 0;
-    let mut parts: Option<Option<crate::reduce::parts::Parts>> = None;
+    // Collapses are stuck above the target: take a part before the next pass.
+    let mut stuck = false;
+    type Analyzed = Option<Option<crate::reduce::parts::Parts>>;
     let analyze = || {
         crate::reduce::parts::Parts::analyze(
             mesh,
@@ -470,192 +472,216 @@ pub(crate) fn simplify_fast(
         )
     };
 
-    loop {
-        if target.is_some_and(|t| alive_tris <= t) {
-            break;
-        }
-        // Near an aggressive target, parts whose removal moves the surface less than a quarter of
-        // the deviation collapses have accepted go (the full reducer's rule); analyzed on first
-        // need.
-        if let Some(t) =
-            target.filter(|&t| opts.remove_parts && alive_tris <= 4 * t && 10 * t <= nt)
-            && let Some(parts) = parts.get_or_insert_with(analyze).as_mut()
-        {
-            let thr = 0.25 * worst2.sqrt() * diag;
-            while let Some((n, e)) = take_part(
-                &mut st,
-                parts,
-                thr,
-                opts.max_error,
-                alive_tris,
-                t,
-                &mut pos_alive,
-            ) {
+    // The passes. Parts are analyzed on first need, or, with `ahead`, by the caller while the
+    // passes run: then the passes stop where they first need them (returning false).
+    let mut passes = |parts: &mut Analyzed, ahead: bool| -> bool {
+        loop {
+            if stuck {
+                // Same rule as the full reducer: cheapest visible removal error first, the floor,
+                // and visible-part protection.
+                let Some(t) = target else { break };
+                if ahead {
+                    return false;
+                }
+                stuck = false;
+                let parts = parts.get_or_insert_with(analyze);
+                let Some(parts) = parts.as_mut() else { break };
+                let limit = if opts.part_protection > 0.0 {
+                    (opts.part_protection * diag).max(0.25 * worst2.sqrt() * diag)
+                } else {
+                    f32::INFINITY
+                };
+                let floor = t.saturating_sub(alive_tris - t);
+                let Some((n, e)) = take_part(
+                    &mut st,
+                    parts,
+                    limit,
+                    opts.max_error,
+                    alive_tris,
+                    floor,
+                    &mut pos_alive,
+                ) else {
+                    break;
+                };
                 alive_tris -= n;
                 part_err2 = part_err2.max((e / diag) * (e / diag));
+                stall = 0;
             }
-        }
-        pass += 1;
-        st.rebuild_stars(nt);
-        // Every edge with an allowed direction, its geometric costs first (cheap). Large
-        // meshes gather them on all threads, in the same order.
-        edges.clear();
-        if np < PAR_MIN {
-            for p in 0..np as u32 {
-                st.edges_at(p, &pos_alive, &mut edges);
-            }
-        } else {
-            use rayon::prelude::*;
-            edges.par_extend(
-                (0..np as u32)
-                    .into_par_iter()
-                    .with_min_len(PAR_MIN / 4)
-                    .fold(Vec::new, |mut out, p| {
-                        st.edges_at(p, &pos_alive, &mut out);
-                        out
-                    })
-                    .flatten_iter(),
-            );
-        }
-        if edges.is_empty() {
-            break;
-        }
-        let needed = target.map_or(edges.len(), |t| {
-            alive_tris.saturating_sub(t).div_ceil(2).max(1)
-        });
-        // Pass cost limit (see PASS_SHARE, PASS_LIMIT): passes stay close to cost order. It
-        // depends on the m-th cheapest full cost, and a candidate's full cost is at least its
-        // geometric one, so only the edges whose geometric cost is under the limit get their
-        // attribute cost (see `Edge`).
-        let m = needed
-            .min((edges.len() as f32 * PASS_SHARE).ceil() as usize)
-            .clamp(1, edges.len());
-        cands.clear();
-        let mut costed = 0;
-        let limit = if stall > 0 {
-            cost_edges(
-                &st,
-                &mut edges,
-                &mut costed,
-                f32::INFINITY,
-                &mut cands,
-                &mut map,
-            );
-            f32::INFINITY
-        } else {
-            // The m-th smallest of `bits` as a cost.
-            let nth = |bits: &mut Vec<u32>| f32::from_bits(*bits.select_nth_unstable(m - 1).1);
-            // The m-th cheapest geometric cost is a lower bound on the m-th cheapest full
-            // cost, so twice it is under the limit.
-            bits.clear();
-            bits.extend(edges.iter().map(|e| e.low.to_bits()));
-            let mut upto = nth(&mut bits) * PASS_LIMIT + 1e-12;
-            let mth = loop {
-                cost_edges(&st, &mut edges, &mut costed, upto, &mut cands, &mut map);
-                // The edges not costed yet cost more than `upto`, so with m costed candidates
-                // at or under it, the m-th cheapest is among them.
-                let under = cands.iter().filter(|c| c.0 <= upto.to_bits()).count();
-                bits.clear();
-                bits.extend(cands.iter().map(|c| c.0));
-                if under >= m || costed == edges.len() {
-                    break nth(&mut bits);
-                }
-                // Otherwise the m-th cheapest is at least the m-th of the known costs and the
-                // lower bounds left, again within the limit.
-                bits.extend(edges[costed..].iter().map(|e| e.low.to_bits()));
-                let next = nth(&mut bits) * PASS_LIMIT + 1e-12;
-                upto = if next > upto { next } else { f32::INFINITY };
-            };
-            let limit = mth * PASS_LIMIT + 1e-12;
-            if limit > upto {
-                cost_edges(&st, &mut edges, &mut costed, limit, &mut cands, &mut map);
-            }
-            limit
-        };
-        // Keys are distinct (one candidate per edge), so any sort gives the same order.
-        if cands.len() < PAR_MIN {
-            cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
-        } else {
-            use rayon::prelude::*;
-            cands.par_sort_unstable_by_key(|c| (c.0, c.1, c.2));
-        }
-        let mut done = 0;
-        for &(cb, p, q, g2) in &cands {
             if target.is_some_and(|t| alive_tris <= t) {
                 break;
             }
-            if f32::from_bits(cb) > limit {
+            // Near an aggressive target, parts whose removal moves the surface less than a quarter of
+            // the deviation collapses have accepted go (the full reducer's rule).
+            let near = target.filter(|&t| opts.remove_parts && alive_tris <= 4 * t && 10 * t <= nt);
+            if near.is_some() && ahead {
+                return false;
+            }
+            if let Some(t) = near
+                && let Some(parts) = parts.get_or_insert_with(analyze).as_mut()
+            {
+                let thr = 0.25 * worst2.sqrt() * diag;
+                while let Some((n, e)) = take_part(
+                    &mut st,
+                    parts,
+                    thr,
+                    opts.max_error,
+                    alive_tris,
+                    t,
+                    &mut pos_alive,
+                ) {
+                    alive_tris -= n;
+                    part_err2 = part_err2.max((e / diag) * (e / diag));
+                }
+            }
+            pass += 1;
+            st.rebuild_stars(nt);
+            // Every edge with an allowed direction, its geometric costs first (cheap). Large
+            // meshes gather them on all threads, in the same order.
+            edges.clear();
+            if np < PAR_MIN {
+                for p in 0..np as u32 {
+                    st.edges_at(p, &pos_alive, &mut edges);
+                }
+            } else {
+                use rayon::prelude::*;
+                edges.par_extend(
+                    (0..np as u32)
+                        .into_par_iter()
+                        .with_min_len(PAR_MIN / 4)
+                        .fold(Vec::new, |mut out, p| {
+                            st.edges_at(p, &pos_alive, &mut out);
+                            out
+                        })
+                        .flatten_iter(),
+                );
+            }
+            if edges.is_empty() {
                 break;
             }
-            if max_err2.is_some_and(|m| g2 > m)
-                || used[p as usize] == pass
-                || used[q as usize] == pass
-                || !pos_alive[p as usize]
-                || !pos_alive[q as usize]
-            {
-                continue;
-            }
-            if !st.link_ok(p, q, &mut mark, &mut epoch) || !st.no_flip(p, q, opts.min_face_dot) {
-                continue;
-            }
-            st.wedge_map(p, q, &mut map);
-            for &(pw, qw) in &map {
-                if pw == qw {
-                    wpos[pw as usize] = q; // carried
-                } else {
-                    wremap[pw as usize] = qw;
-                }
-            }
-            alive_tris -= st.collapse(p, q, &map);
-            pos_alive[p as usize] = false;
-            premap[p as usize] = q;
-            worst2 = worst2.max(g2);
-            collapses += 1;
-            done += 1;
-            // q's triangle list is now stale and p is gone: neither takes part again this pass.
-            used[p as usize] = pass;
-            used[q as usize] = pass;
-        }
-        if done == 0 {
-            stall += 1;
-            if stall > 1 {
-                // Collapses are stuck above the target (closed parts that cannot shrink
-                // further): delete the smallest parts by area and go on.
-                match target {
-                    Some(t) if alive_tris > t && opts.remove_parts => {
-                        // Same rule as the full reducer: cheapest visible removal error first,
-                        // the floor, and visible-part protection.
-                        let parts = parts.get_or_insert_with(analyze);
-                        let Some(parts) = parts.as_mut() else { break };
-                        let limit = if opts.part_protection > 0.0 {
-                            (opts.part_protection * diag).max(0.25 * worst2.sqrt() * diag)
-                        } else {
-                            f32::INFINITY
-                        };
-                        let floor = t.saturating_sub(alive_tris - t);
-                        let Some((n, e)) = take_part(
-                            &mut st,
-                            parts,
-                            limit,
-                            opts.max_error,
-                            alive_tris,
-                            floor,
-                            &mut pos_alive,
-                        ) else {
-                            break;
-                        };
-                        alive_tris -= n;
-                        part_err2 = part_err2.max((e / diag) * (e / diag));
-                        stall = 0;
+            let needed = target.map_or(edges.len(), |t| {
+                alive_tris.saturating_sub(t).div_ceil(2).max(1)
+            });
+            // Pass cost limit (see PASS_SHARE, PASS_LIMIT): passes stay close to cost order. It
+            // depends on the m-th cheapest full cost, and a candidate's full cost is at least its
+            // geometric one, so only the edges whose geometric cost is under the limit get their
+            // attribute cost (see `Edge`).
+            let m = needed
+                .min((edges.len() as f32 * PASS_SHARE).ceil() as usize)
+                .clamp(1, edges.len());
+            cands.clear();
+            let mut costed = 0;
+            let limit = if stall > 0 {
+                cost_edges(
+                    &st,
+                    &mut edges,
+                    &mut costed,
+                    f32::INFINITY,
+                    &mut cands,
+                    &mut map,
+                );
+                f32::INFINITY
+            } else {
+                // The m-th smallest of `bits` as a cost.
+                let nth = |bits: &mut Vec<u32>| f32::from_bits(*bits.select_nth_unstable(m - 1).1);
+                // The m-th cheapest geometric cost is a lower bound on the m-th cheapest full
+                // cost, so twice it is under the limit.
+                bits.clear();
+                bits.extend(edges.iter().map(|e| e.low.to_bits()));
+                let mut upto = nth(&mut bits) * PASS_LIMIT + 1e-12;
+                let mth = loop {
+                    cost_edges(&st, &mut edges, &mut costed, upto, &mut cands, &mut map);
+                    // The edges not costed yet cost more than `upto`, so with m costed candidates
+                    // at or under it, the m-th cheapest is among them.
+                    let under = cands.iter().filter(|c| c.0 <= upto.to_bits()).count();
+                    bits.clear();
+                    bits.extend(cands.iter().map(|c| c.0));
+                    if under >= m || costed == edges.len() {
+                        break nth(&mut bits);
                     }
-                    _ => break,
+                    // Otherwise the m-th cheapest is at least the m-th of the known costs and the
+                    // lower bounds left, again within the limit.
+                    bits.extend(edges[costed..].iter().map(|e| e.low.to_bits()));
+                    let next = nth(&mut bits) * PASS_LIMIT + 1e-12;
+                    upto = if next > upto { next } else { f32::INFINITY };
+                };
+                let limit = mth * PASS_LIMIT + 1e-12;
+                if limit > upto {
+                    cost_edges(&st, &mut edges, &mut costed, limit, &mut cands, &mut map);
                 }
+                limit
+            };
+            // Keys are distinct (one candidate per edge), so any sort gives the same order.
+            if cands.len() < PAR_MIN {
+                cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
+            } else {
+                use rayon::prelude::*;
+                cands.par_sort_unstable_by_key(|c| (c.0, c.1, c.2));
             }
-        } else if done * PASS_STUCK < m && m * 8 < edges.len() {
-            stall = 1;
-        } else {
-            stall = 0;
+            let mut done = 0;
+            for &(cb, p, q, g2) in &cands {
+                if target.is_some_and(|t| alive_tris <= t) {
+                    break;
+                }
+                if f32::from_bits(cb) > limit {
+                    break;
+                }
+                if max_err2.is_some_and(|m| g2 > m)
+                    || used[p as usize] == pass
+                    || used[q as usize] == pass
+                    || !pos_alive[p as usize]
+                    || !pos_alive[q as usize]
+                {
+                    continue;
+                }
+                if !st.link_ok(p, q, &mut mark, &mut epoch) || !st.no_flip(p, q, opts.min_face_dot)
+                {
+                    continue;
+                }
+                st.wedge_map(p, q, &mut map);
+                for &(pw, qw) in &map {
+                    if pw == qw {
+                        wpos[pw as usize] = q; // carried
+                    } else {
+                        wremap[pw as usize] = qw;
+                    }
+                }
+                alive_tris -= st.collapse(p, q, &map);
+                pos_alive[p as usize] = false;
+                premap[p as usize] = q;
+                worst2 = worst2.max(g2);
+                collapses += 1;
+                done += 1;
+                // q's triangle list is now stale and p is gone: neither takes part again this pass.
+                used[p as usize] = pass;
+                used[q as usize] = pass;
+            }
+            if done == 0 {
+                stall += 1;
+                if stall > 1 {
+                    // Collapses are stuck above the target (closed parts that cannot shrink
+                    // further): delete the smallest parts by area (at the top of the loop) and go
+                    // on.
+                    match target {
+                        Some(t) if alive_tris > t && opts.remove_parts => stuck = true,
+                        _ => break,
+                    }
+                }
+            } else if done * PASS_STUCK < m && m * 8 < edges.len() {
+                stall = 1;
+            } else {
+                stall = 0;
+            }
         }
+        true
+    };
+    // Aggressive targets always need the parts: analyze them alongside the first passes.
+    if opts.remove_parts && target.is_some_and(|t| 10 * t <= nt) {
+        let (analyzed, done) = rayon::join(analyze, || passes(&mut None, true));
+        if !done {
+            passes(&mut Some(analyzed), false);
+        }
+    } else {
+        passes(&mut None, false);
     }
     let St { tris, alive, .. } = st;
 
