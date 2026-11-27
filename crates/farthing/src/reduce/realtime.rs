@@ -619,7 +619,12 @@ fn realtime_pass(
 
     // Face sums per vertex. A chunk owns its vertices' sums; corners past its end are handed
     // on and added after, in chunk order.
-    let mut vs = vec![VSum::default(); nv];
+    // Large arrays are filled in parallel, so their pages are first touched by every thread.
+    let mut vs: Vec<VSum> = (0..nv)
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|_| VSum::default())
+        .collect();
     let parts: Vec<(f64, usize, Vec<(u32, VSum)>)> = vs
         .par_chunks_mut(csize)
         .enumerate()
@@ -1001,7 +1006,11 @@ fn realtime_pass(
             .collect()
     });
     let mut cid = vec![0u32; nv];
-    let mut wbest = vec![(f32::INFINITY, u32::MAX); nv];
+    let mut wbest: Vec<(f32, u32)> = (0..nv)
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|_| (f32::INFINITY, u32::MAX))
+        .collect();
     let mut warea_v = vec![0f32; nv];
     let rends = || chunks.iter().map(|c| c[1]);
     let jobs: Vec<Chunk> = split_ends(&mut parent, rends())
@@ -1295,7 +1304,11 @@ fn realtime_pass(
     // Stage-two triangles over wedges; same-orientation duplicates go, opposite ones are
     // kept as double-sided twins.
     let nw_est = kept.len() * 3 / 2 + 16;
-    let mut wid = vec![u32::MAX; nv];
+    let mut wid: Vec<u32> = (0..nv)
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|_| u32::MAX)
+        .collect();
     let mut wsrc: Vec<u32> = Vec::with_capacity(nw_est);
     let mut wc: Vec<u32> = Vec::with_capacity(nw_est);
     let mut warea: Vec<f32> = Vec::with_capacity(nw_est);
