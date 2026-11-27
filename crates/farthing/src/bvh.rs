@@ -47,6 +47,14 @@ pub struct Bvh {
     pub triangles: Vec<[Vec3; 3]>,
 }
 
+/// Per node its parent (`u32::MAX` at the root) and per triangle the leaf that holds it (see
+/// [`Bvh::reaches`]).
+#[derive(Clone, Debug, Default)]
+pub struct Paths {
+    parent: Vec<u32>,
+    leaf: Vec<u32>,
+}
+
 const LEAF_SIZE: usize = 4;
 const BINS: usize = 12;
 
@@ -132,6 +140,54 @@ impl Bvh {
     ) -> Option<u32> {
         self.traverse(origin, dir, t_min, t_max, true, keep)
             .map(|h| h.triangle)
+    }
+
+    /// The way down to every triangle, for [`reaches`](Self::reaches).
+    pub fn paths(&self) -> Paths {
+        let mut parent = vec![u32::MAX; self.nodes.len()];
+        let mut leaf = vec![u32::MAX; self.triangles.len()];
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.count > 0 {
+                for &t in &self.order[n.first as usize..(n.first + n.count) as usize] {
+                    leaf[t as usize] = i as u32;
+                }
+            } else {
+                parent[n.first as usize] = i as u32;
+                parent[n.first as usize + 1] = i as u32;
+            }
+        }
+        Paths { parent, leaf }
+    }
+
+    /// True when triangle `tri` blocks the segment and every box on the way down to it lets the
+    /// segment through: then the any-hit search of [`occluded_where`](Self::occluded_where),
+    /// for any `keep` that accepts `tri`, reaches it unless it finds another hit first, and so
+    /// returns true.
+    pub fn reaches(
+        &self,
+        paths: &Paths,
+        origin: Vec3,
+        dir: Vec3,
+        t_min: f32,
+        t_max: f32,
+        tri: u32,
+    ) -> bool {
+        if !ray_triangle(origin, dir, &self.triangles[tri as usize])
+            .is_some_and(|(t, _, _)| t >= t_min && t <= t_max)
+        {
+            return false;
+        }
+        // The search tests each box with the segment as given until its first hit.
+        let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
+        let mut n = paths.leaf[tri as usize];
+        while n != u32::MAX {
+            let node = &self.nodes[n as usize];
+            if slab(origin, inv, node.min, node.max, t_min, t_max).is_none() {
+                return false;
+            }
+            n = paths.parent[n as usize];
+        }
+        true
     }
 
     /// Winding number of `origin` along the ray `dir`: over every triangle the ray crosses

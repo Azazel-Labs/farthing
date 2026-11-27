@@ -31,6 +31,7 @@ pub(crate) struct Parts {
     bvhs: Vec<Bvh>,
     /// All input triangles, for visibility rays, and the part of each.
     all: Bvh,
+    paths: crate::bvh::Paths,
     tri_part: Vec<u32>,
     /// Per input triangle: blocks visibility rays (not a transparent material).
     occluder: Vec<bool>,
@@ -57,6 +58,10 @@ struct Seen {
     state: Vec<u32>,
     /// Per hidden sample, per outward direction it tests, the part that blocked that ray.
     blockers: Vec<u32>,
+    /// Per direction of [`vis_dirs`], the triangle that last blocked a ray of this part's
+    /// samples, tried first for the next sample (neighboring samples are usually blocked by
+    /// the same triangle).
+    last: Vec<u32>,
 }
 
 const UNSEEN: u32 = u32::MAX;
@@ -131,6 +136,7 @@ impl Parts {
             normals,
             boxes,
             bvhs,
+            paths: all.paths(),
             all,
             tri_part: tri_part.iter().map(|&k| k as u32).collect(),
             occluder: input
@@ -151,6 +157,7 @@ impl Parts {
             .map(|s| Seen {
                 state: vec![UNSEEN; s.len()],
                 blockers: Vec::new(),
+                last: vec![u32::MAX; vis_dirs().len()],
             })
             .collect();
         let coarse: Vec<f32> = {
@@ -193,22 +200,36 @@ impl Parts {
     /// visible (see [`Seen`]).
     fn sample_visible(&self, k: usize, i: usize, (p, n): (Vec3, Vec3), seen: &mut Seen) -> bool {
         let eps = self.reach * 1e-6;
-        // The part whose triangle blocks the ray in direction d, if any.
-        let blocker = |d: Vec3| {
-            self.all
-                .first_occluder_where(p + n * eps, d, eps, self.reach, |t| {
-                    let j = self.tri_part[t as usize] as usize;
-                    j != k && !self.removed[j] && self.occluder[t as usize]
-                })
-                .map(|t| self.tri_part[t as usize])
+        let o = p + n * eps;
+        let blocks = |t: u32| {
+            let j = self.tri_part[t as usize] as usize;
+            j != k && !self.removed[j] && self.occluder[t as usize]
         };
-        let dirs = vis_dirs().iter().filter(|d| d.dot(n) > 0.2);
+        // The part whose triangle blocks the ray in direction `d` (index `di`), if any: the
+        // triangle that blocked this direction last if the full search is sure to find a hit
+        // (see `Bvh::reaches`), else what the search finds.
+        let blocker = |di: usize, d: Vec3, last: &mut [u32]| {
+            let t = last[di];
+            if t != u32::MAX && blocks(t) && self.all.reaches(&self.paths, o, d, eps, self.reach, t)
+            {
+                return Some(self.tri_part[t as usize]);
+            }
+            let t = self
+                .all
+                .first_occluder_where(o, d, eps, self.reach, blocks)?;
+            last[di] = t;
+            Some(self.tri_part[t as usize])
+        };
+        let dirs = vis_dirs()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.dot(n) > 0.2);
         match seen.state[i] {
             VISIBLE => true,
             UNSEEN => {
                 let start = seen.blockers.len();
-                for &d in dirs {
-                    let Some(j) = blocker(d) else {
+                for (di, &d) in dirs {
+                    let Some(j) = blocker(di, d, &mut seen.last) else {
                         seen.blockers.truncate(start);
                         seen.state[i] = VISIBLE;
                         return true;
@@ -219,12 +240,17 @@ impl Parts {
                 false
             }
             start => {
-                for (slot, &d) in seen.blockers[start as usize..].iter_mut().zip(dirs) {
+                let Seen {
+                    state,
+                    blockers,
+                    last,
+                } = seen;
+                for (slot, (di, &d)) in blockers[start as usize..].iter_mut().zip(dirs) {
                     if !self.removed[*slot as usize] {
                         continue;
                     }
-                    let Some(j) = blocker(d) else {
-                        seen.state[i] = VISIBLE;
+                    let Some(j) = blocker(di, d, last) else {
+                        state[i] = VISIBLE;
                         return true;
                     };
                     *slot = j;
