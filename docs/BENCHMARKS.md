@@ -1416,6 +1416,32 @@ under a quarter of its intended collapses lifts the cost limit for the next one 
 used to spend five or six passes collapsing 0 to 27 edges each). The dragon's extra time is
 passes: cheap candidates now cluster in flat regions and block each other, 8 passes against 6.
 
+### Fast: twelve changes, 56% of the time (v24)
+
+Output is byte-identical (fast and default reducers on all 11 assets at 10% and 3%, and the
+flattened 10,000 and 3,000 cases; one thread matches many). A hosted runner, `fast=10000` in
+the Bench workflow (dragon, watch and car flattened), 12 rounds, same run against the previous
+main: car 1024.4 → 514.1 ms, watch 272.2 → 162.5, dragon 298.2 → 217.0, 0.560 in all. Each
+change, timed against the one before (head / base, sum of the three):
+
+| change | time |
+|---|---|
+| Part visibility cached (removing parts only frees rays) | 0.959 |
+| BVH builds in parallel | 0.976 |
+| Attribute cost bounded from below before the full evaluation | 0.942 |
+| The guessed blocking triangle tried first | 0.901 |
+| BVH splits reuse their parent's bins | 0.997 |
+| Attribute cost in a fixed-size layout, one quadric sum per edge | 0.958 |
+| A pass's edges gathered and costed on all threads | 0.899 |
+| A part's exact removal error measured on all threads | 0.854 |
+| BVH walks with an inline stack, any-hit tests each box once | 0.978 |
+| Candidate sort in parallel (keys are unique, so the order is the same) | 0.995 |
+| BVH build boxes in SIMD lanes (min and max are exact, so the tree is the same) | 0.990 |
+| Parts analyzed alongside the first passes at aggressive targets | 0.933 |
+
+Profiles after: on the dragon, BVH splits 16%, candidate checks 12%, edge gathering 11.6% and
+the attribute cost 9.2%; on the car, any-hit traversal 25%.
+
 ### The default reducer against the fast one (v24)
 
 The fast reducer rendered closer to the source than the default on 9 of 22 cases (11 assets

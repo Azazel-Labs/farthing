@@ -138,6 +138,12 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 | Default reducer: narrow-face boost gated on strip height under k × √(area / target) (k 0.25, 0.5, 1), or weighted len × max(len, k × √(area / target)) | The gate changes nothing; the target-length weight −0.07 to −0.18 / −0.01 to +0.26 dB | — |
 | Default reducer: UV weight 0.25 in place of 0.5, for the Corset's relief disks | Corset 10% +0.21 but mean −0.19 / −0.02 dB, Avocado 10% −1.43 | — |
 | Default reducer: closing the watch band gap at 10% (tiling UVs, outline spent on UV error): tear 0.1, 0.02, 0.01; gutter pricing off; normal growth capped at 1, 4, 8; attribute error normalized by mean area | None helps the band (21.2 dB close up against fast's 23.4); reduced without UVs it reaches 23.9, and the whole watch 21.76 at 10% but 15.85 at 3% | A UV cost that knows a tiling chart from an atlas |
+| Fast: at most two collapses per vertex in a pass (dragon 8 passes to 5) | −1.51 dB at 10% (10 of 11 assets worse), −0.83 at 3% (5 seeds) | — |
+| Fast: a pass's topology checks worked out ahead on all threads, redone only where a collapse touched them | 1.100 × the time (car 1.093, watch 1.090, dragon 1.123) | — |
+| Parts: visibility rays reading triangles, parts and occluder flags in BVH slot order | 0.999 × (car 1.010, watch 0.971, dragon 0.994), for about 41 B per triangle | — |
+| Parts: per-node part labels to skip subtrees in visibility rays | 1.037 × (car 1.054, watch 1.062, dragon 0.983) | — |
+| BVH build: interleaved bounds, centroid and triangle per item | 1.023 ×, 1.008 × on a rerun | — |
+| BVH build: the two part builds joined | No dragon gain beyond building each BVH in parallel | — |
 
 ## Voxel proxies
 
