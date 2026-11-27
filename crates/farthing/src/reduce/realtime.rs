@@ -1037,7 +1037,7 @@ fn realtime_pass(
             }
             // Clusters: wedges of a cell that share a position (a seam) are one cluster;
             // separate surfaces passing through the same cell stay apart. Equal positions
-            // share a Morton code, and runs of one code are short.
+            // share a Morton code, and runs of one code are short; most are one position.
             let mut run: Vec<u32> = Vec::new();
             let mut i = 0;
             while i < n {
@@ -1047,9 +1047,16 @@ fn realtime_pass(
                 }
                 if e - i > 1 {
                     let pos = |i: u32| spos[r0 + i as usize];
-                    if e - i <= 8 {
-                        for a in i as u32..e as u32 {
-                            for b in a + 1..e as u32 {
+                    let bits = |i: u32| pos(i).to_array().map(f32::to_bits);
+                    let (a, b) = (i as u32, e as u32);
+                    if !pos(a).is_nan() && (a + 1..b).all(|x| bits(x) == bits(a)) {
+                        // One position (equal however compared).
+                        for x in a + 1..b {
+                            union(sp, a, x);
+                        }
+                    } else if e - i <= 8 {
+                        for a in a..b {
+                            for b in a + 1..b {
                                 if pos(a) == pos(b) {
                                     union(sp, a, b);
                                 }
@@ -1057,11 +1064,10 @@ fn realtime_pass(
                         }
                     } else {
                         run.clear();
-                        run.extend(i as u32..e as u32);
-                        let key = |i: u32| pos(i).to_array().map(f32::to_bits);
-                        run.sort_unstable_by_key(|&i| key(i));
+                        run.extend(a..b);
+                        run.sort_unstable_by_key(|&i| bits(i));
                         for w in run.windows(2) {
-                            if key(w[0]) == key(w[1]) {
+                            if bits(w[0]) == bits(w[1]) {
                                 union(sp, w[0], w[1]);
                             }
                         }
