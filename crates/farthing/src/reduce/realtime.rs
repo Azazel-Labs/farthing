@@ -994,7 +994,6 @@ fn realtime_pass(
         })
         .collect();
     drop(routed);
-    let kept = kept.concat();
     let mut parent: Vec<u32> = aparent.into_iter().map(AtomicU32::into_inner).collect();
     lap("wpass");
 
@@ -1302,8 +1301,52 @@ fn realtime_pass(
     lap("clusters");
 
     // Stage-two triangles over wedges; same-orientation duplicates go, opposite ones are
-    // kept as double-sided twins.
-    let nw_est = kept.len() * 3 / 2 + 16;
+    // kept as double-sided twins. What each triangle needs is gathered in parallel, chunk by
+    // chunk; duplicates and wedge numbers are settled after, in order.
+    struct Pre {
+        key: u128,
+        c: [u32; 3],
+        roots: [u32; 3],
+        facing: Vec3,
+        mat: u32,
+        fwd: bool,
+        fold: bool,
+    }
+    let pre: Vec<Vec<Pre>> = kept
+        .par_iter()
+        .map(|ch| {
+            ch.iter()
+                .map(|&(tri, t)| {
+                    let c = tri.map(|r| cid[r as usize]);
+                    let mut sorted = c;
+                    sorted.sort_unstable();
+                    // Rotation-invariant orientation: the cyclic order with the smallest id
+                    // first.
+                    let r = (0..3).min_by_key(|&i| c[i]).unwrap();
+                    // Clusters stand at member vertices chosen one by one, so three of them
+                    // can form a triangle facing the other way from the one it stands for: a
+                    // fold. The tail takes those out first.
+                    let o = tri.map(|r| spos[r as usize]);
+                    let v = c.map(|x| cpos[x as usize]);
+                    let facing = (o[1] - o[0]).cross(o[2] - o[0]);
+                    Pre {
+                        key: ((sorted[0] as u128) << 64)
+                            | ((sorted[1] as u128) << 32)
+                            | sorted[2] as u128,
+                        c,
+                        roots: tri.map(|r| parent[r as usize]),
+                        facing,
+                        mat: mesh.material_ids.get(t as usize).copied().unwrap_or(0),
+                        fwd: c[(r + 1) % 3] == sorted[1],
+                        fold: facing.dot((v[1] - v[0]).cross(v[2] - v[0])) < 0.0,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    drop(kept);
+    let nkept: usize = pre.iter().map(Vec::len).sum();
+    let nw_est = nkept * 3 / 2 + 16;
     let mut wid: Vec<u32> = (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
@@ -1312,54 +1355,42 @@ fn realtime_pass(
     let mut wsrc: Vec<u32> = Vec::with_capacity(nw_est);
     let mut wc: Vec<u32> = Vec::with_capacity(nw_est);
     let mut warea: Vec<f32> = Vec::with_capacity(nw_est);
-    let mut tw: Vec<[u32; 3]> = Vec::with_capacity(kept.len());
-    let mut tc: Vec<[u32; 3]> = Vec::with_capacity(kept.len());
-    let mut tmat: Vec<u32> = Vec::with_capacity(kept.len());
-    let mut twin: Vec<bool> = Vec::with_capacity(kept.len());
-    let mut seen = KeyMap::new(kept.len());
-    let mut fold: Vec<bool> = Vec::with_capacity(kept.len());
-    let mut tn: Vec<Vec3> = Vec::with_capacity(kept.len());
-    for &(tri, t) in &kept {
-        let c = tri.map(|r| cid[r as usize]);
-        let mut sorted = c;
-        sorted.sort_unstable();
-        let key = ((sorted[0] as u128) << 64) | ((sorted[1] as u128) << 32) | sorted[2] as u128;
-        // Rotation-invariant orientation: the cyclic order with the smallest id first.
-        let r = (0..3).min_by_key(|&i| c[i]).unwrap();
-        let fwd = c[(r + 1) % 3] == sorted[1];
-        let (slot, present) = seen.get_or_insert(key, tw.len() as u32 * 2 + fwd as u32);
+    let mut tw: Vec<[u32; 3]> = Vec::with_capacity(nkept);
+    let mut tc: Vec<[u32; 3]> = Vec::with_capacity(nkept);
+    let mut tmat: Vec<u32> = Vec::with_capacity(nkept);
+    let mut twin: Vec<bool> = Vec::with_capacity(nkept);
+    let mut seen = KeyMap::new(nkept);
+    let mut fold: Vec<bool> = Vec::with_capacity(nkept);
+    let mut tn: Vec<Vec3> = Vec::with_capacity(nkept);
+    for p in pre.iter().flatten() {
+        let (slot, present) = seen.get_or_insert(p.key, tw.len() as u32 * 2 + p.fwd as u32);
         let is_twin = if present {
-            if (slot & 1 == 1) == fwd {
+            if (slot & 1 == 1) == p.fwd {
                 continue;
             }
             true
         } else {
             false
         };
-        let w = tri.map(|r| {
-            let root = parent[r as usize] as usize;
+        let mut w = [0u32; 3];
+        for k in 0..3 {
+            let root = p.roots[k] as usize;
             if wid[root] == u32::MAX {
                 wid[root] = wsrc.len() as u32;
                 wsrc.push(vert(wbest[root].1 as usize));
-                wc.push(cid[r as usize]);
+                wc.push(p.c[k]);
                 warea.push(warea_v[root]);
             }
-            wid[root]
-        });
-        // Clusters stand at member vertices chosen one by one, so three of them can form a
-        // triangle facing the other way from the one it stands for: a fold. The tail takes
-        // those out first.
-        let o = tri.map(|r| spos[r as usize]);
-        let v = c.map(|x| cpos[x as usize]);
-        let facing = (o[1] - o[0]).cross(o[2] - o[0]);
-        fold.push(facing.dot((v[1] - v[0]).cross(v[2] - v[0])) < 0.0);
-        tn.push(facing);
+            w[k] = wid[root];
+        }
+        fold.push(p.fold);
+        tn.push(p.facing);
         tw.push(w);
-        tc.push(c);
-        tmat.push(mesh.material_ids.get(t as usize).copied().unwrap_or(0));
+        tc.push(p.c);
+        tmat.push(p.mat);
         twin.push(is_twin);
     }
-    drop(kept);
+    drop(pre);
     lap("tris");
 
     // Attributes per wedge, pre-scaled as in the fast reducer.
