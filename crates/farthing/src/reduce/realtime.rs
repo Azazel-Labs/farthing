@@ -131,14 +131,30 @@ fn qeval_v(a: &[f64], p: Vec3) -> f64 {
 }
 
 /// Spreads the low 10 bits of `x` three apart.
-#[inline]
-fn spread(x: u32) -> u32 {
+const fn spread_bits(x: u32) -> u32 {
     let mut x = x & 0x3ff;
     x = (x | (x << 16)) & 0x0300_00ff;
     x = (x | (x << 8)) & 0x0300_f00f;
     x = (x | (x << 4)) & 0x030c_30c3;
     x = (x | (x << 2)) & 0x0924_9249;
     x
+}
+
+/// `spread_bits` of every 10-bit value.
+static SPREAD: [u32; 1024] = {
+    let mut t = [0u32; 1024];
+    let mut i = 0;
+    while i < 1024 {
+        t[i] = spread_bits(i as u32);
+        i += 1;
+    }
+    t
+};
+
+/// Spreads the low 10 bits of `x` three apart.
+#[inline]
+fn spread(x: u32) -> u32 {
+    SPREAD[(x & 0x3ff) as usize]
 }
 
 /// Sorts keys (code above `CODE_SHIFT`, tie-breaking bits below) in
