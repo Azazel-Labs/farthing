@@ -46,6 +46,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 const DEPTH: u32 = 10;
 /// Stage-one clusters per target triangle.
 const CLUSTERS_PER_TRI: f32 = 0.55;
+/// Extra clusters at small targets: the budget is scaled by 1 + this / (target + 8).
+const SMALL_TARGET: f32 = 24.0;
 /// A mesh of at most `RETRY_MAX_TRIS` triangles that ends below `RETRY_BELOW` of its target
 /// is reduced again with more clusters, up to `RETRIES` times.
 const RETRY_MAX_TRIS: usize = 20_000;
@@ -723,7 +725,15 @@ fn realtime_pass(
     // Fine cells: the coarsest level with about FINE_PER_CLUSTER cells per wanted cluster,
     // summed in one ordered pass. Refinement works on these and only goes back to vertices
     // for a fine cell that must split further.
-    let k_target = target.map(|t| ((t as f32 * per_tri).ceil() as usize).max(4));
+    //
+    // The budget assumes a closed surface's two triangles per cluster. A cluster on an open
+    // border has one fewer, and at a small target most clusters are on a border (a disc of
+    // four clusters is two triangles), so small targets get more clusters per triangle; the
+    // extra fades out by a few hundred triangles.
+    let k_target = target.map(|t| {
+        let small = 1.0 + SMALL_TARGET / (t as f32 + 8.0);
+        ((t as f32 * per_tri * small).ceil() as usize).max(4)
+    });
     let fine_level = {
         const NL: usize = DEPTH as usize + 1;
         let first_split = (1..nv)
