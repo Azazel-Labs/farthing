@@ -1055,6 +1055,9 @@ impl Demo {
                     width: w,
                     height: h,
                     supersample: opts.supersample.clamp(1, 4),
+                    // Rays reach as far as the proxy strays from the source (at least the
+                    // default 3% of the diagonal), so a coarse far level still finds it.
+                    max_distance: Some(error.max(0.03 * diag)),
                     gutter: 4,
                     channels: vec![
                         channels::BASE_COLOR.into(),
