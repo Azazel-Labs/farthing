@@ -1155,13 +1155,15 @@ struct UvRoom<'f> {
 
 /// Welded position of each vertex (equal bits), numbered in no particular order.
 fn position_ids(mesh: &Mesh) -> Vec<u32> {
-    let key = |v: usize| mesh.positions[v].to_array().map(f32::to_bits);
-    let mut order: Vec<u32> = (0..mesh.vertex_count() as u32).collect();
-    order.par_sort_unstable_by_key(|&v| (key(v as usize), v));
+    let mut order: Vec<([u32; 3], u32)> = (0..mesh.vertex_count() as u32)
+        .into_par_iter()
+        .map(|v| (mesh.positions[v as usize].to_array().map(f32::to_bits), v))
+        .collect();
+    order.par_sort_unstable();
     let mut id = vec![0u32; order.len()];
     let mut n = 0u32;
-    for (i, &v) in order.iter().enumerate() {
-        if i > 0 && key(order[i - 1] as usize) != key(v as usize) {
+    for (i, &(key, v)) in order.iter().enumerate() {
+        if i > 0 && order[i - 1].0 != key {
             n += 1;
         }
         id[v as usize] = n;
@@ -1233,16 +1235,19 @@ fn uv_tile_scales(mesh: &Mesh, diag: f64) -> Vec<f32> {
         }
         // Vertices of one position with the same UV, found as neighbors in (position, UV)
         // order.
-        let key = |v: u32| {
-            (
-                ids[v as usize],
-                set[v as usize].to_array().map(f32::to_bits),
-                v,
-            )
-        };
+        let mut keyed: Vec<(u32, [u32; 2], u32)> = (0..n as u32)
+            .into_par_iter()
+            .map(|v| {
+                (
+                    ids[v as usize],
+                    set[v as usize].to_array().map(f32::to_bits),
+                    v,
+                )
+            })
+            .collect();
+        keyed.par_sort_unstable();
         order.clear();
-        order.extend(0..n as u32);
-        order.sort_unstable_by_key(|&v| key(v));
+        order.extend(keyed.iter().map(|k| k.2));
         for w in order.windows(2) {
             let (a, b) = (w[0], w[1]);
             if ids[a as usize] == ids[b as usize]
