@@ -621,6 +621,17 @@ struct CollapsePlan {
     drift: Vec<(u32, f32)>,
 }
 
+/// Most attribute dims [`State::attr_base`] holds (normals, two UV sets and a color take 11).
+const ATTR_BASE_DIMS: usize = 16;
+
+/// Wedge-only terms of an attribute quadric evaluation (see [`State::attr_base`]).
+struct AttrBase {
+    en: f64,
+    eo: f64,
+    w: f64,
+    d: [f64; ATTR_BASE_DIMS],
+}
+
 /// One of p's corners: p's wedge, the other two wedges, and their positions.
 #[derive(Clone, Copy)]
 struct Corner {
@@ -1946,6 +1957,77 @@ impl<'a> State<'a> {
         (en.max(0.0), eo.max(0.0), w)
     }
 
+    /// The parts of [`Self::attr_eval_m`] for wedge `pw` that do not depend on the other
+    /// wedge, so one wedge can be weighed against several of q's: the two quadric terms, the
+    /// gradients' dot products with the point, and the area. `None` if the layout has more
+    /// dims than [`ATTR_BASE_DIMS`].
+    #[inline(always)]
+    fn attr_base(&self, pw: u32, m: &[f64; 12], h: &[f64; 4]) -> Option<AttrBase> {
+        let dim = self.attrs.dim;
+        if dim > ATTR_BASE_DIMS {
+            return None;
+        }
+        let mut b = AttrBase {
+            en: 0.0,
+            eo: 0.0,
+            w: 0.0,
+            d: [0.0; ATTR_BASE_DIMS],
+        };
+        if dim == 0 {
+            return Some(b);
+        }
+        let nd = self.attrs.nd;
+        let base = pw as usize * self.aq_stride;
+        let a = &self.aq[base..base + 28 + 4 * dim];
+        let (quads, rest) = a.split_at(24);
+        let (grads, tail) = rest.split_at(4 * dim);
+        b.w = tail[0];
+        if nd > 0 {
+            b.en = kernels::dot12(&quads[..12], m);
+        }
+        if nd < dim {
+            b.eo = kernels::dot12(&quads[12..24], m);
+        }
+        for (d, g) in b.d.iter_mut().zip(grads.chunks_exact(4)) {
+            *d = kernels::dot4(g, h);
+        }
+        Some(b)
+    }
+
+    /// [`Self::attr_eval_m`] from an [`AttrBase`]: the same sums in the same order, so the
+    /// same bits.
+    #[inline(always)]
+    fn attr_eval_b(&self, b: &AttrBase, qw: u32) -> (f64, f64, f64) {
+        let dim = self.attrs.dim;
+        if dim == 0 {
+            return (0.0, 0.0, 0.0);
+        }
+        let nd = self.attrs.nd;
+        let w = b.w;
+        let s = &self.attrs.values[qw as usize * dim..qw as usize * dim + dim];
+        let term = |d: f64, sj: f32| {
+            let sj = sj as f64;
+            -2.0 * sj * d + sj * sj * w
+        };
+        let (dn, d_o) = b.d[..dim].split_at(nd);
+        let (sn, so) = s.split_at(nd);
+        let mut en = 0.0;
+        if nd > 0 {
+            en = b.en;
+            for (&d, &sj) in dn.iter().zip(sn) {
+                en += term(d, sj);
+            }
+        }
+        let mut eo = 0.0;
+        if nd < dim {
+            eo = b.eo;
+            for (&d, &sj) in d_o.iter().zip(so) {
+                eo += term(d, sj);
+            }
+        }
+        (en.max(0.0), eo.max(0.0), w)
+    }
+
     /// P's corners in alive triangles, rotated so p's wedge comes first.
     #[inline(always)]
     fn p_corners(&self, p: u32, out: &mut Vec<Corner>) {
@@ -2041,7 +2123,11 @@ impl<'a> State<'a> {
         // triangles p and q share. When both lie on a seam and the edge is a chord through one
         // island, p's wedge on the other island belongs with q's wedge there; restricting it
         // to the shared triangles' wedges dragged it across the atlas.
-        let mut q_wedges: Vec<u32> = Vec::new();
+        // q's wedges, in a fixed buffer unless there are very many.
+        let mut q_buf = [0u32; 32];
+        let mut q_len = 0;
+        let mut q_many: Vec<u32> = Vec::new();
+        let mut q_found = false;
         for c in corners {
             let pw = c.pw;
             if out.iter().any(|(x, _)| *x == pw) {
@@ -2054,27 +2140,49 @@ impl<'a> State<'a> {
                 let qp = self.pos[q as usize];
                 (kernels::monomials(qp), kernels::homogeneous(qp))
             });
-            if q_wedges.is_empty() {
+            if !q_found {
+                q_found = true;
                 for &t in self.adj.get(q) {
                     let tp = self.tpos[t as usize];
                     if let Some(k) = tp.iter().position(|&x| x == q) {
                         let w = self.tris[t as usize][k];
-                        if !q_wedges.contains(&w) {
-                            q_wedges.push(w);
+                        if q_many.is_empty() {
+                            if !q_buf[..q_len].contains(&w) {
+                                if q_len < q_buf.len() {
+                                    q_buf[q_len] = w;
+                                    q_len += 1;
+                                } else {
+                                    q_many.extend_from_slice(&q_buf);
+                                    q_many.push(w);
+                                }
+                            }
+                        } else if !q_many.contains(&w) {
+                            q_many.push(w);
                         }
                     }
                 }
             }
+            let q_wedges: &[u32] = if q_many.is_empty() {
+                &q_buf[..q_len]
+            } else {
+                &q_many
+            };
+            // pw's own terms, shared by every wedge it is weighed against.
+            let base = self.attr_base(pw, &m, &h);
+            let eval = |qw: u32| match &base {
+                Some(b) => self.attr_eval_b(b, qw),
+                None => self.attr_eval_m(pw, &m, &h, qw),
+            };
             // Or the wedge slides onto q keeping its own attributes: its triangles stay on
             // their UV island and only stretch, where any wedge of q would move them to
             // another island (q has no wedge of pw's island, or it would be partnered).
-            let (en, eo, w) = self.attr_eval_m(pw, &m, &h, pw);
+            let (en, eo, w) = eval(pw);
             let eo = self.uv_capped(eo, w);
             // Without slides the wedge takes q's nearest wedge, unless q has none.
             let mut best: Option<(f64, u32, f64)> =
                 (self.slides || q_wedges.is_empty()).then_some((en + eo, pw, 0.0));
-            for &qw in &q_wedges {
-                let (en, eo, w) = self.attr_eval_m(pw, &m, &h, qw);
+            for &qw in q_wedges {
+                let (en, eo, w) = eval(qw);
                 // No tear if qw is on pw's UV island: pw has the UVs of a wedge of p that
                 // merges into a wedge with qw's UVs through a triangle p and q share (the
                 // wedges differ by normal only).
