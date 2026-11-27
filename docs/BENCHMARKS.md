@@ -1301,6 +1301,36 @@ ms): on the watch, 4,672 heap pops for 1,884 collapses at roughly 0.75 to 1 µs 
 over cost evaluation, link checks, wedge mapping and the collapse itself with no single hot
 spot.
 
+### Realtime: thin cells cut into sectors (v24)
+
+A tube or strut narrower than an octree cell fell to one cluster per cell and its triangles
+vanished (the BoomBox antenna, straps and loops). A cell is a candidate when its normals cancel
+by at least 30%, its RMS distance to the centroid's planes is under half the cell size, and its
+normal spread is that of a tube rather than a plate. It counts as three clusters while it is a
+leaf, so the budget stays the same (1.2 × the clusters with no cut gives +0.45 / +0.10 dB on its
+own, so every comparison here is at equal budget). When the budget is reached each candidate is
+checked over its vertices: an axis from the normal moment, three 120° sectors around it, and
+the error those sectors remove against the heap's next split. Kept cuts become three cells;
+rejected ones hand their clusters back and refinement resumes. Two sectors leave flat ribbons
+facing apart that draw as dark slivers; four gain nothing over three. No cuts on cells holding
+an open-border vertex, or on meshes with open borders under 300 clusters, which keeps shared
+borders sealed exactly as before (watch 40.0% / 14.7%, car 34.3% / 17.4% at 10% / 3%).
+
+| rendered PSNR, dB | 10%: before | now | 3%: before | now |
+|---|---|---|---|---|
+| BoomBox | 22.01 | 23.47 | 19.44 | 19.44 |
+| CarConcept | 23.94 | 23.82 | 20.26 | 20.24 |
+| ChronographWatch | 20.02 | 19.95 | 15.32 | 15.33 |
+| DragonAttenuation | 28.80 | 28.89 | 24.66 | 24.88 |
+| Duck | 21.84 | 22.03 | 17.11 | 17.20 |
+| Fox | 18.16 | 18.23 | 15.47 | 16.10 |
+| other five | unchanged | | unchanged | |
+| mean of 11 | 24.38 | 24.53 | 20.52 | 20.60 |
+
+The helmet's hoses are not caught: a threshold loose enough for them costs 0.9 dB elsewhere.
+Time on a hosted runner (same run, 3,000-triangle target on the merged scene): watch 14.13 to
+14.43 ms, car 18.61 to 18.70, dragon 13.73 to 14.11, all in the octree phase.
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
