@@ -134,6 +134,11 @@ const CREASE_NARROW: f32 = 0.3;
 const PASS_SHARE: f32 = 0.5;
 const PASS_LIMIT: f32 = 2.0;
 
+/// Near the target (m under 1/8 of the candidates), a pass that makes under 1/`PASS_STUCK`
+/// of its m collapses (the cheap ones block each other) lifts the limit for the next pass,
+/// which then finishes, instead of re-costing every edge for a handful at a time.
+const PASS_STUCK: usize = 4;
+
 pub(crate) fn simplify_fast(
     mesh: &Mesh,
     opts: &SimplifyOptions,
@@ -361,10 +366,17 @@ pub(crate) fn simplify_fast(
         0
     };
     let uv_dims = if uw > 0.0 { 2 * mesh.uvs.len() } else { 0 };
-    // Per wedge and attribute dim, the attribute's gradient over the surface: the
-    // area-weighted mean of the gradients over the wedge's faces (see `St::wcost`).
-    let grad = {
-        let mut grad = vec![0f32; nv * dim * 3];
+    // Per wedge, one block (see `St::wd`): its area, its attributes, and per attribute dim its
+    // gradient over the surface, the area-weighted mean of the gradients over the wedge's
+    // faces (see `St::wcost`).
+    let stride = 1 + 4 * dim;
+    let wd = {
+        let mut wd = vec![0f32; nv * stride];
+        for v in 0..nv {
+            let b = &mut wd[v * stride..(v + 1) * stride];
+            b[0] = warea[v];
+            b[1..1 + dim].copy_from_slice(&attr[v * dim..(v + 1) * dim]);
+        }
         let mut gw = vec![0f32; nv];
         for t in 0..nt {
             if !alive[t] {
@@ -391,10 +403,10 @@ pub(crate) fn simplify_fast(
                     + gphi[2] * attr[w[2] as usize * dim + k];
                 let g = g * area;
                 for &c in &w {
-                    let o = (c as usize * dim + k) * 3;
-                    grad[o] += g.x;
-                    grad[o + 1] += g.y;
-                    grad[o + 2] += g.z;
+                    let o = c as usize * stride + 1 + dim + 3 * k;
+                    wd[o] += g.x;
+                    wd[o + 1] += g.y;
+                    wd[o + 2] += g.z;
                 }
             }
             for &c in &w {
@@ -404,12 +416,12 @@ pub(crate) fn simplify_fast(
         for v in 0..nv {
             if gw[v] > 0.0 {
                 let s = 1.0 / gw[v];
-                for g in &mut grad[v * dim * 3..(v + 1) * dim * 3] {
+                for g in &mut wd[v * stride + 1 + dim..(v + 1) * stride] {
                     *g *= s;
                 }
             }
         }
-        grad
+        wd
     };
     let mut st = St {
         uvs: nd..nd + uv_dims,
@@ -420,9 +432,8 @@ pub(crate) fn simplify_fast(
         tp,
         alive,
         quad,
-        warea,
-        attr,
-        grad,
+        wd,
+        stride,
         dim,
         avg_area,
         locked,
@@ -627,6 +638,8 @@ pub(crate) fn simplify_fast(
                     _ => break,
                 }
             }
+        } else if done * PASS_STUCK < m && m * 8 < cands.len() {
+            stall = 1;
         } else {
             stall = 0;
         }
@@ -717,11 +730,11 @@ struct St {
     tp: Vec<[u32; 3]>,
     alive: Vec<bool>,
     quad: Vec<Q>,
-    /// Surface area each wedge stands for (grows as wedges merge).
-    warea: Vec<f32>,
-    attr: Vec<f32>,
-    /// Per wedge, per attribute dim, its surface gradient (empty when unused).
-    grad: Vec<f32>,
+    /// Per wedge, `stride` floats side by side (one cache-friendly read in `wcost`): the
+    /// surface area the wedge stands for (grows as wedges merge), its `dim` pre-scaled
+    /// attributes, then per attribute dim its surface gradient (3 floats).
+    wd: Vec<f32>,
+    stride: usize,
     dim: usize,
     /// The attribute dims that hold the UV sets.
     uvs: std::ops::Range<usize>,
@@ -823,23 +836,35 @@ impl St {
     /// surface (UVs inside an island, normals on an evenly curved panel) that is near zero
     /// however far p moves; what remains is what the larger triangles cannot interpolate: a
     /// seam, a fold, a rim whose normal leans away from the faces beside it.
+    #[inline]
     fn wcost(&self, a: u32, b: u32, dx: Vec3) -> f32 {
         if self.dim == 0 || a == b {
             return 0.0;
         }
-        let d = self.dim;
-        let (a, b) = (a as usize, b as usize);
-        let (x, y) = (
-            &self.attr[a * d..(a + 1) * d],
-            &self.attr[b * d..(b + 1) * d],
-        );
-        let g = &self.grad[a * d * 3..(a + 1) * d * 3];
+        let (s, d) = (self.stride, self.dim);
+        let (a, b) = (a as usize * s, b as usize * s);
+        let blk = &self.wd[a..a + s];
+        let (x, g) = blk[1..].split_at(d);
+        let y = &self.wd[b + 1..b + 1 + d];
         let mut e2 = 0.0;
-        for k in 0..d {
-            let e = y[k] - x[k] - (g[3 * k] * dx.x + g[3 * k + 1] * dx.y + g[3 * k + 2] * dx.z);
+        for ((x, y), g) in x.iter().zip(y).zip(g.chunks_exact(3)) {
+            let e = y - x - (g[0] * dx.x + g[1] * dx.y + g[2] * dx.z);
             e2 += e * e;
         }
-        self.warea[a] * e2
+        blk[0] * e2
+    }
+
+    /// Area wedge `w` stands for.
+    #[inline]
+    fn warea(&self, w: u32) -> f32 {
+        self.wd[w as usize * self.stride]
+    }
+
+    /// The pre-scaled attributes of wedge `w`.
+    #[inline]
+    fn attr(&self, w: u32) -> &[f32] {
+        let o = w as usize * self.stride + 1;
+        &self.wd[o..o + self.dim]
     }
 
     /// Wedge map p→q: wedges of p in triangles shared with q map to q's wedge there; the others
@@ -915,7 +940,7 @@ impl St {
             }
             slide = slide.max(self.uv_dist(sw, qw));
         }
-        let w = self.warea[pw as usize];
+        let w = self.warea(pw);
         if on.1 != u32::MAX {
             on
         } else if self.carry {
@@ -930,11 +955,7 @@ impl St {
         if a == b {
             return 0.0;
         }
-        let d = self.dim;
-        let (x, y) = (
-            &self.attr[a as usize * d..(a as usize + 1) * d],
-            &self.attr[b as usize * d..(b as usize + 1) * d],
-        );
+        let (x, y) = (self.attr(a), self.attr(b));
         x[self.uvs.clone()]
             .iter()
             .zip(&y[self.uvs.clone()])
@@ -1070,8 +1091,8 @@ impl St {
     fn collapse(&mut self, p: u32, q: u32, map: &[(u32, u32)]) -> usize {
         for &(pw, qw) in map {
             if pw != qw {
-                let a = self.warea[pw as usize];
-                self.warea[qw as usize] += a;
+                let a = self.warea(pw);
+                self.wd[qw as usize * self.stride] += a;
             }
         }
         let mut removed = 0;
