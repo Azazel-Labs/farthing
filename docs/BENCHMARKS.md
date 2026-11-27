@@ -611,21 +611,45 @@ Meshes with real UV seams everywhere (the dragon itself, the watch, the car) are
 problem, not fixed by default: removing a seam vertex along a seam that bends in UV always
 spills past the island's edge, the gutter guard (`DRIFT_UV`, 1/2048) forbids it, and the
 vertex can then only slide, at a price that drags the accepted geometric error up. On the
-dragon to 1,000 triangles, half of the UV validity checks fail on spill. The opt-in
-`gutter_tolerance` lets the cap grow with the dearest collapse made so far:
+dragon to 1,000 triangles, half of the UV validity checks fail on spill.
 
-| case | default | tolerance 0.01 | tolerance 0.05 | fast |
+The opt-in `gutter_use` lets a seam vertex go where the atlas has room for it. A spill of
+depth d is allowed if no other island's source triangle, and no texture edge, lies within
+d x (1 - share) / share of it (with a small margin), so a spill takes at most its share of
+the gutter's width at that place and two islands spilling toward each other cannot meet.
+The room is probed where the spill lands, against a grid of the source UV triangles. Each
+spilling triangle also pays `uv_weight` x its area x d squared, through the same cost as any
+other UV error, so a collapse that does not spill wins when it is about as good. The depth is
+capped at share / 32 of the texture, half a texel is always allowed as before, and
+`texel_size`, when given, is added to the free distance required. A material whose islands
+cross a texture repeat keeps the old rule. At 0 (the default) nothing changes.
+
+| case (Hausdorff % / mean % / UV p90 / normals deg) | 0 | 0.1 | 0.25 | 0.4 |
 |---|---|---|---|---|
-| dragon, 1,000 | 11.16 / 0.651 / 0.824 / 32.3 | 4.38 / 0.434 / 0.794 / 24.5 | 3.95 / 0.397 / 0.768 / 21.8 | 2.49 / 0.275 / 0.503 / 24.7 |
-| watch, 3,000 | 9.11 / 0.963 / 2.02 / 72.0 | 4.44 / 0.441 / 1.20 / 56.7 | 3.84 / 0.351 / 0.993 / 49.2 | 3.11 / 0.285 / 0.794 / 51.4 |
-| car, 3,000 | 10.64 / 1.272 / 213.8 / 77.7 | 7.24 / 0.491 / 110.5 / 66.9 | 7.51 / 0.463 / 102.5 / 64.3 | 8.04 / 0.369 / 80.7 / 64.4 |
-| 8 assets, means | 2.396 / 0.1723 / 0.0084 / 6.93 | 2.247 / 0.1640 / 0.0074 / 6.81 | 2.030 / 0.1512 / 0.0066 / 6.51 | 2.257 / 0.1413 / 0.0093 / 8.18 |
-| UV area over half a texel into the gutter (mean, worst) | 0.008%, 0.26% | 0.07%, 1.3% | 0.51%, 3.7% | |
+| dragon, 1,000 | 11.16 / 0.651 / 0.824 / 32.3 | 5.59 / 0.585 / 0.826 / 28.9 | 4.90 / 0.517 / 0.774 / 25.8 | 8.95 / 0.451 / 0.763 / 24.3 |
+| dragon, 10,000 | 1.064 / 0.0622 / 0.550 / 7.03 | 0.838 / 0.0580 / 0.471 / 6.60 | 0.751 / 0.0548 / 0.420 / 6.31 | 0.850 / 0.0548 / 0.385 / 6.12 |
+| watch, 3,000 | 9.11 / 0.963 / 2.02 / 72.0 | 15.79 / 1.542 / 2.09 / 76.8 | 8.27 / 0.889 / 2.16 / 68.3 | 12.43 / 1.019 / 2.07 / 71.7 |
+| car, 10,000 | 6.02 / 0.188 / 22.2 / 39.2 | 4.96 / 0.200 / 22.7 / 39.5 | 4.96 / 0.197 / 22.5 / 38.8 | 4.96 / 0.197 / 22.7 / 38.9 |
+| 8 assets, means | 2.396 / 0.1723 / 0.0084 / 6.93, 97% | 2.290 / 0.1627 / 0.0075 / 6.79, 97% | 2.288 / 0.1574 / 0.0070 / 6.66, 100% | 2.151 / 0.1559 / 0.0067 / 6.58, 100% |
+| UV area over half a texel off its island (mean, worst) | 0.008%, 0.26% | 0.016%, 0.10% | 0.058%, 0.50% | 0.111%, 0.92% |
+| UV area inside another island | 0.0000% | 0.0000% | 0.0000% | 0.0000% |
+| rendered PSNR, 11 assets, 10% of input | 24.43 dB | 24.53 | 24.52 | 24.64 |
+| rendered PSNR, 3% of input | 19.38 dB | 19.60 | 20.03 | 20.18 |
+| misplaced highlight, 10% / 3% | 1.37% / 2.36% | 1.31% / 2.32% | 1.28% / 2.26% | 1.24% / 2.11% |
 
-It is off by default: any tolerance fails `uv_islands_never_spill_into_the_gutter`. The
-closest-point UV metric also overstates slides (a seam moved by one edge length reads as a
-jump between islands), so the UV columns here are harsher on the default reducer than a
-render is.
+The dragon is where it pays (mean error down 12 to 21% at 0.25). The watch and the car, each
+flattened to one mesh, get almost nothing: their meshes stack in one UV space and many of
+their materials tile, so nearly every probe is blocked, and the watch at 3,000 triangles
+swings between 8.3% and 15.8% with no trend. A cap of the same depth with no room test (the
+first version of this option, `gutter_tolerance`, removed) scored higher in renders (24.97
+and 25.24 dB at 10% for 0.01 and 0.05) but put 0.51% of UV area over half a texel into the
+gutter at 0.05 and, on the watch, nearly all of its spill inside another island.
+
+It is off by default until its cost is timed on a quiet machine (the flattened car may be 1.4
+to 2.8 times slower with it on; the dragon was inconclusive), and because
+`uv_islands_never_spill_into_the_gutter` asserts the old rule. The closest-point UV metric
+overstates slides (a seam moved by one edge length reads as a jump between islands), so the
+UV columns here are harsher on the default reducer than a render is.
 
 ### Aggressive targets (v14)
 

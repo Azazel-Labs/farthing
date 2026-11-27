@@ -131,15 +131,27 @@ pub struct SimplifyOptions {
     /// of deleting a prominent part. 0 disables (stalls delete parts of any error).
     #[serde(default = "default_part_protection")]
     pub part_protection: f32,
-    /// How far reduced UV islands may reach into the texture gutter, as a share of the UV error
-    /// the collapses so far have accepted (the dearest collapse's cost ÷ √`uv_weight`, in
-    /// texture units). 0 (default) holds every island boundary within half a texel at 1024² of
-    /// its source island at any target; a seam vertex whose seam bends in UV can then only go
-    /// by stretching one island over its neighbor, which on meshes with seams nearly
-    /// everywhere costs far more shape and texture fidelity than the spill it avoids. 0.01 to
-    /// 0.05 give most of that back for a little gutter coverage at aggressive targets.
+    /// Share of the free texture gutter beside a UV island (UV set 0) that the reduced island
+    /// may grow into, 0 to 0.45. The gutter is measured where it would be spent: a spill d
+    /// deep is allowed if no other island's source triangle, and no edge of the texture, lies
+    /// within d × (1 − share) / share of it, and never deeper than this share of 1/32 of the
+    /// texture. An island spilling from the other side is held to the same share, so two
+    /// never meet, on any material. A spill is priced like a UV error of its depth, so it is
+    /// spent only where it saves shape or texture error.
+    ///
+    /// 0 keeps every island boundary within half a texel at 1024² of its source island at
+    /// any target. That half texel is always allowed, and is all that further UV sets and
+    /// materials with an island across the texture's edge (tiling textures) get. Without it,
+    /// a seam vertex whose seam bends in UV can only go by dragging one island over its
+    /// neighbor, which on meshes with seams nearly everywhere costs shape and texture
+    /// placement.
     #[serde(default)]
-    pub gutter_tolerance: f32,
+    pub gutter_use: f32,
+    /// Size of one texel in UV units (1 / texture size), if known: a spill under
+    /// [`SimplifyOptions::gutter_use`] keeps that much further from other islands and the
+    /// texture's edge. 0: unknown.
+    #[serde(default)]
+    pub texel_size: f32,
     /// How glossy each material is, by material id, in 0..=1 (0 or missing: matte; see
     /// [`crate::metrics::Gloss::weight`]). A highlight sits where the shading normal puts it,
     /// so on glossy materials a deviating normal costs more, by up to the weight's share of a
@@ -207,7 +219,8 @@ impl Default for SimplifyOptions {
             remove_parts: true,
             transparent_materials: Vec::new(),
             part_protection: default_part_protection(),
-            gutter_tolerance: 0.0,
+            gutter_use: 0.0,
+            texel_size: 0.0,
             material_gloss: Vec::new(),
             silhouette_weight: 0.5,
             quality: Quality::Best,
@@ -625,13 +638,245 @@ struct State<'a> {
     strict: bool,
     /// Set once collapses stall: vertices with many wedges become collapse sources too.
     relaxed: bool,
-    /// Furthest (texture units) a UV island boundary may drift outward at this point of the
-    /// reduction: [`DRIFT_UV`], or more once collapses have accepted larger errors (see
-    /// [`SimplifyOptions::gutter_tolerance`]).
-    drift_cap: f64,
+    /// Where the source UV islands lie, when islands may spill into the gutter (see
+    /// [`SimplifyOptions::gutter_use`]), with each wedge's island and the share in use.
+    fp: Option<&'a UvFootprint>,
+    isle: Vec<u32>,
+    gutter_use: f64,
     /// Per-thread scratch buffers (marker array sized for this mesh), so `State` can be shared
     /// by parallel evaluations.
     scratch: thread_local::ThreadLocal<RefCell<Scratch>>,
+}
+
+/// Gutters wider than this (texture units) count as this wide: no spill reaches further
+/// than its share of it (see [`SimplifyOptions::gutter_use`]).
+const GUTTER_MAX: f64 = 1.0 / 32.0;
+/// Largest [`SimplifyOptions::gutter_use`]: two islands facing each other each take their
+/// share of the same gutter, and some of it must stay free.
+const GUTTER_USE_MAX: f32 = 0.45;
+/// A spill of depth d into the gutter is priced like a UV error of this times d over the
+/// triangle that spills.
+const SPILL_PRICE: f64 = 1.0;
+
+/// Where the source mesh's UV islands lie in the texture (UV set 0): what a spilling island
+/// must keep clear of. Triangles are held modulo the texture, in a uniform grid.
+struct UvFootprint {
+    /// Source triangles in UV, shifted into the texture's first repeat.
+    tris: Vec<[DVec2; 3]>,
+    /// Island of each of `tris`.
+    tri_isle: Vec<u32>,
+    /// Material of each island (by its id; its first triangle's).
+    isle_mat: Vec<u32>,
+    /// Per material: some island of it lies across the texture's edge (a tiling texture).
+    mat_tiled: Vec<bool>,
+    /// Island of each source vertex.
+    isle: Vec<u32>,
+    start: Vec<u32>,
+    list: Vec<u32>,
+}
+
+impl UvFootprint {
+    const G: usize = 256;
+
+    /// Islands are found over welded positions (`vpos`) and equal UVs, so vertices split only
+    /// by normals do not cut one. A triangle lying across the texture's edge is held once
+    /// per repeat it touches. Depends only on the mesh.
+    fn new(mesh: &Mesh, vpos: &[u32]) -> UvFootprint {
+        let uv = &mesh.uvs[0];
+        let nv = mesh.vertex_count();
+        let at = |v: u32| uv[v as usize].as_dvec2();
+        // UV vertices: the wedges of one position with the same UVs, named by the first.
+        let np = vpos.iter().map(|&p| p as usize + 1).max().unwrap_or(0);
+        let mut start = vec![0u32; np + 1];
+        for &p in vpos {
+            start[p as usize + 1] += 1;
+        }
+        for i in 0..np {
+            start[i + 1] += start[i];
+        }
+        let mut fill = start.clone();
+        let mut by_pos = vec![0u32; nv];
+        for (v, &p) in vpos.iter().enumerate() {
+            by_pos[fill[p as usize] as usize] = v as u32;
+            fill[p as usize] += 1;
+        }
+        let mut uvid = vec![0u32; nv];
+        let mut reps: Vec<u32> = Vec::new();
+        for p in 0..np {
+            reps.clear();
+            for &w in &by_pos[start[p] as usize..start[p + 1] as usize] {
+                let same = |r: u32| (at(r) - at(w)).length_squared() <= TEAR_SAME_UV * TEAR_SAME_UV;
+                uvid[w as usize] = match reps.iter().find(|&&r| same(r)) {
+                    Some(&r) => r,
+                    None => {
+                        reps.push(w);
+                        w
+                    }
+                };
+            }
+        }
+        // Islands: UV vertices joined by triangles.
+        let mut root: Vec<u32> = (0..nv as u32).collect();
+        fn find(root: &mut [u32], mut x: u32) -> u32 {
+            while root[x as usize] != x {
+                root[x as usize] = root[root[x as usize] as usize];
+                x = root[x as usize];
+            }
+            x
+        }
+        for t in 0..mesh.triangle_count() {
+            let k = mesh.triangle(t).map(|v| find(&mut root, uvid[v as usize]));
+            let m = k[0].min(k[1]).min(k[2]);
+            for r in k {
+                root[r as usize] = m;
+            }
+        }
+        let isle: Vec<u32> = (0..nv).map(|v| find(&mut root, uvid[v])).collect();
+        let g = Self::G;
+        // A material with an island across the texture's edge tiles its texture: its islands
+        // get no room, and their repeats are not worked out.
+        let nmat = mesh
+            .material_ids
+            .iter()
+            .map(|&m| m as usize + 1)
+            .max()
+            .unwrap_or(1);
+        let mut mat_tiled = vec![false; nmat];
+        let mut span = vec![(DVec2::INFINITY, DVec2::NEG_INFINITY); nv];
+        for t in 0..mesh.triangle_count() {
+            let vs = mesh.triangle(t);
+            let r = isle[vs[0] as usize] as usize;
+            for v in vs {
+                span[r] = (span[r].0.min(at(v)), span[r].1.max(at(v)));
+            }
+        }
+        // The repeat an island lies in (with a little slack for UVs on the edge).
+        let tile = |r: u32| (span[r as usize].0 + 1e-4).floor();
+        for t in 0..mesh.triangle_count() {
+            let r = isle[mesh.triangle(t)[0] as usize];
+            if (span[r as usize].1 - 1e-4).floor().max(tile(r)) != tile(r) {
+                mat_tiled[mesh.material_ids.get(t).copied().unwrap_or(0) as usize] = true;
+            }
+        }
+        let mut tris = Vec::with_capacity(mesh.triangle_count());
+        let mut tri_isle = Vec::with_capacity(mesh.triangle_count());
+        let mut isle_mat = vec![u32::MAX; nv];
+        for t in 0..mesh.triangle_count() {
+            let vs = mesh.triangle(t);
+            let x = vs.map(at);
+            if (x[1] - x[0]).perp_dot(x[2] - x[0]) == 0.0 {
+                continue;
+            }
+            let mat = mesh.material_ids.get(t).copied().unwrap_or(0);
+            let im = &mut isle_mat[isle[vs[0] as usize] as usize];
+            if *im == u32::MAX {
+                *im = mat;
+            }
+            if mat_tiled[mat as usize] {
+                continue;
+            }
+            let off = tile(isle[vs[0] as usize]);
+            tris.push(x.map(|u| u - off));
+            tri_isle.push(isle[vs[0] as usize]);
+        }
+        let cell = |x: f64| ((x * g as f64).floor().clamp(0.0, g as f64 - 1.0)) as usize;
+        let span = |t: &[DVec2; 3]| {
+            let (lo, hi) = (t[0].min(t[1]).min(t[2]), t[0].max(t[1]).max(t[2]));
+            (cell(lo.x), cell(hi.x), cell(lo.y), cell(hi.y))
+        };
+        let mut start = vec![0u32; g * g + 1];
+        for t in &tris {
+            let (x0, x1, y0, y1) = span(t);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    start[y * g + x + 1] += 1;
+                }
+            }
+        }
+        for c in 0..g * g {
+            start[c + 1] += start[c];
+        }
+        let mut fill = start.clone();
+        let mut list = vec![0u32; start[g * g] as usize];
+        for (i, t) in tris.iter().enumerate() {
+            let (x0, x1, y0, y1) = span(t);
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    list[fill[y * g + x] as usize] = i as u32;
+                    fill[y * g + x] += 1;
+                }
+            }
+        }
+        UvFootprint {
+            tris,
+            tri_isle,
+            isle_mat,
+            mat_tiled,
+            isle,
+            start,
+            list,
+        }
+    }
+
+    /// Whether anything but island `own` lies within `radius` of UV point `x`: another
+    /// island's source triangle, or the texture's edge.
+    fn blocked(&self, x: DVec2, own: u32, radius: f64) -> bool {
+        let g = Self::G;
+        let tiled = |m: &u32| self.mat_tiled.get(*m as usize).copied().unwrap_or(true);
+        if self.isle_mat.get(own as usize).is_none_or(tiled) {
+            return true;
+        }
+        let x = x - x.floor();
+        if x.min_element() < radius || x.max_element() > 1.0 - radius {
+            return true;
+        }
+        let cell = |v: f64| ((v * g as f64).floor().clamp(0.0, g as f64 - 1.0)) as usize;
+        let (x0, x1) = (cell(x.x - radius), cell(x.x + radius));
+        let (y0, y1) = (cell(x.y - radius), cell(x.y + radius));
+        for cy in y0..=y1 {
+            for cx in x0..=x1 {
+                let c = cy * g + cx;
+                for &t in &self.list[self.start[c] as usize..self.start[c + 1] as usize] {
+                    if self.tri_isle[t as usize] != own
+                        && tri_distance(x, self.tris[t as usize]) < radius
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// The gutter state a stage of a reduction starts from (see [`SimplifyOptions::gutter_use`]).
+struct UvRoom<'f> {
+    fp: &'f UvFootprint,
+    /// Island (of `fp`) of each vertex of the mesh being reduced.
+    isle: Vec<u32>,
+    /// What each vertex's island boundary has drifted already (see [`State::drift`]).
+    drift: Vec<f32>,
+}
+
+/// Welded position of each vertex (equal bits), numbered in no particular order.
+fn position_ids(mesh: &Mesh) -> Vec<u32> {
+    let key = |v: usize| mesh.positions[v].to_array().map(f32::to_bits);
+    let mut order: Vec<u32> = (0..mesh.vertex_count() as u32).collect();
+    order.par_sort_unstable_by_key(|&v| (key(v as usize), v));
+    let mut id = vec![0u32; order.len()];
+    let mut n = 0u32;
+    for (i, &v) in order.iter().enumerate() {
+        if i > 0 && key(order[i - 1] as usize) != key(v as usize) {
+            n += 1;
+        }
+        id[v as usize] = n;
+    }
+    id
+}
+
+/// Whether [`SimplifyOptions::gutter_use`] applies to `mesh`.
+fn gutter_on(mesh: &Mesh, opts: &SimplifyOptions) -> bool {
+    opts.gutter_use > 0.0 && opts.uv_weight > 0.0 && !mesh.uvs.is_empty()
 }
 
 #[inline]
@@ -715,7 +960,12 @@ impl<'a> State<'a> {
 
     /// `frame` overrides the normalization frame (min corner, diagonal) so that pieces of one
     /// mesh (clusters) weigh geometry against attributes exactly like the whole mesh would.
-    fn new(mesh: &'a Mesh, opts: &'a SimplifyOptions, frame: Option<(DVec3, f64)>) -> State<'a> {
+    fn new(
+        mesh: &'a Mesh,
+        opts: &'a SimplifyOptions,
+        frame: Option<(DVec3, f64)>,
+        room: Option<UvRoom<'a>>,
+    ) -> State<'a> {
         let bounds = mesh.bounds();
         let (min, diag) =
             frame.unwrap_or((bounds.min.as_dvec3(), bounds.diagonal().max(1e-12) as f64));
@@ -853,6 +1103,11 @@ impl<'a> State<'a> {
             }
         }
         let attrs = AttrLayout::new(mesh, opts);
+        let (fp, isle, drift) = match room {
+            Some(r) => (Some(r.fp), r.isle, r.drift),
+            None => (None, Vec::new(), vec![0.0; mesh.vertex_count()]),
+        };
+        let gutter_use = opts.gutter_use.clamp(0.0, GUTTER_USE_MAX) as f64;
         let dim = attrs.dim;
         // Per wedge: normal-group quadric (12, padded), other-group quadric (12), gradients
         // (4·dim), weight (+3 pad): every block starts on a 4-lane boundary.
@@ -1148,7 +1403,7 @@ impl<'a> State<'a> {
             vremap: (0..mesh.vertex_count() as u32).collect(),
             pos_src,
             slid: Vec::new(),
-            drift: vec![0.0; mesh.vertex_count()],
+            drift,
             premap: (0..np as u32).collect(),
             inv_scale: diag,
             mirror,
@@ -1156,7 +1411,9 @@ impl<'a> State<'a> {
             dirty: vec![false; np],
             strict: opts.seams == SeamMode::Strict,
             relaxed: false,
-            drift_cap: DRIFT_UV,
+            fp,
+            isle,
+            gutter_use,
             scratch: thread_local::ThreadLocal::new(),
             alpha: opts.error_normalization.clamp(0.0, 1.0) as f64,
         }
@@ -1414,17 +1671,6 @@ impl<'a> State<'a> {
         (w * a.uv_weight * TEAR_UV * TEAR_UV - eo).max(0.0)
     }
 
-    /// Lets UV island boundaries drift by [`SimplifyOptions::gutter_tolerance`] times the UV
-    /// error a collapse of cost `cost` accepts (never less than [`DRIFT_UV`]).
-    fn widen_drift(&mut self, cost: f64) {
-        let share = self.opts.gutter_tolerance as f64;
-        if share > 0.0 && self.attrs.uv_weight > 0.0 && cost.is_finite() {
-            self.drift_cap = self
-                .drift_cap
-                .max(share * cost / self.attrs.uv_weight.sqrt());
-        }
-    }
-
     /// Whether wedges `a` and `b` have the same UVs in every UV set.
     #[inline]
     fn same_uv(&self, a: u32, b: u32) -> bool {
@@ -1642,7 +1888,7 @@ impl<'a> State<'a> {
         if self.attrs.nuv > 0 {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
             let ok = match wedges {
-                Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift),
+                Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift).is_some(),
                 None => self.uv_drift(p, q, &mut drift),
             };
             self.scratch().borrow_mut().drift = drift;
@@ -1714,7 +1960,7 @@ impl<'a> State<'a> {
         };
         self.p_corners(p, &mut corners);
         let ok = self.map_from_corners(&corners, q, &mut map).is_some()
-            && self.uv_drift_with(&corners, q, &map, out);
+            && self.uv_drift_with(&corners, q, &map, out).is_some();
         let mut s = self.scratch().borrow_mut();
         s.corners3 = corners;
         s.map3 = map;
@@ -1728,11 +1974,35 @@ impl<'a> State<'a> {
         q: u32,
         map: &[(u32, u32)],
         out: &mut Vec<(u32, f32)>,
-    ) -> bool {
+    ) -> Option<f64> {
         out.clear();
-        map.iter()
-            .filter(|&&(pw, qw)| pw != qw)
-            .all(|&(pw, qw)| self.uv_merge_ok(corners, q, pw, qw, out))
+        let mut price = 0.0;
+        for &(pw, qw) in map {
+            if pw != qw {
+                price += self.uv_merge_ok(corners, q, pw, qw, out)?;
+            }
+        }
+        Some(price)
+    }
+
+    /// What the gutter spill of collapsing onto `q` with wedge map `map` costs, to add to the
+    /// tear error in [`Self::cost`] (see [`SimplifyOptions::gutter_use`]); 0 for a collapse
+    /// the UV check rejects anyway.
+    fn spill_price(&self, corners: &[Corner], q: u32, map: &[(u32, u32)]) -> f64 {
+        if self.fp.is_none() {
+            return 0.0;
+        }
+        // A fan of one wedge that closes on itself has no boundary to spill over.
+        if let [(pw, _)] = *map
+            && corners
+                .iter()
+                .all(|c| c.pw == pw && corners.iter().any(|d| d.pa == c.pb && d.a == c.b))
+        {
+            return 0.0;
+        }
+        let mut drift = Vec::new();
+        self.uv_drift_with(corners, q, map, &mut drift)
+            .unwrap_or(0.0)
     }
 
     fn record_drift(&mut self, drift: &[(u32, f32)]) {
@@ -1747,7 +2017,9 @@ impl<'a> State<'a> {
     /// p's. Each moved triangle must keep its UV winding and stay inside the old fan, which
     /// lies on the island; whatever it covers outside is texture gutter. That spill, as the
     /// height of a sliver over the triangle's longest edge, is added to the drift already at
-    /// its corners and capped at [`DRIFT_UV`].
+    /// its corners and capped at [`DRIFT_UV`], or, with [`SimplifyOptions::gutter_use`], at
+    /// what the gutter there has room for. `None` if the merge is not allowed; otherwise what
+    /// its spill costs (0 without `gutter_use`).
     fn uv_merge_ok(
         &self,
         corners: &[Corner],
@@ -1755,14 +2027,15 @@ impl<'a> State<'a> {
         pw: u32,
         qw: u32,
         out: &mut Vec<(u32, f32)>,
-    ) -> bool {
+    ) -> Option<f64> {
+        let mut price = 0.0;
         let same =
             |a: Vec2, b: Vec2| (a - b).length_squared() as f64 <= TEAR_SAME_UV * TEAR_SAME_UV;
         let carried = self.drift[pw as usize];
         if carried > 0.0 {
             out.push((qw, carried));
         }
-        for set in &self.mesh.uvs {
+        for (si, set) in self.mesh.uvs.iter().enumerate() {
             let uv = |w: u32| set[w as usize].as_dvec2();
             let (up, uq) = (set[pw as usize], set[qw as usize]);
             let fan = || corners.iter().filter(|c| same(set[c.pw as usize], up));
@@ -1783,7 +2056,7 @@ impl<'a> State<'a> {
                 let before = (a - uv(c.pw)).perp_dot(b - uv(c.pw));
                 let after = (a - q2).perp_dot(b - q2);
                 if before * after < 0.0 || (before != 0.0 && after == 0.0) {
-                    return false; // folds over in UV
+                    return None; // folds over in UV
                 }
                 if closed {
                     continue;
@@ -1805,6 +2078,14 @@ impl<'a> State<'a> {
                     .iter()
                     .map(|&w| self.drift[w as usize])
                     .fold(0.0f32, f32::max) as f64;
+                // With gutter to use (UV set 0), the spill may go as deep as its share of the
+                // widest gutter that counts, if the texture around it is free (below).
+                let fp = self.fp.filter(|_| si == 0);
+                let cap = match fp {
+                    Some(_) => (self.gutter_use * GUTTER_MAX).max(DRIFT_UV),
+                    None => DRIFT_UV,
+                };
+                let mut probes: Vec<DVec2> = Vec::new();
                 let gap = |x: DVec2| {
                     fan()
                         .map(|o| tri_distance(x, [uv(o.pw), uv(o.a), uv(o.b)]))
@@ -1826,20 +2107,46 @@ impl<'a> State<'a> {
                     let samples = (1..SPILL_SAMPLES).map(|k| k as f64 / SPILL_SAMPLES as f64);
                     for t in across.chain(samples) {
                         if t > 0.0 && t < 1.0 {
-                            reach = reach.max(gap(q2 + dir * t));
+                            let y = q2 + dir * t;
+                            let g = gap(y);
+                            reach = reach.max(g);
+                            if fp.is_some() && g > 0.0 {
+                                probes.push(y);
+                            }
                         }
                     }
-                    if near + reach > self.drift_cap {
-                        return false;
+                    if near + reach > cap {
+                        return None;
                     }
                 }
                 let drift = near + reach;
+                if let Some(fp) = fp {
+                    // Past the half texel that is always allowed, the spill must fit the
+                    // gutter where it is: a spill of depth d takes its share of a gutter d + r
+                    // wide if nothing else (another island's source triangles, the texture's
+                    // edge) lies within r of it. An island spilling from the other side is
+                    // held to the same share, so the two cannot meet.
+                    if drift > DRIFT_UV {
+                        // (An eighth more: the depth is measured at sample points.)
+                        let need = 1.125 * drift * (1.0 - self.gutter_use) / self.gutter_use
+                            + self.opts.texel_size.max(0.0) as f64;
+                        let own = self.isle[pw as usize];
+                        if probes.iter().any(|&y| fp.blocked(y, own, need)) {
+                            return None;
+                        }
+                    }
+                    // Priced like a UV error of the spill's depth over the moved triangle.
+                    let x = [q, c.pa, c.pb].map(|v| self.pos[v as usize]);
+                    let area3 = (x[1] - x[0]).cross(x[2] - x[0]).length() * 0.5;
+                    let depth = SPILL_PRICE * drift;
+                    price += self.attrs.uv_weight * area3 * depth * depth;
+                }
                 for w in [qw, c.a, c.b] {
                     out.push((w, drift as f32));
                 }
             }
         }
-        true
+        Some(price)
     }
 
     /// Debug (`LF_STALL`): why each live position has no collapse left.
@@ -1887,7 +2194,9 @@ impl<'a> State<'a> {
         let mut map = std::mem::take(&mut self.scratch().borrow_mut().map);
         let mut corners = std::mem::take(&mut self.scratch().borrow_mut().corners2);
         self.p_corners(p, &mut corners);
-        let tear = self.map_from_corners(&corners, q, &mut map);
+        let tear = self
+            .map_from_corners(&corners, q, &mut map)
+            .map(|t| t + self.spill_price(&corners, q, &map));
         let r = match tear {
             Some(t) if self.validity_with(p, q, Some((&corners, &map)), None) == Validity::Ok => {
                 Some(self.cost(p, q, &map, t))
@@ -2068,6 +2377,7 @@ impl<'a> State<'a> {
             };
             next += 1;
             if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
+                let tear = tear + self.spill_price(&corners, q, &map);
                 let (c, g) = self.cost_with(p, q, &map, tear, (geom2, mean2, imp));
                 let start = maps.len() as u32;
                 maps.extend_from_slice(&map);
@@ -2385,6 +2695,7 @@ impl<'a> State<'a> {
                 continue;
             }
             if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
+                let tear = tear + self.spill_price(&corners, q, &map);
                 let (c, g) = self.cost(x, q, &map, tear);
                 let old = heap.key[x as usize];
                 if c < old || target == q && c <= old * 1.0001 + 1e-12 {
@@ -2483,7 +2794,6 @@ fn run_loop(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 }
                 worst_geom2 = worst_geom2.max(geom);
                 alive_tris -= st.collapse(p, q);
-                st.widen_drift(cost);
                 collapses += 1;
                 heap.remove(p);
                 st.refresh(p, q, &mut heap);
@@ -2553,7 +2863,6 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
     let mut sub = 0u32;
     let mut ring = Vec::new();
     let (mut worst_geom2, mut collapses) = (0.0f64, 0usize);
-    let mut worst_cost = 0.0f64;
     let frac = batch_fraction();
     // Stall escalation: 1 = open the round to every candidate, 2 = re-rank everything, 3 = stop.
     let mut stall = 0u32;
@@ -2744,7 +3053,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                 .collect();
             let (touched_ref, checked_ref, pre_ref) = (&touched, &checked_at, &pre);
             // (invalid, plan): no plan if the candidate is now invalid or dearer.
-            let plans: Vec<(bool, Option<((f64, f64), CollapsePlan)>)> = winners
+            let plans: Vec<(bool, Option<(f64, CollapsePlan)>)> = winners
                 .par_iter()
                 .with_min_len(4)
                 .map(|&li| {
@@ -2766,7 +3075,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     };
                     match eval {
                         Some((cost, geom)) if cost <= limit * 1.0001 + 1e-12 => {
-                            (false, Some(((geom, cost), shared.plan_collapse(p, q))))
+                            (false, Some((geom, shared.plan_collapse(p, q))))
                         }
                         e => (e.is_none(), None),
                     }
@@ -2780,8 +3089,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                     newly_validated += 1;
                 }
                 match plan {
-                    Some(((geom, cost), plan)) => {
-                        worst_cost = worst_cost.max(cost);
+                    Some((geom, plan)) => {
                         let q = plan.q;
                         worst_geom2 = worst_geom2.max(geom);
                         alive_tris -= st.apply_collapse(&plan);
@@ -2894,7 +3202,6 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             };
             match eval {
                 Some((cost, geom)) if cost <= limit * 1.0001 + 1e-12 => {
-                    worst_cost = worst_cost.max(cost);
                     worst_geom2 = worst_geom2.max(geom);
                     alive_tris -= st.collapse(p, q);
                     collapses += 1;
@@ -2983,10 +3290,6 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         } else if executed > 0 {
             stall = 0;
         }
-        // From the next round on, UV island boundaries may drift by a share of the error the
-        // collapses so far accepted (the cap changes between rounds only, so every evaluation
-        // of a round sees the same one, on any number of threads).
-        st.widen_drift(worst_cost);
         // Re-rank changed positions in parallel (deterministic: applied in list order).
         full_list.sort_unstable();
         let ranked: Vec<(u32, Option<Candidate>)> = {
@@ -3032,6 +3335,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                             return (x, None);
                         }
                         if let Some(tear) = shared.map_from_corners(corners, q, map) {
+                            let tear = tear + shared.spill_price(corners, q, map);
                             (x, Some(shared.cost(x, q, map, tear)))
                         } else {
                             (x, None)
@@ -3145,8 +3449,20 @@ fn simplify_clustered(
         }
     }
     let ratio = target as f64 / tc as f64;
+    // The UV islands are found on the whole mesh (a cluster does not see the islands next to
+    // its own), and what the clusters let them drift is handed on to the final pass.
+    let fp = gutter_on(mesh, opts).then(|| UvFootprint::new(mesh, &group));
+    let mut drift = vec![0.0f32; if fp.is_some() { vc } else { 0 }];
     // 3. Reduce every cluster interior in parallel (deterministic: results are joined in order).
-    type Part = (Vec<u32>, Vec<u32>, f32, f32, usize, Vec<(u32, u32)>);
+    type Part = (
+        Vec<u32>,
+        Vec<u32>,
+        f32,
+        f32,
+        usize,
+        Vec<(u32, u32)>,
+        Vec<(u32, f32)>,
+    );
     let parts: Vec<Result<Part>> = (0..k)
         .into_par_iter()
         .map(|c| {
@@ -3201,7 +3517,19 @@ fn simplify_clustered(
                 cluster_threshold: 0,
                 ..opts.clone()
             };
-            let r = simplify_frame(&sub, &sub_opts, Some(frame), PartsMode::Cluster)?;
+            let sub_room = fp.as_ref().map(|fp| UvRoom {
+                fp,
+                isle: verts.iter().map(|&v| fp.isle[v as usize]).collect(),
+                drift: vec![0.0; verts.len()],
+            });
+            let (r, left) =
+                simplify_frame(&sub, &sub_opts, Some(frame), PartsMode::Cluster, sub_room)?;
+            // (input vertex, drift) of the cluster's remaining vertices.
+            let used: Vec<(u32, f32)> = left
+                .iter()
+                .zip(&r.source_vertex)
+                .map(|(&d, &s)| (verts[s as usize], d))
+                .collect();
             let out_idx = r
                 .mesh
                 .indices
@@ -3223,6 +3551,7 @@ fn simplify_clustered(
                 r.relative_error,
                 r.collapses,
                 remap,
+                used,
             ))
         })
         .collect();
@@ -3234,8 +3563,12 @@ fn simplify_clustered(
     let (mut err, mut collapses) = (0.0f32, 0usize);
     let mut prior_geom2 = 0.0f64;
     for part in parts {
-        let (idx, mats, e, rel, n, remap) = part?;
+        let (idx, mats, e, rel, n, remap, used) = part?;
         prior_geom2 = prior_geom2.max((rel as f64).powi(2));
+        // A vertex on a cluster border is in several clusters: the most drift counts.
+        for (v, d) in used {
+            drift[v as usize] = drift[v as usize].max(d);
+        }
         merged.indices.extend_from_slice(&idx);
         merged.material_ids.extend_from_slice(&mats);
         for (from, to) in remap {
@@ -3270,11 +3603,17 @@ fn simplify_clustered(
         cluster_threshold: 0,
         ..opts.clone()
     };
-    let r = simplify_frame(
+    let final_room = fp.as_ref().map(|fp| UvRoom {
+        fp,
+        isle: inv.iter().map(|&o| fp.isle[o as usize]).collect(),
+        drift: inv.iter().map(|&o| drift[o as usize]).collect(),
+    });
+    let (r, _) = simplify_frame(
         &merged,
         &final_opts,
         Some(frame),
         PartsMode::Final(prior_geom2),
+        final_room,
     )?;
     let source_vertex = r.source_vertex.iter().map(|&c| inv[c as usize]).collect();
     let vertex_remap = (0..vc)
@@ -3333,7 +3672,7 @@ fn simplify_top(mesh: &Mesh, opts: &SimplifyOptions) -> Result<SimplifyResult> {
         crate::reduce::parts::remap_orphans(mesh, &mut r);
         return Ok(r);
     }
-    let mut r = simplify_frame(mesh, opts, None, PartsMode::Top)?;
+    let (mut r, _) = simplify_frame(mesh, opts, None, PartsMode::Top, None)?;
     // Vertices of removed parts map onto the remaining surface.
     crate::reduce::parts::remap_orphans(mesh, &mut r);
     Ok(r)
@@ -3367,7 +3706,8 @@ fn simplify_frame(
     opts: &SimplifyOptions,
     frame: Option<(DVec3, f64)>,
     parts_mode: PartsMode,
-) -> Result<SimplifyResult> {
+    room: Option<UvRoom>,
+) -> Result<(SimplifyResult, Vec<f32>)> {
     mesh.validate()?;
     if let Some(r) = opts.target_ratio
         && !(0.0..=1.0).contains(&r)
@@ -3384,7 +3724,7 @@ fn simplify_frame(
         && opts.symmetry == Symmetry::Off
         && t < input_tris
     {
-        return simplify_clustered(mesh, opts, t);
+        return Ok((simplify_clustered(mesh, opts, t)?, Vec::new()));
     }
     let wants_parts = opts.remove_parts
         && opts.symmetry == Symmetry::Off
@@ -3395,6 +3735,18 @@ fn simplify_frame(
         PartsMode::Final(g) => g,
         _ => 0.0,
     };
+    // The source UV islands, if they may spill into the gutter around them and the caller
+    // has not found them on the mesh this one is a piece of.
+    let own_fp = (room.is_none() && gutter_on(mesh, opts))
+        .then(|| UvFootprint::new(mesh, &position_ids(mesh)));
+    let room = room.or_else(|| {
+        own_fp.as_ref().map(|fp| UvRoom {
+            fp,
+            isle: fp.isle.clone(),
+            drift: vec![0.0; mesh.vertex_count()],
+        })
+    });
+    let mut room = Some(room);
     // The part analysis runs alongside building the reducer state.
     let (parts, mut st) = rayon::join(
         || {
@@ -3408,7 +3760,7 @@ fn simplify_frame(
                 })
                 .flatten()
         },
-        || State::new(mesh, opts, frame),
+        || State::new(mesh, opts, frame, room.take().flatten()),
     );
     st.parts = parts;
     st.prior_geom2 = prior;
@@ -3479,15 +3831,28 @@ fn simplify_frame(
             source_vertex[new as usize] = old as u32;
         }
     }
-    Ok(SimplifyResult {
-        mesh: out,
-        error: ((worst_geom2.sqrt() * st.inv_scale) as f32).max(st.part_error),
-        relative_error: worst_geom2.sqrt() as f32,
-        vertex_remap,
-        collapses,
-        symmetry_plane,
-        source_vertex,
-    })
+    // What the island boundaries at the vertices that are left have drifted, for a later
+    // stage.
+    let left = if st.fp.is_some() {
+        source_vertex
+            .iter()
+            .map(|&v| st.drift[v as usize])
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((
+        SimplifyResult {
+            mesh: out,
+            error: ((worst_geom2.sqrt() * st.inv_scale) as f32).max(st.part_error),
+            relative_error: worst_geom2.sqrt() as f32,
+            vertex_remap,
+            collapses,
+            symmetry_plane,
+            source_vertex,
+        },
+        left,
+    ))
 }
 
 /// Simplifies every mesh of a scene in parallel.
@@ -3889,6 +4254,145 @@ pub(crate) mod tests {
         }
     }
 
+    /// A wavy sheet cut into UV islands of 4 × 4 cells, each shrunk toward its middle in UV so
+    /// that gutters `1 - fill` of an island wide lie between them, and warped so that every
+    /// island boundary bends: half of each side bulges out, half in.
+    fn bowed_islands(n: u32, fill: f32) -> Mesh {
+        let g = grid(n);
+        let (mut pos, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+        for t in 0..g.triangle_count() {
+            let tri = g.triangle_positions(t);
+            let c = (tri[0] + tri[1] + tri[2]) / 3.0;
+            let mid = Vec2::new(
+                4.0 * (c.x / 4.0).floor() + 2.0,
+                4.0 * (c.z / 4.0).floor() + 2.0,
+            );
+            for p in tri {
+                let d = Vec2::new(p.x, p.z) - mid;
+                let bow = |along: f32| 1.0 + 0.1 * (along * std::f32::consts::FRAC_PI_2).sin();
+                let d = Vec2::new(d.x * bow(d.y), d.y * bow(d.x));
+                idx.push(pos.len() as u32);
+                uv.push((mid + d * fill) / n as f32 * 0.9 + 0.05);
+                pos.push(Vec3::new(
+                    p.x,
+                    1.5 * (p.x * 0.45).sin() * (p.z * 0.35).cos(),
+                    p.z,
+                ));
+            }
+        }
+        let mut m = Mesh::new(pos, idx);
+        m.uvs = vec![uv];
+        crate::reduce::repair::weld(&mut m, 0.0);
+        m
+    }
+
+    #[test]
+    fn gutter_use_spills_only_into_free_gutter() {
+        // Islands with bent boundaries and gutters between them. With a share of the gutter
+        // to use, a reduced island may leave its source footprint, but only by its share of
+        // the gutter at that place, and never onto another island's source triangles.
+        let m = bowed_islands(32, 0.7);
+        let fp = UvFootprint::new(&m, &position_ids(&m));
+        let src: Vec<([DVec2; 3], u32)> = (0..m.triangle_count())
+            .map(|t| {
+                let vs = m.triangle(t);
+                (
+                    vs.map(|v| m.uvs[0][v as usize].as_dvec2()),
+                    fp.isle[vs[0] as usize],
+                )
+            })
+            .collect();
+        for share in [0.2f32, 0.4] {
+            let mut deepest = 0.0f64;
+            for target in [600, 250, 100] {
+                let r = simplify(
+                    &m,
+                    &SimplifyOptions {
+                        target_triangles: Some(target),
+                        gutter_use: share,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                assert!(r.mesh.triangle_count() <= target + 2);
+                for t in 0..r.mesh.triangle_count() {
+                    let vs = r.mesh.triangle(t);
+                    let isle = vs.map(|v| fp.isle[r.source_vertex[v as usize] as usize]);
+                    if isle[0] != isle[1] || isle[1] != isle[2] {
+                        continue; // torn across islands: priced as a tear, not a spill
+                    }
+                    let [a, b, c] = vs.map(|v| r.mesh.uvs[0][v as usize].as_dvec2());
+                    for i in 0..=6 {
+                        for j in 0..=6 - i {
+                            let x = a + (b - a) * (i as f64 / 6.0) + (c - a) * (j as f64 / 6.0);
+                            let (mut own, mut other) = (f64::INFINITY, f64::INFINITY);
+                            for (tri, k) in &src {
+                                let d = tri_distance(x, *tri);
+                                if *k == isle[0] {
+                                    own = own.min(d);
+                                } else {
+                                    other = other.min(d);
+                                }
+                            }
+                            deepest = deepest.max(own);
+                            // (A tenth over: the reducer measures depth at sample points.)
+                            let allowed = (1.1 * share as f64 * (own + other)).max(DRIFT_UV) + 1e-4;
+                            assert!(
+                                own <= allowed,
+                                "share {share} target {target}: triangle {t} is {own} off its \
+                                 island at {x}, {other} from the next"
+                            );
+                        }
+                    }
+                }
+            }
+            // The gutter does get used.
+            assert!(
+                deepest > 4.0 * DRIFT_UV,
+                "share {share}: deepest spill {deepest}"
+            );
+        }
+    }
+
+    #[test]
+    fn gutter_use_keeps_seams_in_place_on_seam_dense_meshes() {
+        // Seams every few triangles, none of them straight in UV. Without gutter to use, a
+        // seam vertex can only leave by sliding: one island is dragged over its neighbor (the
+        // vertex keeps its UVs at another vertex's position). With it, seams are reduced
+        // along themselves, and the shape is no worse for it.
+        let m = bowed_islands(32, 0.7);
+        let run = |gutter_use: f32| {
+            let r = simplify(
+                &m,
+                &SimplifyOptions {
+                    target_triangles: Some(400),
+                    gutter_use,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(r.mesh.triangle_count() <= 402);
+            let slid = (0..r.mesh.vertex_count())
+                .filter(|&v| r.mesh.positions[v] != m.positions[r.source_vertex[v] as usize])
+                .count();
+            (surface_distance(&m, &r.mesh, 20_000).relative_mean, slid)
+        };
+        let (off, on) = (run(0.0), run(0.25));
+        assert!(off.1 >= 30, "{} slid without gutter use", off.1);
+        assert!(
+            3 * on.1 < off.1,
+            "slid: {} with gutter use, {} without",
+            on.1,
+            off.1
+        );
+        assert!(
+            on.0 <= off.0,
+            "mean error {} with gutter use, {} without",
+            on.0,
+            off.0
+        );
+    }
+
     #[test]
     fn normal_seams_stay_on_their_uv_island() {
         // A wavy sheet with one UV chart and flat shading: every vertex is split by normals
@@ -4106,7 +4610,7 @@ mod attr_quadric_check {
             uv_weight: 0.0,
             ..Default::default()
         };
-        let st = State::new(&m, &opts, None);
+        let st = State::new(&m, &opts, None, None);
         let p = (4 * n + 4) as u32;
         let nw = 0.5f64; // sqrt(1.0) * 0.5
         for q in st.neighbors(p) {
