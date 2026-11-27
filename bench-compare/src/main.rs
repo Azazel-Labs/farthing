@@ -1626,6 +1626,7 @@ mod pack_bench;
 
 /// `realtime <assets...>`: every mesh of each asset as one, reduced to a fixed triangle count
 /// (`RT_TARGET`, default 3000). Time is the best of `RT_RUNS` (default 5) after one warm-up.
+/// `RT_HASH=1` also prints a hash of each output mesh.
 fn realtime_mode(assets: &[String]) {
     let target: usize = std::env::var("RT_TARGET")
         .ok()
@@ -1708,6 +1709,13 @@ fn realtime_mode(assets: &[String]) {
                 r = Some(out);
             }
             let r = r.unwrap();
+            // RT_HASH=1: a hash of the whole output mesh, to compare builds byte for byte.
+            if std::env::var_os("RT_HASH").is_some() {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::hash::DefaultHasher::new();
+                format!("{r:?}").hash(&mut h);
+                println!("hash {name} {} {:016x}", label.replace(' ', "_"), h.finish());
+            }
             let d = surface_distance(&m, &r, 40000);
             let (_, u90, nd) = attribute_error(&m, &r);
             println!(
