@@ -211,15 +211,14 @@ fn spread(x: u32) -> u32 {
 /// Sorts keys (code above `CODE_SHIFT`, tie-breaking bits below) in
 /// parallel: blocks count their top digits and write their keys straight to place (relaxed
 /// atomic stores, plain stores on common targets), then each bucket is sorted on its own.
-/// The order is the same however it is split.
-fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
+/// The order is the same however it is split. Sorted into `out`; `hist` is working space.
+fn sort_by_code(keys: &[u64], hist: &mut Vec<[u32; 1024]>, out: &mut Vec<u64>) {
     // One scatter by the top 10 bits of the code, then each bucket (a few hundred keys,
     // in cache) sorted on its own. Keys are distinct, so the order is the full sort's.
     let n = keys.len();
     let blk = (n / (4 * rayon::current_num_threads())).max(PAR_MIN);
     let digit = |k: u64| (k >> (CODE_SHIFT + 3 * DEPTH - 10)) as usize & 1023;
-    let mut hist: Vec<[u32; 1024]> = keys
-        .par_chunks(blk)
+    keys.par_chunks(blk)
         .map(|b| {
             let mut h = [0u32; 1024];
             for &k in b {
@@ -227,7 +226,7 @@ fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
             }
             h
         })
-        .collect();
+        .collect_into_vec(hist);
     let mut start = [0u32; 1025];
     let mut sum = 0u32;
     for d in 0..1024 {
@@ -239,11 +238,12 @@ fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
         }
     }
     start[1024] = sum;
-    let dst: Vec<AtomicU64> = (0..n)
+    let mut dst: Vec<AtomicU64> = recycle(std::mem::take(out), AtomicU64::new);
+    (0..n)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|_| AtomicU64::new(0))
-        .collect();
+        .collect_into_vec(&mut dst);
     keys.par_chunks(blk)
         .zip(hist.par_iter_mut())
         .for_each(|(b, h)| {
@@ -253,8 +253,7 @@ fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
                 h[d] += 1;
             }
         });
-    drop(keys);
-    let mut out: Vec<u64> = dst.into_iter().map(AtomicU64::into_inner).collect();
+    *out = dst.into_iter().map(AtomicU64::into_inner).collect();
     let mut buckets: Vec<&mut [u64]> = Vec::with_capacity(1024);
     let mut rest = &mut out[..];
     for d in 0..1024 {
@@ -268,7 +267,6 @@ fn sort_by_code(keys: Vec<u64>) -> Vec<u64> {
         .into_par_iter()
         .with_min_len(8)
         .for_each(|b| b.sort_unstable());
-    out
 }
 
 /// A refinement node: a range of fine cells, the leading Morton digits all its codes share
@@ -548,10 +546,11 @@ struct TriSet<K> {
 }
 
 impl<K: TriKey> TriSet<K> {
-    fn new(n: usize) -> TriSet<K> {
+    /// Room for `n` triangles, in `slots`' memory.
+    fn new(n: usize, slots: Vec<K>) -> TriSet<K> {
         let cap = (n * 2).next_power_of_two().max(16);
         TriSet {
-            slots: vec![K::EMPTY; cap],
+            slots: filled(slots, cap, K::EMPTY),
             shift: 64 - cap.trailing_zeros(),
         }
     }
@@ -579,10 +578,244 @@ enum Seen {
     Large(TriSet<u128>),
 }
 
+/// What a stage-two triangle needs, gathered in parallel (see `realtime_pass`).
+struct Pre {
+    key: u128,
+    c: [u32; 3],
+    roots: [u32; 3],
+    facing: Vec3,
+    mat: u32,
+    fwd: bool,
+    fold: bool,
+}
+
+/// Memory a thread's scratch keeps whatever the calls after need, and how much more than a
+/// call used it may hold past that before it is freed.
+const RETAIN_ALWAYS: usize = 64 << 20;
+const RETAIN_RATIO: usize = 4;
+
+/// The size of a buffer: bytes held and bytes in use (inner buffers included).
+trait Held {
+    const NESTED: bool = false;
+    fn held(&self) -> (usize, usize) {
+        (0, 0)
+    }
+}
+
+macro_rules! plain_held {
+    ($($t:ty),* $(,)?) => { $(impl Held for $t {})* };
+}
+plain_held!(
+    u8,
+    u32,
+    u64,
+    u128,
+    f32,
+    bool,
+    Vec3,
+    [u32; 2],
+    [u32; 3],
+    [u32; 1024],
+    (f32, u32),
+    ([u32; 3], u32),
+    (u32, VSum),
+    [f64; NS],
+    Q,
+    VSum,
+    FCell,
+    Node,
+    Pre,
+    Option<Thin>,
+    (u32, u32, u32),
+);
+
+impl<T: Held> Held for Vec<T> {
+    const NESTED: bool = true;
+    fn held(&self) -> (usize, usize) {
+        let s = std::mem::size_of::<T>();
+        let (mut cap, mut len) = (self.capacity() * s, self.len() * s);
+        if T::NESTED {
+            for x in self {
+                let (c, l) = x.held();
+                cap += c;
+                len += l;
+            }
+        }
+        (cap, len)
+    }
+}
+
+impl<T: Ord> Held for BinaryHeap<T> {
+    fn held(&self) -> (usize, usize) {
+        let s = std::mem::size_of::<T>();
+        (self.capacity() * s, self.len() * s)
+    }
+}
+
+impl<K, V> Held for std::collections::HashMap<K, V> {
+    fn held(&self) -> (usize, usize) {
+        let s = std::mem::size_of::<(K, V)>() + 1;
+        (self.capacity() * s, self.len() * s)
+    }
+}
+
+/// The working buffers of a realtime call, each named for the array it holds. A call takes
+/// the calling thread's set, sizes every buffer it uses afresh (cleared and refilled, so
+/// nothing of an earlier call is read), and puts the set back, so a thread that reduces again
+/// writes to memory it already has instead of new pages from the system.
+macro_rules! scratch {
+    ($($f:ident: $t:ty,)*) => {
+        #[derive(Default)]
+        struct RealtimeScratch {
+            $($f: $t,)*
+        }
+
+        impl RealtimeScratch {
+            /// Bytes held and bytes in use, over every buffer.
+            fn bytes(&self) -> (usize, usize) {
+                let mut b = (0, 0);
+                $(
+                    let (c, l) = self.$f.held();
+                    b = (b.0 + c, b.1 + l);
+                )*
+                b
+            }
+
+            /// The buffers that hold no memory.
+            #[cfg(test)]
+            fn empty(&self) -> Vec<&'static str> {
+                let mut v = Vec::new();
+                $(
+                    if self.$f.held().0 == 0 {
+                        v.push(stringify!($f));
+                    }
+                )*
+                v
+            }
+        }
+    };
+}
+
+scratch! {
+    keys_in: Vec<u64>,
+    keys: Vec<u64>,
+    hist: Vec<[u32; 1024]>,
+    rank: Vec<u32>,
+    spos: Vec<Vec3>,
+    routed: Vec<Vec<Vec<([u32; 3], u32)>>>,
+    first_at: Vec<u32>,
+    vs: Vec<VSum>,
+    spill: Vec<Vec<(u32, VSum)>>,
+    borders: Vec<[u32; 2]>,
+    starts: Vec<u32>,
+    fcells: Vec<FCell>,
+    nodes: Vec<Node>,
+    leaves: Vec<u32>,
+    kids: Vec<u32>,
+    heap: BinaryHeap<(u64, std::cmp::Reverse<u32>)>,
+    tstate: Vec<u8>,
+    tinfo: std::collections::HashMap<u32, Thin>,
+    pending: Vec<u32>,
+    found: Vec<Option<Thin>>,
+    rest: Vec<u32>,
+    cells: Vec<(u32, u32, u32)>,
+    cellr: Vec<u32>,
+    cell_st: Vec<[f64; NS]>,
+    parent: Vec<u32>,
+    kept: Vec<Vec<([u32; 3], u32)>>,
+    cid: Vec<u32>,
+    wbest: Vec<(f32, u32)>,
+    warea_v: Vec<f32>,
+    cq: Vec<Q>,
+    cpos: Vec<Vec3>,
+    rep: Vec<u32>,
+    clocked: Vec<bool>,
+    cbord: Vec<bool>,
+    pre: Vec<Vec<Pre>>,
+    wid: Vec<u32>,
+    wsrc: Vec<u32>,
+    wc: Vec<u32>,
+    warea: Vec<f32>,
+    tw: Vec<[u32; 3]>,
+    tc: Vec<[u32; 3]>,
+    tmat: Vec<u32>,
+    twin: Vec<bool>,
+    seen_small: Vec<u64>,
+    seen_large: Vec<u128>,
+    fold: Vec<bool>,
+    tn: Vec<Vec3>,
+    attr: Vec<f32>,
+    alive: Vec<bool>,
+    side: Vec<[u32; 2]>,
+    sdeg: Vec<u8>,
+    soff: Vec<u32>,
+    slen: Vec<u32>,
+    scap: Vec<u32>,
+    star_pool: Vec<u32>,
+    wout: Vec<u32>,
+    srcs: Vec<u32>,
+    cluster_out: Vec<u32>,
+    normal_parts: Vec<Vec<Vec3>>,
+}
+
+thread_local! {
+    /// The calling thread's realtime buffers between calls.
+    static SCRATCH: std::cell::Cell<RealtimeScratch> = std::cell::Cell::new(RealtimeScratch::default());
+}
+
+/// Frees the working memory [`Quality::Realtime`](crate::reduce::Quality::Realtime) keeps on
+/// the calling thread between calls (see there). Other threads keep theirs; a program that
+/// reduced on a rayon pool can free every worker's with `rayon::broadcast(|_|
+/// release_realtime_scratch())`.
+pub fn release_realtime_scratch() {
+    let _ = SCRATCH.try_with(|s| drop(s.take()));
+}
+
+/// An emptied buffer with `v`'s memory, for another element type of the same size and
+/// alignment (an atomic and its plain value): collected in place, so nothing is allocated.
+fn recycle<T, U>(mut v: Vec<T>, f: impl FnMut(T) -> U) -> Vec<U> {
+    v.clear();
+    v.into_iter().map(f).collect()
+}
+
+/// `v` emptied, with room for `n` items.
+fn reuse<T>(mut v: Vec<T>, n: usize) -> Vec<T> {
+    v.clear();
+    v.reserve(n);
+    v
+}
+
+/// `v` holding `n` copies of `x`.
+fn filled<T: Clone>(mut v: Vec<T>, n: usize, x: T) -> Vec<T> {
+    v.clear();
+    v.resize(n, x);
+    v
+}
+
 pub(crate) fn simplify_realtime(
     mesh: &Mesh,
     opts: &SimplifyOptions,
     target: Option<usize>,
+) -> Result<SimplifyResult> {
+    // The thread's buffers are taken for the call, not borrowed: a call that rayon starts on
+    // this thread while it waits (a host reducing meshes in parallel) finds none and makes its
+    // own, and whichever call ends last leaves its set.
+    let mut s = SCRATCH.try_with(|s| s.take()).unwrap_or_default();
+    let r = reduce_with(mesh, opts, target, &mut s);
+    let (held, used) = s.bytes();
+    // A call that needed far less than one before it frees the excess (all of it) once
+    // there is enough to matter, so one huge mesh doesn't pin its memory for good.
+    if held <= RETAIN_ALWAYS || held <= used.saturating_mul(RETAIN_RATIO) {
+        let _ = SCRATCH.try_with(|c| c.set(s));
+    }
+    r
+}
+
+fn reduce_with(
+    mesh: &Mesh,
+    opts: &SimplifyOptions,
+    target: Option<usize>,
+    s: &mut RealtimeScratch,
 ) -> Result<SimplifyResult> {
     // The cluster budget assumes about two triangles per cluster, as on a closed surface. An
     // open sheet has about one (a disc of k vertices has k - 2 triangles), so stage one can
@@ -590,7 +823,7 @@ pub(crate) fn simplify_realtime(
     // short goes again with the budget scaled by the shortfall; a large one is rarely short
     // by much and is not worth a second pass.
     let mut per_tri = CLUSTERS_PER_TRI;
-    let mut r = realtime_pass(mesh, opts, target, per_tri)?;
+    let mut r = realtime_pass(mesh, opts, target, per_tri, s)?;
     let Some(t) = target else {
         return Ok(r);
     };
@@ -603,7 +836,7 @@ pub(crate) fn simplify_realtime(
             break;
         }
         per_tri *= (1.2 * t as f32 / got.max(1) as f32).min(4.0);
-        let again = realtime_pass(mesh, opts, target, per_tri)?;
+        let again = realtime_pass(mesh, opts, target, per_tri, s)?;
         if again.mesh.triangle_count() <= got {
             break;
         }
@@ -618,6 +851,7 @@ fn realtime_pass(
     opts: &SimplifyOptions,
     target: Option<usize>,
     per_tri: f32,
+    s: &mut RealtimeScratch,
 ) -> Result<SimplifyResult> {
     let nv = mesh.vertex_count();
     let nt = mesh.triangle_count();
@@ -646,7 +880,7 @@ fn realtime_pass(
     let hash_bits = CODE_SHIFT - index_bits;
     let cell = (1u32 << DEPTH) as f32 / ext;
     let top = ((1u32 << DEPTH) - 1) as f32;
-    let keys: Vec<u64> = (0..nv)
+    (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|v| {
@@ -660,20 +894,22 @@ fn realtime_pass(
             let h = (h as u64 >> 1) >> (31 - hash_bits);
             ((c as u64) << CODE_SHIFT) | (h << index_bits) | v as u64
         })
-        .collect();
-    let keys = sort_by_code(keys);
+        .collect_into_vec(&mut s.keys_in);
+    sort_by_code(&s.keys_in, &mut s.hist, &mut s.keys);
+    let keys = &s.keys[..];
     let code = |r: usize| (keys[r] >> CODE_SHIFT) as u32;
     let vert = |r: usize| (keys[r] & ((1 << index_bits) - 1)) as u32;
 
     // From here on vertices are Morton ranks: positions (unit-diagonal frame, centered) are
     // gathered once, triangle corners map through `rank`, and every per-vertex pass after
     // reads its arrays in order.
-    let arank: Vec<AtomicU32> = (0..nv)
+    let mut arank: Vec<AtomicU32> = recycle(std::mem::take(&mut s.rank), AtomicU32::new);
+    (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|_| AtomicU32::new(0))
-        .collect();
-    let spos: Vec<Vec3> = (0..nv)
+        .collect_into_vec(&mut arank);
+    (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|r| {
@@ -681,8 +917,9 @@ fn realtime_pass(
             arank[v].store(r as u32, Relaxed);
             (mesh.positions[v] - center) * inv
         })
-        .collect();
-    let rank: Vec<u32> = arank.into_iter().map(AtomicU32::into_inner).collect();
+        .collect_into_vec(&mut s.spos);
+    s.rank = arank.into_iter().map(AtomicU32::into_inner).collect();
+    let (spos, rank) = (&s.spos[..], &s.rank[..]);
     lap("morton");
 
     // The parallel passes run over a fixed number of chunks of the Morton order, set by the
@@ -691,23 +928,31 @@ fn realtime_pass(
     let csize = nv.div_ceil((nv / CHUNK_VERTS).clamp(1, MAX_CHUNKS));
     let nch = nv.div_ceil(csize);
     let tblock = nt.div_ceil(nch).max(1);
-    let routed: Vec<Vec<Vec<([u32; 3], u32)>>> = (0..nt.div_ceil(tblock))
-        .into_par_iter()
-        .map(|b| {
-            let mut out = vec![Vec::new(); nch];
+    // (Block and chunk lists past this call's counts are kept for later calls, unread.)
+    let nblk = nt.div_ceil(tblock);
+    if s.routed.len() < nblk {
+        s.routed.resize_with(nblk, Vec::new);
+    }
+    s.routed[..nblk]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(b, out)| {
+            if out.len() < nch {
+                out.resize_with(nch, Vec::new);
+            }
+            out[..nch].iter_mut().for_each(Vec::clear);
             for t in b * tblock..((b + 1) * tblock).min(nt) {
                 let tr = mesh.triangle(t).map(|v| rank[v as usize]);
                 out[tr[0].min(tr[1]).min(tr[2]) as usize / csize].push((tr, t as u32));
             }
-            out
-        })
-        .collect();
+        });
+    let routed = &s.routed[..nblk];
     let chunk_tris = |k: usize| routed.iter().flat_map(move |b| b[k].iter());
 
     // Each vertex's position, as the first rank at it (vertices at one position are
     // neighbors in rank, see `sort_by_code`). Fan sums count neighbors by these, so the copies
     // of a vertex split by a seam or unwelded faces sum to one fan.
-    let first_at: Vec<u32> = (0..nv)
+    (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|r| {
@@ -717,22 +962,29 @@ fn realtime_pass(
             }
             q as u32
         })
-        .collect();
+        .collect_into_vec(&mut s.first_at);
+    let first_at = &s.first_at[..];
 
     // Face sums per vertex. A chunk owns its vertices' sums; corners past its end are handed
     // on and added after, in chunk order.
     // Filled in parallel, so its pages are first touched by every thread.
-    let mut vs: Vec<VSum> = (0..nv)
+    let vs = &mut s.vs;
+    (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
         .map(|_| VSum::default())
-        .collect();
-    let parts: Vec<(f64, usize, Vec<(u32, VSum)>)> = vs
+        .collect_into_vec(vs);
+    if s.spill.len() < nch {
+        s.spill.resize_with(nch, Vec::new);
+    }
+    let parts: Vec<(f64, usize)> = vs
         .par_chunks_mut(csize)
+        .zip(s.spill[..nch].par_iter_mut())
         .enumerate()
-        .map(|(k, own)| {
+        .map(|(k, (own, spill))| {
             let lo = (k * csize) as u32;
-            let (mut total, mut live, mut spill) = (0f64, 0usize, Vec::new());
+            let (mut total, mut live) = (0f64, 0usize);
+            spill.clear();
             for &([a, b, c], _) in chunk_tris(k) {
                 if a == b || b == c || a == c {
                     continue;
@@ -761,20 +1013,21 @@ fn realtime_pass(
                     }
                 }
             }
-            (total, live, spill)
+            (total, live)
         })
         .collect();
     let (mut total_area, mut live) = (0f64, 0usize);
-    for (t, l, spill) in parts {
+    for ((t, l), spill) in parts.into_iter().zip(&s.spill[..nch]) {
         total_area += t;
         live += l;
         for (v, d) in spill {
-            vs[v as usize].add(&d);
+            vs[*v as usize].add(d);
         }
     }
     if live == 0 {
         return Ok(unchanged(mesh));
     }
+    let vs = &s.vs[..];
     let avg_area = (total_area / live as f64).max(1e-30);
     // Border edges, worked out per position: the fan sums count neighbors by position (see
     // `first_at`), so the copies of a vertex at one position facing one way (split by a seam,
@@ -783,7 +1036,7 @@ fn realtime_pass(
     // back of a double-sided sheet is there too, facing the other way, and is summed apart.)
     const NONE: [u32; 2] = [u32::MAX; 2];
     let bw = opts.border_weight;
-    let borders: Vec<[u32; 2]> = if bw > 0.0 {
+    if bw > 0.0 {
         (0..nv)
             .into_par_iter()
             .with_min_len(PAR_MIN)
@@ -813,21 +1066,15 @@ fn realtime_pass(
                     _ => NONE,
                 }
             })
-            .collect()
+            .collect_into_vec(&mut s.borders);
     } else {
-        Vec::new()
-    };
-    drop(first_at);
+        s.borders.clear();
+    }
+    let borders = &s.borders[..];
     // Importance scales a vertex's error, so clusters stay finer and collapse later there.
     let importance = opts.vertex_importance.as_deref();
     let vq = |r: usize| {
-        let mut q = vertex_quadric(
-            r,
-            &vs[r],
-            &spos,
-            bw,
-            borders.get(r).copied().unwrap_or(NONE),
-        );
+        let mut q = vertex_quadric(r, &vs[r], spos, bw, borders.get(r).copied().unwrap_or(NONE));
         if let Some(w) = importance.and_then(|i| i.get(vert(r) as usize)) {
             for x in &mut q {
                 *x *= w.max(0.0);
@@ -887,7 +1134,9 @@ fn realtime_pass(
     };
     let mut fcells: Vec<FCell> = {
         let shift = 3 * (DEPTH - fine_level);
-        let mut starts: Vec<u32> = vec![0];
+        let starts = &mut s.starts;
+        starts.clear();
+        starts.push(0);
         starts.par_extend(
             (1..nv)
                 .into_par_iter()
@@ -896,16 +1145,15 @@ fn realtime_pass(
                 .map(|r| r as u32),
         );
         starts.push(nv as u32);
-        starts
-            .windows(2)
-            .map(|w| FCell {
-                s: w[0],
-                e: w[1],
-                c0: 0,
-                c1: 0,
-                st: [0.0; NS],
-            })
-            .collect()
+        let mut fcells = reuse(std::mem::take(&mut s.fcells), starts.len());
+        fcells.extend(starts.windows(2).map(|w| FCell {
+            s: w[0],
+            e: w[1],
+            c0: 0,
+            c1: 0,
+            st: [0.0; NS],
+        }));
+        fcells
     };
     fcells.par_iter_mut().with_min_len(16).for_each(|f| {
         (f.c0, f.c1) = (code(f.s as usize), code(f.e as usize - 1));
@@ -1055,7 +1303,7 @@ fn realtime_pass(
             .sum();
         (before - after >= need).then_some((t, parts))
     };
-    let mut nodes: Vec<Node> = Vec::with_capacity(k_target.unwrap_or(1024) * 2);
+    let mut nodes: Vec<Node> = reuse(std::mem::take(&mut s.nodes), k_target.unwrap_or(1024) * 2);
     {
         let mut st = [0f64; NS];
         for f in &fcells {
@@ -1121,9 +1369,10 @@ fn realtime_pass(
         .max_error
         .map(|e| (e * inv * STAGE1_ERROR_SHARE) as f64)
         .map(|e| e * e);
-    let mut leaves: Vec<u32> = Vec::new();
-    let mut kids = Vec::new();
-    let mut heap: BinaryHeap<(u64, std::cmp::Reverse<u32>)> = BinaryHeap::new();
+    let mut leaves: Vec<u32> = reuse(std::mem::take(&mut s.leaves), 0);
+    let mut kids = std::mem::take(&mut s.kids);
+    let mut heap = std::mem::take(&mut s.heap);
+    heap.clear();
     if nodes[0].level == DEPTH {
         leaves.push(0);
     } else {
@@ -1138,8 +1387,10 @@ fn realtime_pass(
     // verified, and the budget freed by those that fail goes back to refinement.
     let extra = THIN_SECTORS - 1;
     let reserve = |n: &Node| cheap_thin(&n.st, n.level) as u8;
-    let mut tstate: Vec<u8> = vec![reserve(&nodes[0])];
-    let mut tinfo: std::collections::HashMap<u32, Thin> = std::collections::HashMap::new();
+    let mut tstate: Vec<u8> = filled(std::mem::take(&mut s.tstate), 1, reserve(&nodes[0]));
+    let mut tinfo = std::mem::take(&mut s.tinfo);
+    tinfo.clear();
+    let (mut pending, mut found) = (std::mem::take(&mut s.pending), std::mem::take(&mut s.found));
     let mut count = 1 + tstate[0] as usize * extra;
     if let Some(k) = k_target {
         loop {
@@ -1165,12 +1416,13 @@ fn realtime_pass(
                     }
                 }
             }
-            let pending: Vec<u32> = heap
-                .iter()
-                .map(|x| x.1.0)
-                .chain(leaves.iter().copied())
-                .filter(|&i| tstate[i as usize] == 1)
-                .collect();
+            pending.clear();
+            pending.extend(
+                heap.iter()
+                    .map(|x| x.1.0)
+                    .chain(leaves.iter().copied())
+                    .filter(|&i| tstate[i as usize] == 1),
+            );
             if pending.is_empty() {
                 break;
             }
@@ -1187,13 +1439,14 @@ fn realtime_pass(
                     (fcells[n.fe as usize - 1].e - fcells[n.fs as usize].s) as usize
                 })
                 .sum();
-            let found: Vec<Option<Thin>> = if work < PAR_MIN * 4 {
-                pending.iter().map(one).collect()
+            if work < PAR_MIN * 4 {
+                found.clear();
+                found.extend(pending.iter().map(one));
             } else {
-                pending.par_iter().map(one).collect()
-            };
+                pending.par_iter().map(one).collect_into_vec(&mut found);
+            }
             let mut freed = false;
-            for (&i, f) in pending.iter().zip(found) {
+            for (&i, &f) in pending.iter().zip(&found) {
                 if let Some(t) = f {
                     tstate[i as usize] = 2;
                     tinfo.insert(i, t);
@@ -1208,7 +1461,8 @@ fn realtime_pass(
             }
         }
     }
-    let mut rest: Vec<u32> = heap.into_iter().map(|x| x.1.0).collect();
+    let mut rest = reuse(std::mem::take(&mut s.rest), heap.len());
+    rest.extend(heap.drain().map(|x| x.1.0));
     if let Some(m) = max1 {
         // Within the error budget everywhere (stage one's share of it).
         while let Some(i) = rest.pop() {
@@ -1228,20 +1482,18 @@ fn realtime_pass(
         leaves.append(&mut rest);
     }
     // Cells in Morton order, as rank ranges, grouped into chunks of whole cells.
-    let mut cells: Vec<(u32, u32, u32)> = leaves
-        .iter()
-        .map(|&i| {
-            let n = &nodes[i as usize];
-            (fcells[n.fs as usize].s, fcells[n.fe as usize - 1].e, i)
-        })
-        .collect();
+    let mut cells: Vec<(u32, u32, u32)> = reuse(std::mem::take(&mut s.cells), leaves.len());
+    cells.extend(leaves.iter().map(|&i| {
+        let n = &nodes[i as usize];
+        (fcells[n.fs as usize].s, fcells[n.fe as usize - 1].e, i)
+    }));
     cells.sort_unstable_by_key(|c| c.0);
     // Thin parts: a leaf cell holding a tube or strut narrower than the cell would fall to
     // one point and the part would vanish. Such a cell is cut into sectors around the part's
     // axis, each its own cell, so the part keeps a cross-section.
     let ncell = cells.len() + tinfo.len() * extra;
-    let mut cellr = vec![0u32; nv];
-    let mut cell_st: Vec<[f64; NS]> = Vec::with_capacity(ncell);
+    let mut cellr = filled(std::mem::take(&mut s.cellr), nv, 0u32);
+    let mut cell_st: Vec<[f64; NS]> = reuse(std::mem::take(&mut s.cell_st), ncell);
     let mut chunks: Vec<[usize; 4]> = Vec::new();
     let (mut r0, mut c0) = (0usize, 0usize);
     let mut nsplit = 0;
@@ -1270,21 +1522,25 @@ fn realtime_pass(
     if prof {
         eprintln!("  thin cells {nsplit} of {}", cells.len());
     }
-    drop(cells);
-    drop(nodes);
-    drop(leaves);
-    drop(fcells);
+    (s.cells, s.nodes, s.leaves, s.fcells) = (cells, nodes, leaves, fcells);
+    (s.kids, s.heap, s.tstate, s.tinfo) = (kids, heap, tstate, tinfo);
+    (s.pending, s.found, s.rest) = (pending, found, rest);
     lap("octree");
 
     // Wedges: members joined by an edge inside their cell. A triangle with all three corners
     // in different cells has them in different clusters too (two corners in one cell share
     // an edge, hence a cluster), so the kept set is final here. Two edges of a triangle
     // connect all three corners.
-    let aparent: Vec<AtomicU32> = (0..nv as u32).map(AtomicU32::new).collect();
-    let kept: Vec<Vec<([u32; 3], u32)>> = (0..nch)
-        .into_par_iter()
-        .map(|k| {
-            let mut kept = Vec::new();
+    let mut aparent: Vec<AtomicU32> = recycle(std::mem::take(&mut s.parent), AtomicU32::new);
+    aparent.extend((0..nv as u32).map(AtomicU32::new));
+    if s.kept.len() < nch {
+        s.kept.resize_with(nch, Vec::new);
+    }
+    s.kept[..nch]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(k, kept)| {
+            kept.clear();
             for &(r, t) in chunk_tris(k) {
                 let c = r.map(|r| cellr[r as usize]);
                 if c[0] == c[1] {
@@ -1299,10 +1555,8 @@ fn realtime_pass(
                     aunion(&aparent, r[0], r[2]);
                 }
             }
-            kept
-        })
-        .collect();
-    drop(routed);
+        });
+    let kept = &s.kept[..nch];
     let mut parent: Vec<u32> = aparent.into_iter().map(AtomicU32::into_inner).collect();
     lap("wpass");
 
@@ -1313,9 +1567,9 @@ fn realtime_pass(
             .map(|r| l.get(vert(r) as usize).copied().unwrap_or(false))
             .collect()
     });
-    let mut cid = vec![0u32; nv];
-    let mut wbest = vec![(f32::INFINITY, u32::MAX); nv];
-    let mut warea_v = vec![0f32; nv];
+    let mut cid = filled(std::mem::take(&mut s.cid), nv, 0u32);
+    let mut wbest = filled(std::mem::take(&mut s.wbest), nv, (f32::INFINITY, u32::MAX));
+    let mut warea_v = filled(std::mem::take(&mut s.warea_v), nv, 0f32);
     let rends = || chunks.iter().map(|c| c[1]);
     let jobs: Vec<Chunk> = split_ends(&mut parent, rends())
         .into_iter()
@@ -1575,8 +1829,7 @@ fn realtime_pass(
             }
         })
         .collect();
-    drop(cellr);
-    drop(cell_st);
+    (s.cellr, s.cell_st) = (cellr, cell_st);
     drop(locked_v);
     // Global cluster ids: chunk offsets, in rank order.
     let mut off = Vec::with_capacity(outs.len());
@@ -1589,11 +1842,11 @@ fn realtime_pass(
         .into_par_iter()
         .zip(off)
         .for_each(|(s, o)| s.iter_mut().for_each(|c| *c += o));
-    let mut cq: Vec<Q> = Vec::with_capacity(nc);
-    let mut cpos: Vec<Vec3> = Vec::with_capacity(nc);
-    let mut rep: Vec<u32> = Vec::with_capacity(nc);
-    let mut clocked: Vec<bool> = Vec::with_capacity(nc);
-    let mut cbord: Vec<bool> = Vec::with_capacity(nc);
+    let mut cq: Vec<Q> = reuse(std::mem::take(&mut s.cq), nc);
+    let mut cpos: Vec<Vec3> = reuse(std::mem::take(&mut s.cpos), nc);
+    let mut rep: Vec<u32> = reuse(std::mem::take(&mut s.rep), nc);
+    let mut clocked: Vec<bool> = reuse(std::mem::take(&mut s.clocked), nc);
+    let mut cbord: Vec<bool> = reuse(std::mem::take(&mut s.cbord), nc);
     let mut worst1 = 0f64;
     for o in outs {
         cq.extend(o.cq);
@@ -1608,67 +1861,60 @@ fn realtime_pass(
     // Stage-two triangles over wedges; same-orientation duplicates go, opposite ones are
     // kept as double-sided twins. What each triangle needs is gathered in parallel, chunk by
     // chunk; duplicates and wedge numbers are settled after, in order.
-    struct Pre {
-        key: u128,
-        c: [u32; 3],
-        roots: [u32; 3],
-        facing: Vec3,
-        mat: u32,
-        fwd: bool,
-        fold: bool,
-    }
     let small_keys = nc < 1 << 21;
     let key_bits = if small_keys { 21 } else { 32 };
-    let pre: Vec<Vec<Pre>> = kept
-        .par_iter()
-        .map(|ch| {
-            ch.iter()
-                .map(|&(tri, t)| {
-                    let c = tri.map(|r| cid[r as usize]);
-                    let mut sorted = c;
-                    sorted.sort_unstable();
-                    // Rotation-invariant orientation: the cyclic order with the smallest id
-                    // first.
-                    let r = (0..3).min_by_key(|&i| c[i]).unwrap();
-                    // Clusters stand at member vertices chosen one by one, so three of them
-                    // can form a triangle facing the other way from the one it stands for: a
-                    // fold. The tail takes those out first.
-                    let o = tri.map(|r| spos[r as usize]);
-                    let v = c.map(|x| cpos[x as usize]);
-                    let facing = (o[1] - o[0]).cross(o[2] - o[0]);
-                    Pre {
-                        key: ((sorted[0] as u128) << (2 * key_bits))
-                            | ((sorted[1] as u128) << key_bits)
-                            | sorted[2] as u128,
-                        c,
-                        roots: tri.map(|r| parent[r as usize]),
-                        facing,
-                        mat: mesh.material_ids.get(t as usize).copied().unwrap_or(0),
-                        fwd: c[(r + 1) % 3] == sorted[1],
-                        fold: facing.dot((v[1] - v[0]).cross(v[2] - v[0])) < 0.0,
-                    }
-                })
-                .collect()
-        })
-        .collect();
-    drop(kept);
+    if s.pre.len() < nch {
+        s.pre.resize_with(nch, Vec::new);
+    }
+    s.pre[..nch]
+        .par_iter_mut()
+        .zip(kept.par_iter())
+        .for_each(|(pre, ch)| {
+            pre.clear();
+            pre.extend(ch.iter().map(|&(tri, t)| {
+                let c = tri.map(|r| cid[r as usize]);
+                let mut sorted = c;
+                sorted.sort_unstable();
+                // Rotation-invariant orientation: the cyclic order with the smallest id
+                // first.
+                let r = (0..3).min_by_key(|&i| c[i]).unwrap();
+                // Clusters stand at member vertices chosen one by one, so three of them
+                // can form a triangle facing the other way from the one it stands for: a
+                // fold. The tail takes those out first.
+                let o = tri.map(|r| spos[r as usize]);
+                let v = c.map(|x| cpos[x as usize]);
+                let facing = (o[1] - o[0]).cross(o[2] - o[0]);
+                Pre {
+                    key: ((sorted[0] as u128) << (2 * key_bits))
+                        | ((sorted[1] as u128) << key_bits)
+                        | sorted[2] as u128,
+                    c,
+                    roots: tri.map(|r| parent[r as usize]),
+                    facing,
+                    mat: mesh.material_ids.get(t as usize).copied().unwrap_or(0),
+                    fwd: c[(r + 1) % 3] == sorted[1],
+                    fold: facing.dot((v[1] - v[0]).cross(v[2] - v[0])) < 0.0,
+                }
+            }));
+        });
+    let pre = &s.pre[..nch];
     let nkept: usize = pre.iter().map(Vec::len).sum();
     let nw_est = nkept * 3 / 2 + 16;
-    let mut wid = vec![u32::MAX; nv];
-    let mut wsrc: Vec<u32> = Vec::with_capacity(nw_est);
-    let mut wc: Vec<u32> = Vec::with_capacity(nw_est);
-    let mut warea: Vec<f32> = Vec::with_capacity(nw_est);
-    let mut tw: Vec<[u32; 3]> = Vec::with_capacity(nkept);
-    let mut tc: Vec<[u32; 3]> = Vec::with_capacity(nkept);
-    let mut tmat: Vec<u32> = Vec::with_capacity(nkept);
-    let mut twin: Vec<bool> = Vec::with_capacity(nkept);
+    let mut wid = filled(std::mem::take(&mut s.wid), nv, u32::MAX);
+    let mut wsrc: Vec<u32> = reuse(std::mem::take(&mut s.wsrc), nw_est);
+    let mut wc: Vec<u32> = reuse(std::mem::take(&mut s.wc), nw_est);
+    let mut warea: Vec<f32> = reuse(std::mem::take(&mut s.warea), nw_est);
+    let mut tw: Vec<[u32; 3]> = reuse(std::mem::take(&mut s.tw), nkept);
+    let mut tc: Vec<[u32; 3]> = reuse(std::mem::take(&mut s.tc), nkept);
+    let mut tmat: Vec<u32> = reuse(std::mem::take(&mut s.tmat), nkept);
+    let mut twin: Vec<bool> = reuse(std::mem::take(&mut s.twin), nkept);
     let mut seen = if small_keys {
-        Seen::Small(TriSet::new(nkept))
+        Seen::Small(TriSet::new(nkept, std::mem::take(&mut s.seen_small)))
     } else {
-        Seen::Large(TriSet::new(nkept))
+        Seen::Large(TriSet::new(nkept, std::mem::take(&mut s.seen_large)))
     };
-    let mut fold: Vec<bool> = Vec::with_capacity(nkept);
-    let mut tn: Vec<Vec3> = Vec::with_capacity(nkept);
+    let mut fold: Vec<bool> = reuse(std::mem::take(&mut s.fold), nkept);
+    let mut tn: Vec<Vec3> = reuse(std::mem::take(&mut s.tn), nkept);
     for p in pre.iter().flatten() {
         let first = match &mut seen {
             Seen::Small(s) => s.first(p.key as u64, p.fwd),
@@ -1698,7 +1944,10 @@ fn realtime_pass(
         tmat.push(p.mat);
         twin.push(is_twin);
     }
-    drop(pre);
+    match seen {
+        Seen::Small(t) => s.seen_small = t.slots,
+        Seen::Large(t) => s.seen_large = t.slots,
+    }
     lap("tris");
 
     // Attributes per wedge, pre-scaled as in the fast reducer.
@@ -1717,7 +1966,7 @@ fn realtime_pass(
     if mesh.colors.is_some() && cwt > 0.0 {
         dim += 4;
     }
-    let mut attr = vec![0f32; wsrc.len() * dim];
+    let mut attr = filled(std::mem::take(&mut s.attr), wsrc.len() * dim, 0f32);
     if dim > 0 {
         attr.par_chunks_mut(dim)
             .zip(&wsrc)
@@ -1749,7 +1998,7 @@ fn realtime_pass(
         cq,
         tw,
         tc,
-        alive: vec![true; alive_count],
+        alive: filled(std::mem::take(&mut s.alive), alive_count, true),
         twin,
         fold,
         tn,
@@ -1759,13 +2008,13 @@ fn realtime_pass(
         nd2: if nd > 0 { nwt * nwt } else { 0.0 },
         avg_area,
         locked: clocked,
-        side: vec![[u32::MAX; 2]; nc],
-        sdeg: vec![0; nc],
+        side: filled(std::mem::take(&mut s.side), nc, [u32::MAX; 2]),
+        sdeg: filled(std::mem::take(&mut s.sdeg), nc, 0),
         cbord,
-        soff: vec![0; nc],
-        slen: vec![0; nc],
-        scap: vec![0; nc],
-        pool: Vec::new(),
+        soff: filled(std::mem::take(&mut s.soff), nc, 0),
+        slen: filled(std::mem::take(&mut s.slen), nc, 0),
+        scap: filled(std::mem::take(&mut s.scap), nc, 0),
+        pool: std::mem::take(&mut s.star_pool),
     };
     st.classify_edges();
     lap("attrs");
@@ -1776,11 +2025,11 @@ fn realtime_pass(
 
     // Output: one vertex per wedge still used, at its cluster's representative position.
     let nw = wsrc.len();
-    let mut wout = vec![u32::MAX; nw];
-    let mut srcs: Vec<u32> = Vec::new();
+    let mut wout = filled(std::mem::take(&mut s.wout), nw, u32::MAX);
+    let mut srcs: Vec<u32> = reuse(std::mem::take(&mut s.srcs), 0);
     let mut indices: Vec<u32> = Vec::new();
     let mut material_ids: Vec<u32> = Vec::new();
-    let mut cluster_out = vec![u32::MAX; nc];
+    let mut cluster_out = filled(std::mem::take(&mut s.cluster_out), nc, u32::MAX);
     for t in 0..st.tw.len() {
         if !st.alive[t] {
             continue;
@@ -1851,36 +2100,68 @@ fn realtime_pass(
         // doesn't depend on the thread count.
         let span = nv.div_ceil(8).max(PAR_MIN);
         let n_out = dst.len();
-        let parts: Vec<Vec<Vec3>> = (0..nv.div_ceil(span))
-            .into_par_iter()
-            .map(|k| {
-                let mut sum = vec![Vec3::ZERO; n_out];
-                for r in k * span..((k + 1) * span).min(nv) {
-                    let root = parent[r] as usize;
-                    if wid[root] != u32::MAX {
-                        let o = wout[wremap[wid[root] as usize] as usize];
-                        if o != u32::MAX {
-                            sum[o as usize] += src[vert(r) as usize] * vs[r].area;
-                        }
+        let nparts = nv.div_ceil(span);
+        if s.normal_parts.len() < nparts {
+            s.normal_parts.resize_with(nparts, Vec::new);
+        }
+        let parts = &mut s.normal_parts[..nparts];
+        parts.par_iter_mut().enumerate().for_each(|(k, sum)| {
+            sum.clear();
+            sum.resize(n_out, Vec3::ZERO);
+            for r in k * span..((k + 1) * span).min(nv) {
+                let root = parent[r] as usize;
+                if wid[root] != u32::MAX {
+                    let o = wout[wremap[wid[root] as usize] as usize];
+                    if o != u32::MAX {
+                        sum[o as usize] += src[vert(r) as usize] * vs[r].area;
                     }
                 }
-                sum
-            })
-            .collect();
-        let mut parts = parts.into_iter();
-        let mut sum = parts.next().unwrap_or_default();
-        for part in parts {
-            for (a, b) in sum.iter_mut().zip(part) {
-                *a += b;
             }
-        }
-        for (n, s) in dst.iter_mut().zip(sum) {
-            let l = s.length();
-            if l > 1e-20 {
-                *n = s / l;
+        });
+        if let Some((sum, rest)) = parts.split_first_mut() {
+            for part in rest {
+                for (a, b) in sum.iter_mut().zip(part.iter()) {
+                    *a += *b;
+                }
+            }
+            for (n, s) in dst.iter_mut().zip(sum.iter()) {
+                let l = s.length();
+                if l > 1e-20 {
+                    *n = *s / l;
+                }
             }
         }
     }
+    // Every buffer taken from the scratch goes back for the next call.
+    let Tail {
+        cpos,
+        cq,
+        tw,
+        tc,
+        alive,
+        twin,
+        fold,
+        tn,
+        warea,
+        attr,
+        locked,
+        side,
+        sdeg,
+        cbord,
+        soff,
+        slen,
+        scap,
+        pool,
+        ..
+    } = st;
+    (s.cpos, s.cq, s.tw, s.tc, s.alive, s.twin, s.fold, s.tn) =
+        (cpos, cq, tw, tc, alive, twin, fold, tn);
+    (s.warea, s.attr, s.clocked, s.side, s.sdeg, s.cbord) =
+        (warea, attr, locked, side, sdeg, cbord);
+    (s.soff, s.slen, s.scap, s.star_pool) = (soff, slen, scap, pool);
+    (s.parent, s.cid, s.wbest, s.warea_v, s.rep, s.wid) = (parent, cid, wbest, warea_v, rep, wid);
+    (s.wsrc, s.wc, s.tmat, s.wout, s.srcs, s.cluster_out) =
+        (wsrc, wc, tmat, wout, srcs, cluster_out);
     let rel = worst1.max(worst2 as f64).sqrt() as f32;
     lap("output");
     Ok(SimplifyResult {
@@ -1960,7 +2241,8 @@ impl Tail {
             self.scap[c] = count[c] + 2;
             off += count[c] + 2;
         }
-        self.pool = vec![0; off as usize];
+        self.pool.clear();
+        self.pool.resize(off as usize, 0);
         for (t, c) in self.tc.iter().enumerate() {
             for &x in c {
                 let x = x as usize;
@@ -2624,7 +2906,7 @@ mod tests {
     #[test]
     fn triangle_set_keeps_first_orientation() {
         fn check<K: super::TriKey>(key: impl Fn(u64) -> K) {
-            let mut s = super::TriSet::new(40);
+            let mut s = super::TriSet::new(40, Vec::new());
             for i in 0..40u64 {
                 assert_eq!(s.first(key(i), i % 3 == 0), None);
             }
@@ -2691,6 +2973,94 @@ mod tests {
             assert_eq!(a.mesh, b.mesh, "{t} threads");
             assert_eq!(a.vertex_remap, b.vertex_remap, "{t} threads");
         }
+    }
+
+    fn grid(n: u32) -> Mesh {
+        let mut pos = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                let (fx, fy) = (x as f32, y as f32);
+                pos.push(glam::Vec3::new(fx, fy, (fx * 0.3).sin() * (fy * 0.2).cos()));
+            }
+        }
+        let mut idx = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let i = y * (n + 1) + x;
+                idx.extend_from_slice(&[i, i + 1, i + n + 2, i, i + n + 2, i + n + 1]);
+            }
+        }
+        Mesh::new(pos, idx)
+    }
+
+    #[test]
+    fn reused_buffers_match_fresh_ones() {
+        // A thread keeps its buffers between calls; every call must come out as on a thread
+        // that never ran one, whatever ran before it (bigger or smaller meshes, other options).
+        let small = {
+            let mut m = uv_sphere(24, 12);
+            m.compute_normals(60.0);
+            m
+        };
+        let no_borders = SimplifyOptions {
+            border_weight: 0.0,
+            ..opts(0.05)
+        };
+        let max_error = SimplifyOptions {
+            max_error: Some(0.02),
+            quality: Quality::Realtime,
+            ..Default::default()
+        };
+        let cases = [
+            (sphere(), opts(0.05)),
+            (small.clone(), opts(0.1)),
+            (grid(60), opts(0.02)),
+            (sphere(), no_borders.clone()),
+            (grid(12), opts(0.2)),
+            (small, max_error),
+            (grid(60), no_borders),
+            (sphere(), opts(0.3)),
+        ];
+        let on_new_thread = |m: &Mesh, o: &SimplifyOptions| {
+            std::thread::scope(|sc| sc.spawn(|| simplify(m, o).unwrap()).join().unwrap())
+        };
+        let fresh: Vec<_> = cases.iter().map(|(m, o)| on_new_thread(m, o)).collect();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let order: Vec<usize> = (0..cases.len()).chain((0..cases.len()).rev()).collect();
+                for i in order {
+                    let ((m, o), f) = (&cases[i], &fresh[i]);
+                    let r = simplify(m, o).unwrap();
+                    assert_eq!(r.mesh, f.mesh, "case {i}");
+                    assert_eq!(r.vertex_remap, f.vertex_remap, "case {i}");
+                    assert_eq!(r.source_vertex, f.source_vertex, "case {i}");
+                    assert_eq!(r.error.to_bits(), f.error.to_bits(), "case {i}");
+                    assert_eq!(r.collapses, f.collapses, "case {i}");
+                }
+                // Every buffer went back to the thread (these four are only used by meshes
+                // with thin parts or millions of clusters).
+                let s = super::SCRATCH.take();
+                let missing: Vec<_> = s
+                    .empty()
+                    .into_iter()
+                    .filter(|f| !["seen_large", "tinfo", "pending", "found"].contains(f))
+                    .collect();
+                assert!(missing.is_empty(), "not handed back: {missing:?}");
+                super::SCRATCH.set(s);
+                super::release_realtime_scratch();
+                assert_eq!(super::SCRATCH.take().bytes().0, 0);
+            })
+            .join()
+            .unwrap()
+        });
+    }
+
+    #[test]
+    fn recycled_buffers_keep_their_memory() {
+        let v: Vec<u32> = vec![7; 1000];
+        let p = v.as_ptr() as usize;
+        let a = super::recycle(v, std::sync::atomic::AtomicU32::new);
+        assert!(a.is_empty() && a.capacity() >= 1000 && a.as_ptr() as usize == p);
     }
 
     #[test]

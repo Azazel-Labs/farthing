@@ -28,6 +28,7 @@ mod simplify;
 pub mod symmetry;
 
 pub use quad::{QuadReduceOptions, QuadReduceResult, reduce_quads};
+pub use realtime::release_realtime_scratch;
 pub use simplify::{
     CollapseOrder, Gutter, LodLevel, Quality, SeamMode, SimplifyOptions, SimplifyResult, StopWhen,
     lod_chain, screen_size_to_max_error, simplify, simplify_scene,

@@ -210,6 +210,15 @@ pub enum Quality {
     /// then a short collapse tail from about twice the target. Linear in the input and tens
     /// of times faster than [`Quality::Fast`] at large ratios, with seams and borders kept.
     /// Uses the target, error, weight, border and lock options like `Fast`; ignores the rest.
+    ///
+    /// Each thread that runs it keeps its working memory between calls (about 100 bytes per
+    /// input vertex of the largest mesh it has reduced lately, more at high targets), so a
+    /// program that reduces again and again writes to memory it already has instead of
+    /// taking fresh pages from the system, which some system allocators (the Windows heap)
+    /// hand back after every call. Up to 64 MiB per thread is always kept; past that, a call
+    /// that needed less than a quarter of what the thread holds frees it all.
+    /// [`release_realtime_scratch`](crate::reduce::release_realtime_scratch) frees the
+    /// calling thread's at once.
     Realtime,
 }
 
