@@ -1327,6 +1327,45 @@ worst), against 0.008% (0.26%) guarded; 0.009% lands inside another island (0.11
 against none. The Lantern, the asset the guard was written for, renders the same (28.73 to
 28.60 dB at 10%, 24.12 to 24.83 at 3%).
 
+### Gentle creases and normal growth capped (v24)
+
+The WaterBottle did not lose at the cap's lip. Its body and cap sides are tessellated as tall
+thin strips with creases of about 9°, and a crease plane weighed edge length²: on a strip
+that outweighed the faces' own planes about five times and pinned every strip, so the cap's
+outline and dome ran short of vertices. The Lantern post and the watch dial lost the same way.
+A crease under 30° now weighs at most 12 times its face's area; sharp creases keep the full
+weight, because there the face across may be a thin part's rim. Capping every crease cost the
+car 0.9 to 1.4 dB at 3% (sliver faces along sharp rims need it). Separately, the normal term's
+growth with region size stops at 32 average input triangles: past that, dense smooth meshes
+(the watch, the dragon) kept the shading of a few wide regions at the cost of their outline.
+
+Single runs move a case 0.5 to 1 dB, so these are means over five neutral seeds (the normal
+weight, which both reducers use, scaled by 0.94 to 1.06; jittering the target ratio does not
+decorrelate runs):
+
+| rendered PSNR, dB | 10%: before | now | fast | 3%: before | now | fast |
+|---|---|---|---|---|---|---|
+| Avocado | 28.51 | 28.74 | 28.45 | 23.61 | 23.19 | 22.81 |
+| BoomBox | 24.04 | 24.08 | 23.22 | 20.39 | 20.28 | 19.41 |
+| CarConcept | 27.41 | 27.55 | 23.99 | 22.16 | 21.98 | 18.65 |
+| ChronographWatch | 21.41 | 21.44 | 21.31 | 15.49 | 16.16 | 15.87 |
+| Corset | 30.09 | 30.10 | 30.29 | 25.57 | 25.91 | 23.02 |
+| DamagedHelmet | 20.15 | 20.17 | 19.42 | 15.29 | 15.24 | 14.86 |
+| DragonAttenuation | 29.65 | 29.76 | 29.95 | 24.57 | 24.97 | 25.32 |
+| Duck | 21.95 | 22.07 | 21.46 | 16.91 | 16.56 | 16.88 |
+| Fox | 18.72 | 18.72 | 18.22 | 14.96 | 15.07 | 15.67 |
+| Lantern | 28.61 | 29.49 | 26.28 | 24.86 | 24.98 | 24.00 |
+| WaterBottle | 31.01 | 32.25 | 32.34 | 23.62 | 24.13 | 23.99 |
+| mean | 25.60 | 25.85 | 24.99 | 20.67 | 20.77 | 20.04 |
+
+With default options: 25.87 / 20.75 dB, against 25.62 / 20.65 before and fast's 25.03 /
+20.05. Cases behind fast: 7 (4.02 dB in all) before, 6 (1.75 dB) now, the largest 0.60 dB (Fox
+at 3%, 16 triangles). The dragon's remaining gap is its UVs, which drive only a thickness
+texture the scorer does not render: reduced without UVs the default scores 29.97 / 24.89
+against 29.63 / 24.56 with them. `bench-compare rtexport` takes `MIX_FAST=<mesh indices>`
+(those meshes reduced by fast mode) and `UV0_MESH=<mesh indices>` (reduced without UVs, UVs
+copied back) to find which mesh of a scene a gap comes from.
+
 ### v14: the dragon's error is in the reduction
 
 v12 left the dragon at 1.39% Hausdorff against baby_shark's 0.87%, and adaptive (octree)

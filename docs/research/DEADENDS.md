@@ -87,6 +87,15 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 | Curvature or saliency weights on the quadrics | Not built: a commercial tool deprecated its own, and scaling a quadric does nothing on flat regions, where the ties are | — |
 | Texture-content weighting of UV error | Not built: no source reports image-space gains, and it conflicts with visual masking (busy texture hides error) | A color-at-closest-point metric shows headroom |
 | Optimal vertex placement during collapse | Not built: an older study found no significant gain in rendered images over choosing an endpoint, and the trial refit in the thin-features work was dropped | — |
+| Default reducer: an edge-length term k × area × \|p−q\|² (k 1e-4 to 1e-1), to copy what fast mode's UV distance seems to do on the dragon | Never closes the dragon gap (10%: −0.06 to −1.16 dB); Duck 10% −0.15 to −1.07; at 1e-2 the 4-asset mean is −0.17 at 10%, +0.16 at 3% (single run) | — |
+| Default reducer: normal weight 2.5e-5 or 1e-5 (single run) | +0.09 / +0.31 and +0.03 / +0.04 dB, but Corset 10% −0.20 / −0.49, Duck 10% −0.66 at 1e-5, car 3% −0.52 / −0.80 | — |
+| Default reducer: normal growth (area/avg)^0.5 or ^0.75 in place of linear (single run) | −0.09 / +0.26 and −0.09 / +0.20 dB; a cap at 32 average triangles shipped instead | — |
+| Default reducer: crease plane capped at c × face area on every crease, c = 2, 4, 8 | +0.005 / −0.16, +0.03 / −0.14, +0.15 / −0.13 dB (single run); car 3% −0.9 to −1.4: sliver faces along sharp CAD rims need the full length² weight. Shipped for creases under 30° only | — |
+| Gentle-crease cap gated at 45°, or c = 16 or 8 at 30° (seeds) | 45°: +0.23 / −0.02, car 3% −0.74. c = 16: +0.19 / +0.01, bottle +0.51 only. c = 8: as 12 but Fox 10% −0.51 | — |
+| Crease weight 1.5 with the gentle-crease cap (seeds) | +0.15 / +0.01 dB; Avocado 3% −1.94, helmet 10% −0.29 | — |
+| Normal growth capped at 16, 24 or 48 average triangles with the crease cap (seeds) | +0.15 / +0.10, +0.20 / +0.03, +0.24 / +0.10, against +0.25 / +0.10 at 32 (shipped); 16 and 24 cost Corset 10% 0.4 to 0.5 | — |
+| Dragon: greedy order, silhouette weight 0, cluster-parallel off (single run) | +0.05 / +0.16, 0 / +0.01, identical (its meshes are under the threshold) | — |
+| Default reducer: closing the dragon gap to fast mode | Its UVs drive only a thickness texture the scorer ignores: without UVs the default scores 29.97 / 24.89 against 29.63 / 24.56 with them | The scorer renders thickness |
 
 ## Voxel proxies
 
@@ -107,3 +116,4 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 |---|---|---|
 | Timing on the development machine while other work runs | Phase times move by 2× between runs; only minimums over many runs while the load is under about 35% mean anything | — |
 | Remote agent isolation for timing | Fails to start on this checkout (the worktree path differs from git's by drive-letter case). The `Bench` workflow on a hosted runner is used instead | — |
+| Neutral seeds made by jittering the target ratio (0.097, 0.103) | Do not decorrelate runs: BoomBox 3% −0.70 dB on all three seeds for a change touching 0.6% of crease weight. Seeds made by scaling the normal weight (×0.94 to ×1.06, used by both reducers) do | — |
