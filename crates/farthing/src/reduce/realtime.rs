@@ -457,42 +457,74 @@ fn union(parent: &mut [u32], a: u32, b: u32) {
     }
 }
 
-/// Open-addressing map from a key to a slot index, for the small stage-two tables.
-struct KeyMap {
-    keys: Vec<u128>,
-    vals: Vec<u32>,
-    mask: usize,
+/// A stage-two triangle's sorted cluster ids packed into one key: a u64 while the ids fit in
+/// 21 bits each (any target under a few million triangles), a u128 past that.
+trait TriKey:
+    Copy
+    + Eq
+    + From<bool>
+    + std::ops::Shl<u32, Output = Self>
+    + std::ops::Shr<u32, Output = Self>
+    + std::ops::BitOr<Output = Self>
+{
+    const EMPTY: Self;
+    fn mix(self) -> u64;
 }
 
-impl KeyMap {
-    fn new(n: usize) -> KeyMap {
-        let cap = (n * 2).next_power_of_two().max(16);
-        KeyMap {
-            keys: vec![u128::MAX; cap],
-            vals: vec![0; cap],
-            mask: cap - 1,
-        }
-    }
+impl TriKey for u64 {
+    const EMPTY: u64 = u64::MAX;
     #[inline]
-    fn slot(&self, k: u128) -> usize {
-        let h = (k as u64 ^ ((k >> 64) as u64).rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut i = (h >> 32) as usize & self.mask;
-        while self.keys[i] != u128::MAX && self.keys[i] != k {
-            i = (i + 1) & self.mask;
-        }
-        i
+    fn mix(self) -> u64 {
+        self
     }
-    /// The value for `k`, inserting `v` if absent; returns (value, was it present).
-    fn get_or_insert(&mut self, k: u128, v: u32) -> (u32, bool) {
-        let i = self.slot(k);
-        if self.keys[i] == k {
-            (self.vals[i], true)
-        } else {
-            self.keys[i] = k;
-            self.vals[i] = v;
-            (v, false)
+}
+
+impl TriKey for u128 {
+    const EMPTY: u128 = u128::MAX;
+    #[inline]
+    fn mix(self) -> u64 {
+        self as u64 ^ ((self >> 64) as u64).rotate_left(29)
+    }
+}
+
+/// Open-addressing set of stage-two triangles, each stored as its key shifted up one with the
+/// orientation it was first seen in as the low bit: one word per slot. A kept triangle's
+/// three clusters differ, so no slot of a key is all ones, the empty slot.
+struct TriSet<K> {
+    slots: Vec<K>,
+    shift: u32,
+}
+
+impl<K: TriKey> TriSet<K> {
+    fn new(n: usize) -> TriSet<K> {
+        let cap = (n * 2).next_power_of_two().max(16);
+        TriSet {
+            slots: vec![K::EMPTY; cap],
+            shift: 64 - cap.trailing_zeros(),
         }
     }
+    /// The orientation `k` was first seen in, or None (recording `fwd`) if it is new.
+    #[inline]
+    fn first(&mut self, k: K, fwd: bool) -> Option<bool> {
+        let mask = self.slots.len() - 1;
+        let mut i = (k.mix().wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize;
+        loop {
+            let s = self.slots[i];
+            if s == K::EMPTY {
+                self.slots[i] = (k << 1) | K::from(fwd);
+                return None;
+            }
+            if s >> 1 == k {
+                return Some(s != k << 1);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+enum Seen {
+    Small(TriSet<u64>),
+    Large(TriSet<u128>),
 }
 
 pub(crate) fn simplify_realtime(
@@ -1336,6 +1368,8 @@ fn realtime_pass(
         fwd: bool,
         fold: bool,
     }
+    let small_keys = nc < 1 << 21;
+    let key_bits = if small_keys { 21 } else { 32 };
     let pre: Vec<Vec<Pre>> = kept
         .par_iter()
         .map(|ch| {
@@ -1354,8 +1388,8 @@ fn realtime_pass(
                     let v = c.map(|x| cpos[x as usize]);
                     let facing = (o[1] - o[0]).cross(o[2] - o[0]);
                     Pre {
-                        key: ((sorted[0] as u128) << 64)
-                            | ((sorted[1] as u128) << 32)
+                        key: ((sorted[0] as u128) << (2 * key_bits))
+                            | ((sorted[1] as u128) << key_bits)
                             | sorted[2] as u128,
                         c,
                         roots: tri.map(|r| parent[r as usize]),
@@ -1383,18 +1417,23 @@ fn realtime_pass(
     let mut tc: Vec<[u32; 3]> = Vec::with_capacity(nkept);
     let mut tmat: Vec<u32> = Vec::with_capacity(nkept);
     let mut twin: Vec<bool> = Vec::with_capacity(nkept);
-    let mut seen = KeyMap::new(nkept);
+    let mut seen = if small_keys {
+        Seen::Small(TriSet::new(nkept))
+    } else {
+        Seen::Large(TriSet::new(nkept))
+    };
     let mut fold: Vec<bool> = Vec::with_capacity(nkept);
     let mut tn: Vec<Vec3> = Vec::with_capacity(nkept);
     for p in pre.iter().flatten() {
-        let (slot, present) = seen.get_or_insert(p.key, tw.len() as u32 * 2 + p.fwd as u32);
-        let is_twin = if present {
-            if (slot & 1 == 1) == p.fwd {
-                continue;
-            }
-            true
-        } else {
-            false
+        let first = match &mut seen {
+            Seen::Small(s) => s.first(p.key as u64, p.fwd),
+            Seen::Large(s) => s.first(p.key, p.fwd),
+        };
+        // A duplicate facing the first one's way goes; one facing the other way is its twin.
+        let is_twin = match first {
+            Some(f) if f == p.fwd => continue,
+            Some(_) => true,
+            None => false,
         };
         let mut w = [0u32; 3];
         for k in 0..3 {
@@ -2336,6 +2375,22 @@ impl Scratch {
 mod tests {
     use crate::Mesh;
     use crate::reduce::simplify::{Quality, SimplifyOptions, simplify, tests::uv_sphere};
+
+    #[test]
+    fn triangle_set_keeps_first_orientation() {
+        fn check<K: super::TriKey>(key: impl Fn(u64) -> K) {
+            let mut s = super::TriSet::new(40);
+            for i in 0..40u64 {
+                assert_eq!(s.first(key(i), i % 3 == 0), None);
+            }
+            for i in 0..40u64 {
+                assert_eq!(s.first(key(i), true), Some(i % 3 == 0));
+            }
+        }
+        // Keys as packed for the largest cluster ids of each width.
+        check(|i| (((1u64 << 21) - 3) << 42) | (i << 21) | 7);
+        check(|i| ((u32::MAX as u128 - 2) << 64) | ((i as u128) << 32) | 7);
+    }
 
     fn opts(ratio: f32) -> SimplifyOptions {
         SimplifyOptions {
