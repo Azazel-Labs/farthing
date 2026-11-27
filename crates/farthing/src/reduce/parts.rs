@@ -114,11 +114,16 @@ impl Parts {
                 )
             })
             .collect();
-        let bvhs = part_tris.into_iter().map(Bvh::build).collect();
-        let all = Bvh::build(
-            (0..input.triangle_count())
-                .map(|t| input.triangle_positions(t))
-                .collect(),
+        // The trees side by side (each is the same for any thread count).
+        let (bvhs, all) = rayon::join(
+            || part_tris.into_par_iter().map(Bvh::build).collect(),
+            || {
+                Bvh::build(
+                    (0..input.triangle_count())
+                        .map(|t| input.triangle_positions(t))
+                        .collect(),
+                )
+            },
         );
         let mut parts = Parts {
             part_tris: ids,
