@@ -344,6 +344,7 @@ fn fan_ends(v: usize, s: &VSum, nv: usize) -> Option<[usize; 2]> {
 /// cone of normals, M ≈ (A cos²θ) uuᵀ + (A sin²θ / 2)(I − uuᵀ). Flat fans give their exact
 /// plane; curved ones also resist tangential motion, as their faces would. Open fans add the
 /// border planes of `borders`, its end edges that are borders (`u32::MAX`: not one).
+#[inline]
 fn vertex_quadric(v: usize, s: &VSum, upos: &[Vec3], bw: f32, borders: [u32; 2]) -> [f32; 10] {
     // In terms of n = Σ Aᵢnᵢ itself (u = n / |n|), so one reciprocal serves every term.
     let n = Vec3::from_array(s.n);
@@ -1238,26 +1239,21 @@ fn realtime_pass(
     // Thin parts: a leaf cell holding a tube or strut narrower than the cell would fall to
     // one point and the part would vanish. Such a cell is cut into sectors around the part's
     // axis, each its own cell, so the part keeps a cross-section.
-    let thin: Vec<Option<Thin>> = cells
-        .iter()
-        .map(|&(s, e, i)| match tstate[i as usize] {
-            2 => Some(tinfo[&i]),
-            1 => verify(s, e, &nodes[i as usize], 0.0),
-            _ => None,
-        })
-        .collect();
-    let nsplit = thin.iter().filter(|t| t.is_some()).count();
-    if prof {
-        eprintln!("  thin cells {nsplit} of {}", cells.len());
-    }
-    let ncell = cells.len() + nsplit * extra;
+    let ncell = cells.len() + tinfo.len() * extra;
     let mut cellr = vec![0u32; nv];
     let mut cell_st: Vec<[f64; NS]> = Vec::with_capacity(ncell);
     let mut chunks: Vec<[usize; 4]> = Vec::new();
     let (mut r0, mut c0) = (0usize, 0usize);
+    let mut nsplit = 0;
     for (k, &(s, e, i)) in cells.iter().enumerate() {
         let c = cell_st.len();
-        if let Some((t, parts)) = &thin[k] {
+        let thin = match tstate[i as usize] {
+            2 => tinfo.get(&i).copied(),
+            1 => verify(s, e, &nodes[i as usize], 0.0),
+            _ => None,
+        };
+        if let Some((t, parts)) = &thin {
+            nsplit += 1;
             for r in s as usize..e as usize {
                 cellr[r] = (c + sector_of(spos[r], t)) as u32;
             }
@@ -1270,6 +1266,9 @@ fn realtime_pass(
             chunks.push([r0, e as usize, c0, cell_st.len()]);
             (r0, c0) = (e as usize, cell_st.len());
         }
+    }
+    if prof {
+        eprintln!("  thin cells {nsplit} of {}", cells.len());
     }
     drop(cells);
     drop(nodes);
