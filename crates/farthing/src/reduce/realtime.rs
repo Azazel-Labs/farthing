@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 /// Octree depth (Morton bits per axis).
 const DEPTH: u32 = 10;
 /// Stage-one clusters per target triangle.
-const CLUSTERS_PER_TRI: f32 = 0.55;
+const CLUSTERS_PER_TRI: f32 = 0.715;
 /// A mesh of at most `RETRY_MAX_TRIS` triangles that ends below `RETRY_BELOW` of its target
 /// is reduced again with more clusters, up to `RETRIES` times.
 const RETRY_MAX_TRIS: usize = 20_000;
