@@ -403,10 +403,10 @@ pub(crate) fn simplify_fast(
                     + gphi[2] * attr[w[2] as usize * dim + k];
                 let g = g * area;
                 for &c in &w {
-                    let o = c as usize * stride + 1 + dim + 3 * k;
+                    let o = c as usize * stride + 1 + dim + k;
                     wd[o] += g.x;
-                    wd[o + 1] += g.y;
-                    wd[o + 2] += g.z;
+                    wd[o + dim] += g.y;
+                    wd[o + 2 * dim] += g.z;
                 }
             }
             for &c in &w {
@@ -515,15 +515,13 @@ pub(crate) fn simplify_fast(
                 }
             }
             for &q in &nbr {
-                let geo = |a: u32, b: u32| {
-                    let mut qq = st.quad[a as usize];
-                    qq.add(&st.quad[b as usize]);
-                    qq.eval(st.pos[b as usize]) / st.avg_area
-                };
+                // Both directions share the summed quadric (addition commutes exactly).
+                let mut qq = st.quad[p as usize];
+                qq.add(&st.quad[q as usize]);
                 let mut dirs = [(p, q, f32::INFINITY), (q, p, f32::INFINITY)];
                 for d in &mut dirs {
                     if st.can(d.0, d.1) {
-                        d.2 = geo(d.0, d.1);
+                        d.2 = qq.eval(st.pos[d.1 as usize]) / st.avg_area;
                     }
                 }
                 if dirs[1].2 < dirs[0].2 {
@@ -820,7 +818,8 @@ struct St {
     quad: Vec<Q>,
     /// Per wedge, `stride` floats side by side (one cache-friendly read in `wcost`): the
     /// surface area the wedge stands for (grows as wedges merge), its `dim` pre-scaled
-    /// attributes, then per attribute dim its surface gradient (3 floats).
+    /// attributes, then their surface gradients: the x components of all `dim`, the y
+    /// components, the z components.
     wd: Vec<f32>,
     stride: usize,
     dim: usize,
@@ -929,14 +928,51 @@ impl St {
         if self.dim == 0 || a == b {
             return 0.0;
         }
-        let (s, d) = (self.stride, self.dim);
+        // Fixed sizes for the usual channel sets (normal and one or two UV sets, with or
+        // without colors), so the loops unroll.
+        match self.dim {
+            3 => self.wcost_n::<3>(a, b, dx),
+            5 => self.wcost_n::<5>(a, b, dx),
+            7 => self.wcost_n::<7>(a, b, dx),
+            9 => self.wcost_n::<9>(a, b, dx),
+            d => self.wcost_dyn(d, a, b, dx),
+        }
+    }
+
+    /// [`wcost`](Self::wcost) for `D` attribute dims.
+    #[inline(always)]
+    fn wcost_n<const D: usize>(&self, a: u32, b: u32, dx: Vec3) -> f32 {
+        let s = self.stride;
+        let (a, b) = (a as usize * s, b as usize * s);
+        let blk = &self.wd[a..a + s];
+        let x: &[f32; D] = blk[1..1 + D].try_into().unwrap();
+        let gx: &[f32; D] = blk[1 + D..1 + 2 * D].try_into().unwrap();
+        let gy: &[f32; D] = blk[1 + 2 * D..1 + 3 * D].try_into().unwrap();
+        let gz: &[f32; D] = blk[1 + 3 * D..1 + 4 * D].try_into().unwrap();
+        let y: &[f32; D] = self.wd[b + 1..b + 1 + D].try_into().unwrap();
+        let mut e = [0f32; D];
+        for k in 0..D {
+            e[k] = y[k] - x[k] - (gx[k] * dx.x + gy[k] * dx.y + gz[k] * dx.z);
+        }
+        let mut e2 = 0.0;
+        for e in e {
+            e2 += e * e;
+        }
+        blk[0] * e2
+    }
+
+    /// [`wcost`](Self::wcost) for any number of attribute dims.
+    fn wcost_dyn(&self, d: usize, a: u32, b: u32, dx: Vec3) -> f32 {
+        let s = self.stride;
         let (a, b) = (a as usize * s, b as usize * s);
         let blk = &self.wd[a..a + s];
         let (x, g) = blk[1..].split_at(d);
+        let (gx, g) = g.split_at(d);
+        let (gy, gz) = g.split_at(d);
         let y = &self.wd[b + 1..b + 1 + d];
         let mut e2 = 0.0;
-        for ((x, y), g) in x.iter().zip(y).zip(g.chunks_exact(3)) {
-            let e = y - x - (g[0] * dx.x + g[1] * dx.y + g[2] * dx.z);
+        for k in 0..d {
+            let e = y[k] - x[k] - (gx[k] * dx.x + gy[k] * dx.y + gz[k] * dx.z);
             e2 += e * e;
         }
         blk[0] * e2
