@@ -382,7 +382,7 @@ fn reduce_mode(assets: &[String]) {
             .unwrap_or_else(|_| vec![0.5, 0.2, 0.05, 0.01]);
         let only: Option<Vec<String>> = std::env::var("RD_METHODS")
             .ok()
-            .map(|v| v.split(',').map(String::from).collect());
+            .map(|v| v.split(',').map(|m| m.replace('_', " ")).collect());
         for ratio in ratios {
             let target = ((m.triangle_count() as f32 * ratio) as usize).max(8);
             let methods: Vec<(&str, Box<dyn Fn() -> Mesh>)> = vec![
@@ -1390,7 +1390,7 @@ fn realtime_mode(assets: &[String]) {
         .unwrap_or(5);
     let only: Option<Vec<String>> = std::env::var("RD_METHODS")
         .ok()
-        .map(|v| v.split(',').map(String::from).collect());
+        .map(|v| v.split(',').map(|m| m.replace('_', " ")).collect());
     let mut summary: std::collections::BTreeMap<String, Vec<(f32, f32, f32, f32, f64)>> =
         Default::default();
     println!(

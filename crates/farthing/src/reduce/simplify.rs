@@ -277,6 +277,8 @@ pub struct SimplifyResult {
     /// For each output vertex, the input vertex it is an exact copy of (half-edge collapse),
     /// so callers can carry custom per-vertex attributes across. In realtime mode the copy's
     /// position may be moved along the normal and its normal is a mean over merged vertices.
+    /// In fast mode, with UVs weighted and no `locked_vertices`, a vertex carried across a UV
+    /// seam keeps its attributes but stands at the position of the vertex it moved onto.
     pub source_vertex: Vec<u32>,
 }
 

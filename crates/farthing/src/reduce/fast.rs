@@ -13,6 +13,14 @@
 //! condition are skipped. When collapses stall above the target, whole parts go by the full
 //! reducer's rule (visible removal error, target floor, visible-part protection). Output is
 //! deterministic (single-threaded; hash sets are only looked up, never iterated).
+//!
+//! A collapse that takes a vertex off a UV seam carries the wedges it would tear: a wedge of p
+//! that no triangle joins to q, and that lies on another UV island than the wedges that are
+//! joined, moves to q's position with its own attributes, so its triangles stay on their
+//! island and the seam moves with the vertex. Mapped onto a wedge of q instead (the only
+//! choice when output vertices must be exact copies of input vertices), its triangles span
+//! two islands and show whatever lies between them in the texture, over an area that grows
+//! with every later collapse. See `CARRY_SLIDE` and `St::unshared`.
 
 use crate::reduce::simplify::{SimplifyOptions, SimplifyResult};
 use crate::{Mesh, Result};
@@ -99,6 +107,14 @@ impl Q {
 const NORMAL_SCALE: f32 = 1e-5;
 const UV_SCALE: f32 = 1e-3;
 const COLOR_SCALE: f32 = 1e-3;
+/// A carried wedge (see the module docs) keeps its UVs while its corner moves, so its texture
+/// slides over the surface about as far as the joined wedges' UVs move. That squared distance
+/// times this is its attribute cost. The slide moves an island's edge, which shows at once,
+/// where the same UV change inside an island mostly follows the surface: at 1 and 4 the
+/// corpus's smooth single-island assets lose up to 0.6 dB to seams that wander.
+const CARRY_SLIDE: f32 = 16.0;
+/// Squared UV distance (unscaled) under which two wedges of a vertex are on the same island.
+const SAME_UV2: f32 = 1e-10;
 /// Pass size: candidates up to `PASS_LIMIT` × the cost of the m-th cheapest, m = what is still
 /// needed but at most `PASS_SHARE` of all edges.
 const PASS_SHARE: f32 = 0.5;
@@ -298,7 +314,18 @@ pub(crate) fn simplify_fast(
     }
 
     let max_err2 = opts.max_error.map(|e| (e * inv) * (e * inv));
+    let nd = if mesh.normals.is_some() && nw > 0.0 {
+        3
+    } else {
+        0
+    };
+    let uv_dims = if uw > 0.0 { 2 * mesh.uvs.len() } else { 0 };
     let mut st = St {
+        uvs: nd..nd + uv_dims,
+        same_uv2: SAME_UV2 * uw * uw,
+        // Callers that lock vertices (the cluster builder) rebuild their triangles from
+        // `source_vertex` and need every output vertex to be an exact copy.
+        carry: uv_dims > 0 && opts.locked_vertices.is_none(),
         pos,
         tris,
         tp,
@@ -307,11 +334,7 @@ pub(crate) fn simplify_fast(
         warea,
         attr,
         dim,
-        nd: if mesh.normals.is_some() && nw > 0.0 {
-            3
-        } else {
-            0
-        },
+        nd,
         avg_area,
         locked,
         border_deg,
@@ -321,6 +344,8 @@ pub(crate) fn simplify_fast(
         corners: Vec::new(),
         single: Vec::new(),
     };
+    // Position of each wedge: its own until it is carried.
+    let mut wpos = vpos.clone();
     let mut wremap: Vec<u32> = (0..nv as u32).collect();
     let mut premap: Vec<u32> = (0..np as u32).collect();
     let mut pos_alive = vec![true; np];
@@ -462,7 +487,11 @@ pub(crate) fn simplify_fast(
             }
             st.wedge_map(p, q, &mut map);
             for &(pw, qw) in &map {
-                wremap[pw as usize] = qw;
+                if pw == qw {
+                    wpos[pw as usize] = q; // carried
+                } else {
+                    wremap[pw as usize] = qw;
+                }
             }
             alive_tris -= st.collapse(p, q, &map);
             pos_alive[p as usize] = false;
@@ -532,6 +561,26 @@ pub(crate) fn simplify_fast(
                 .push(mesh.material_ids.get(t).copied().unwrap_or(0));
         }
     }
+    // Carried wedges sit where they were carried to, with what belongs to that position.
+    let mut at = vec![u32::MAX; np];
+    for v in 0..nv {
+        if at[vpos[v] as usize] == u32::MAX {
+            at[vpos[v] as usize] = v as u32;
+        }
+    }
+    for v in 0..nv {
+        if wpos[v] != vpos[v] {
+            let r = at[wpos[v] as usize] as usize;
+            out.positions[v] = mesh.positions[r];
+            if let Some(skin) = &mut out.skin {
+                skin.joints[v] = skin.joints[r];
+                skin.weights[v] = skin.weights[r];
+            }
+            for target in &mut out.morph_targets {
+                target.position_deltas[v] = target.position_deltas[r];
+            }
+        }
+    }
     let remap = out.compact();
     let resolve_pos = |mut p: u32| {
         while premap[p as usize] != p {
@@ -541,8 +590,8 @@ pub(crate) fn simplify_fast(
     };
     let mut pos_out = vec![u32::MAX; np];
     for v in 0..nv {
-        if remap[v] != u32::MAX && pos_out[vpos[v] as usize] == u32::MAX {
-            pos_out[vpos[v] as usize] = remap[v];
+        if remap[v] != u32::MAX && pos_out[wpos[v] as usize] == u32::MAX {
+            pos_out[wpos[v] as usize] = remap[v];
         }
     }
     let vertex_remap = (0..nv as u32)
@@ -585,6 +634,12 @@ struct St {
     dim: usize,
     /// The first `nd` attribute dims are the normal.
     nd: usize,
+    /// The attribute dims that hold the UV sets.
+    uvs: std::ops::Range<usize>,
+    /// [`SAME_UV2`] in the scaled units of `attr`.
+    same_uv2: f32,
+    /// Whether wedges torn off their island are carried (see the module docs).
+    carry: bool,
     avg_area: f32,
     locked: Vec<bool>,
     border_deg: Vec<u8>,
@@ -687,9 +742,9 @@ impl St {
         sq(0..self.nd) + sq(self.nd..d)
     }
 
-    /// Wedge map p→q: wedges of p in triangles shared with q map to q's wedge there; others to
-    /// the shared q wedge with the nearest attributes. Returns the attribute cost (None if p
-    /// and q share no triangle).
+    /// Wedge map p→q: wedges of p in triangles shared with q map to q's wedge there; the others
+    /// as [`unshared`](Self::unshared) says, a wedge mapped to itself being carried. Returns
+    /// the attribute cost (None if p and q share no triangle).
     fn wedge_map(&self, p: u32, q: u32, out: &mut Vec<(u32, u32)>) -> Option<f32> {
         out.clear();
         let (s, e) = (
@@ -718,8 +773,12 @@ impl St {
         if out.is_empty() {
             return None;
         }
+        let mut cost: f32 = out
+            .iter()
+            .map(|&(pw, qw)| self.warea[pw as usize] * self.adist(pw, qw))
+            .sum();
         if !single {
-            let shared = out.len();
+            let joined = out.len();
             for k in s..e {
                 if !self.alive[self.list[k] as usize] {
                     continue;
@@ -728,20 +787,61 @@ impl St {
                 if out.iter().any(|&(a, _)| a == pw) {
                     continue;
                 }
-                let best = out[..shared]
-                    .iter()
-                    .map(|&(_, qw)| (self.adist(pw, qw), qw))
-                    .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
-                    .unwrap();
-                out.push((pw, best.1));
+                let (c, to) = self.unshared(pw, &out[..joined]);
+                cost += c;
+                out.push((pw, to));
             }
         }
-        Some(
-            out.iter()
-                .map(|&(pw, qw)| self.warea[pw as usize] * self.adist(pw, qw))
-                .sum::<f32>()
-                / self.avg_area,
-        )
+        Some(cost / self.avg_area)
+    }
+
+    /// Where wedge `pw` of p goes when no triangle joins it to q, given the wedges that are
+    /// joined (p's wedge, q's wedge): its area-weighted attribute cost and the wedge it
+    /// becomes. With the UVs of a joined wedge it is on that wedge's island (split from it by
+    /// a normal or a color) and takes the nearest q wedge of that island. Otherwise the
+    /// collapse leaves its seam behind: it is carried (becomes itself, see the module docs)
+    /// at the cost of its texture sliding, or, where it cannot be, takes the nearest q wedge.
+    fn unshared(&self, pw: u32, joined: &[(u32, u32)]) -> (f32, u32) {
+        let mut on = (f32::INFINITY, u32::MAX);
+        let mut off = (f32::INFINITY, u32::MAX);
+        let mut slide = 0.0f32;
+        for &(sw, qw) in joined {
+            let d = self.adist(pw, qw);
+            let best = if self.uv_dist(pw, sw) <= self.same_uv2 {
+                &mut on
+            } else {
+                &mut off
+            };
+            if d < best.0 || (d == best.0 && qw < best.1) {
+                *best = (d, qw);
+            }
+            slide = slide.max(self.uv_dist(sw, qw));
+        }
+        let w = self.warea[pw as usize];
+        if on.1 != u32::MAX {
+            (w * on.0, on.1)
+        } else if self.carry {
+            (w * CARRY_SLIDE * slide, pw)
+        } else {
+            (w * off.0, off.1)
+        }
+    }
+
+    /// Squared distance between the (pre-scaled) UVs of wedges a and b, over all UV sets.
+    fn uv_dist(&self, a: u32, b: u32) -> f32 {
+        if a == b {
+            return 0.0;
+        }
+        let d = self.dim;
+        let (x, y) = (
+            &self.attr[a as usize * d..(a as usize + 1) * d],
+            &self.attr[b as usize * d..(b as usize + 1) * d],
+        );
+        x[self.uvs.clone()]
+            .iter()
+            .zip(&y[self.uvs.clone()])
+            .map(|(p, q)| (p - q) * (p - q))
+            .sum()
     }
 
     /// Attribute cost of p→q (as [`wedge_map`](Self::wedge_map) returns) without building the
@@ -818,14 +918,10 @@ impl St {
         }
         let mut cost = 0.0;
         for &pw in &pws[..np] {
-            let d = match maps[..nm].iter().find(|m| m.0 == pw) {
-                Some(&(_, qw)) => self.adist(pw, qw),
-                None => maps[..nm]
-                    .iter()
-                    .map(|&(_, qw)| self.adist(pw, qw))
-                    .fold(f32::INFINITY, f32::min),
+            cost += match maps[..nm].iter().find(|m| m.0 == pw) {
+                Some(&(_, qw)) => self.warea[pw as usize] * self.adist(pw, qw),
+                None => self.unshared(pw, &maps[..nm]).0,
             };
-            cost += self.warea[pw as usize] * d;
         }
         Some(cost / self.avg_area)
     }
@@ -874,8 +970,10 @@ impl St {
     /// Moves p onto q. Returns triangles removed.
     fn collapse(&mut self, p: u32, q: u32, map: &[(u32, u32)]) -> usize {
         for &(pw, qw) in map {
-            let a = self.warea[pw as usize];
-            self.warea[qw as usize] += a;
+            if pw != qw {
+                let a = self.warea[pw as usize];
+                self.warea[qw as usize] += a;
+            }
         }
         let mut removed = 0;
         let (s, e) = (
@@ -1049,6 +1147,101 @@ mod tests {
             df.relative_mean < db.relative_mean * 2.0,
             "{df:?} vs {db:?}"
         );
+    }
+
+    /// A cube of n × n quads per face, each face its own UV island (a sixth of the texture's
+    /// width) with its own vertices.
+    fn island_cube(n: u32) -> Mesh {
+        let (mut pos, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+        for f in 0..6u32 {
+            let axis = (f / 2) as usize;
+            let base = pos.len() as u32;
+            for j in 0..=n {
+                for i in 0..=n {
+                    let (a, b) = (i as f32 / n as f32, j as f32 / n as f32);
+                    let mut p = [0.0f32; 3];
+                    p[axis] = if f % 2 == 0 { -0.5 } else { 0.5 };
+                    p[(axis + 1) % 3] = a - 0.5;
+                    p[(axis + 2) % 3] = b - 0.5;
+                    pos.push(glam::Vec3::from(p));
+                    uv.push(glam::Vec2::new((f as f32 + 0.1 + 0.8 * a) / 6.0, b));
+                }
+            }
+            for j in 0..n {
+                for i in 0..n {
+                    let v = base + j * (n + 1) + i;
+                    let (b, c, d) = (v + 1, v + n + 2, v + n + 1);
+                    if f % 2 == 1 {
+                        idx.extend_from_slice(&[v, b, c, v, c, d]);
+                    } else {
+                        idx.extend_from_slice(&[v, c, b, v, d, c]);
+                    }
+                }
+            }
+        }
+        let mut m = Mesh::new(pos, idx);
+        m.uvs = vec![uv];
+        m.compute_normals(30.0);
+        m
+    }
+
+    #[test]
+    fn collapses_off_a_seam_keep_triangles_on_their_islands() {
+        // Fewer triangles than the cube's 12 can only be had by moving its corners off their
+        // seams. Every triangle must still lie on one face's island, and no vertex anywhere
+        // but at an input position.
+        let m = island_cube(4);
+        assert!(edge_counts(&m).values().all(|&c| c == 2));
+        let r = simplify(
+            &m,
+            &SimplifyOptions {
+                target_triangles: Some(8),
+                target_ratio: None,
+                ..opts(1.0)
+            },
+        )
+        .unwrap();
+        r.mesh.validate().unwrap();
+        assert!(r.mesh.triangle_count() < 12, "{}", r.mesh.triangle_count());
+        let island = |v: u32| (r.mesh.uvs[0][v as usize].x * 6.0).floor() as u32;
+        for t in 0..r.mesh.triangle_count() {
+            let [a, b, c] = r.mesh.triangle(t).map(island);
+            assert!(a == b && b == c, "triangle {t} spans islands {a} {b} {c}");
+        }
+        let key = |p: glam::Vec3| p.to_array().map(f32::to_bits);
+        let input: std::collections::HashSet<_> = m.positions.iter().map(|&p| key(p)).collect();
+        assert!(r.mesh.positions.iter().all(|&p| input.contains(&key(p))));
+        assert!(
+            r.vertex_remap
+                .iter()
+                .all(|&v| (v as usize) < r.mesh.vertex_count())
+        );
+        // Attributes other than the position are still the source vertex's.
+        for (v, &s) in r.source_vertex.iter().enumerate() {
+            assert_eq!(r.mesh.uvs[0][v], m.uvs[0][s as usize]);
+        }
+    }
+
+    #[test]
+    fn locked_vertices_keep_output_vertices_exact_copies() {
+        // With locks (none set here) every output vertex is its source vertex unchanged, as
+        // callers that rebuild triangles from `source_vertex` need.
+        let m = island_cube(4);
+        let r = simplify(
+            &m,
+            &SimplifyOptions {
+                target_triangles: Some(8),
+                target_ratio: None,
+                locked_vertices: Some(vec![false; m.vertex_count()]),
+                ..opts(1.0)
+            },
+        )
+        .unwrap();
+        r.mesh.validate().unwrap();
+        for (v, &s) in r.source_vertex.iter().enumerate() {
+            assert_eq!(r.mesh.positions[v], m.positions[s as usize]);
+            assert_eq!(r.mesh.uvs[0][v], m.uvs[0][s as usize]);
+        }
     }
 
     #[test]
