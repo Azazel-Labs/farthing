@@ -1108,7 +1108,37 @@ fn rtexport_mode(args: &[String]) {
             let share = m.triangle_count() as f64 / input.max(1) as f64;
             let target = ((total as f64 * share).round() as usize).max(4);
             let t = Instant::now();
-            lod.meshes[i] = f(&m, target);
+            // MIX_FAST=<i,j,..>: those meshes reduced by fast mode, whatever the method.
+            let mix = std::env::var("MIX_FAST")
+                .ok()
+                .is_some_and(|v| v.split(',').any(|x| x.parse::<usize>().ok() == Some(i)));
+            // UV0_MESH=<i,j,..>: those meshes reduced with their UVs dropped and put back.
+            let uv0 = std::env::var("UV0_MESH")
+                .ok()
+                .is_some_and(|v| v.split(',').any(|x| x.parse::<usize>().ok() == Some(i)));
+            lod.meshes[i] = if uv0 {
+                let mut bare = m.clone();
+                bare.uvs.clear();
+                let r = simplify(
+                    &bare,
+                    &SimplifyOptions {
+                        quality: if mix { Quality::Fast } else { Quality::Best },
+                        ..lf_opts(target)
+                    },
+                )
+                .unwrap();
+                let mut out = r.mesh;
+                out.uvs = m
+                    .uvs
+                    .iter()
+                    .map(|set| r.source_vertex.iter().map(|&v| set[v as usize]).collect())
+                    .collect();
+                out
+            } else if mix {
+                lf(Quality::Fast)(&m, target)
+            } else {
+                f(&m, target)
+            };
             ms += t.elapsed().as_secs_f64() * 1e3;
             let e = farthing::metrics::specular_error(
                 &m,
