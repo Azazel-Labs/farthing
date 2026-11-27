@@ -1352,6 +1352,37 @@ The helmet's hoses are not caught: a threshold loose enough for them costs 0.9 d
 Time on a hosted runner (same run, 3,000-triangle target on the merged scene): watch 14.13 to
 14.43 ms, car 18.61 to 18.70, dragon 13.73 to 14.11, all in the octree phase.
 
+### Realtime: border cells with a turned-down edge cut in two (v24)
+
+The car's glass and panels are modeled with their thickness: one edge ring in from the open
+border the sheet turns down 90° into a narrow strip, which draws as the dark rim line. One
+cluster held the border and the crease, pressed the strip flat into the sheet, and the line
+became a soft gray smudge (the car's worst mesh scored 21.78 dB against Best's 26.47). Refinement
+sums now also carry the normal and area of the vertices at an open-border position (a copy
+there, facing the same way, holds border planes). A leaf cell whose border normals meet the
+rest's at a cosine under 0.5, while the rest's normals keep 70% of their area (an open tube end
+fails that), counts as two clusters while it is a leaf, so the budget stays the same, and is cut
+into its border positions and the rest. Copies split by a seam fall on the same side, and the
+border clusters still keep their input positions.
+
+| rendered PSNR, dB | 10%: before | now | 3%: before | now |
+|---|---|---|---|---|
+| BoomBox | 23.47 | 23.38 | 19.44 | 19.48 |
+| CarConcept | 23.82 | 25.73 | 20.24 | 20.81 |
+| ChronographWatch | 19.95 | 19.83 | 15.33 | 15.48 |
+| Corset | 29.81 | 30.01 | 25.38 | 25.40 |
+| DamagedHelmet | 17.54 | 17.26 | 14.86 | 14.90 |
+| DragonAttenuation | 28.89 | 28.89 | 24.88 | 24.83 |
+| WaterBottle | 29.38 | 30.71 | 24.10 | 23.90 |
+| other four | unchanged | | unchanged | |
+| mean of 11 | 24.53 | 24.80 | 20.60 | 20.65 |
+
+Sealed share of shared borders (`rtcrack`, 10% / 3%): watch 40.0 / 14.7% to 42.6 / 17.2%, car
+34.3 / 17.4% to 41.4 / 17.4%; the car's mean crack at 3% grew from 0.65% to 1.20% of the
+diagonal. Time on a hosted runner (same run, 3,000-triangle target on the merged scene): watch
+16.55 to 16.99 ms, car 21.22 to 22.46, dragon 15.54 to 16.29: the border pass works out the
+flags per position run (+0.25 ms), the larger sums (+0.15 ms), and the car's tail (+0.35 ms).
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
