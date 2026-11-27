@@ -54,18 +54,23 @@ pub(crate) struct Parts {
 /// The answers are the ones a fresh test would give.
 #[derive(Default)]
 struct Seen {
-    /// Per sample: [`UNSEEN`], [`VISIBLE`], or where its blocking parts start in `blockers`.
-    state: Vec<u32>,
-    /// Per hidden sample, per outward direction it tests, the part that blocked that ray.
-    blockers: Vec<u32>,
+    /// Per sample.
+    state: Vec<State>,
     /// Per direction of [`vis_dirs`], the triangle that last blocked a ray of this part's
     /// samples, tried first for the next sample (neighboring samples are usually blocked by
-    /// the same triangle).
+    /// the same triangle). Only a guess: any value gives the same answers.
     last: Vec<u32>,
 }
 
-const UNSEEN: u32 = u32::MAX;
-const VISIBLE: u32 = u32::MAX - 1;
+/// What the visibility test of one sample found.
+#[derive(Clone, Default)]
+enum State {
+    #[default]
+    Unseen,
+    Visible,
+    /// Hidden: per outward direction it tests, the part that blocked that ray.
+    Hidden(Box<[u32]>),
+}
 
 impl Parts {
     /// None for single-part meshes and when every part has a locked vertex.
@@ -155,8 +160,7 @@ impl Parts {
             .samples
             .iter()
             .map(|s| Seen {
-                state: vec![UNSEEN; s.len()],
-                blockers: Vec::new(),
+                state: vec![State::Unseen; s.len()],
                 last: vec![u32::MAX; vis_dirs().len()],
             })
             .collect();
@@ -195,10 +199,16 @@ impl Parts {
         self.distance_of(k, coarse, seen)
     }
 
-    /// Whether a ray from sample `i` (p, n) of part k escapes the parts still kept in one of
-    /// the outward directions. Removing parts only frees rays, so a visible sample stays
-    /// visible (see [`Seen`]).
-    fn sample_visible(&self, k: usize, i: usize, (p, n): (Vec3, Vec3), seen: &mut Seen) -> bool {
+    /// Whether a ray from sample (p, n) of part k escapes the parts still kept in one of the
+    /// outward directions, given what its last test found (`state`, updated). Removing parts
+    /// only frees rays, so a visible sample stays visible (see [`Seen`]).
+    fn sample_visible(
+        &self,
+        k: usize,
+        (p, n): (Vec3, Vec3),
+        state: &mut State,
+        last: &mut [u32],
+    ) -> bool {
         let eps = self.reach * 1e-6;
         let o = p + n * eps;
         let blocks = |t: u32| {
@@ -208,7 +218,7 @@ impl Parts {
         // The part whose triangle blocks the ray in direction `d` (index `di`), if any: the
         // triangle that blocked this direction last if the full search is sure to find a hit
         // (see `Bvh::reaches`), else what the search finds.
-        let blocker = |di: usize, d: Vec3, last: &mut [u32]| {
+        let mut blocker = |di: usize, d: Vec3| {
             let t = last[di];
             if t != u32::MAX && blocks(t) && self.all.reaches(&self.paths, o, d, eps, self.reach, t)
             {
@@ -224,33 +234,27 @@ impl Parts {
             .iter()
             .enumerate()
             .filter(|(_, d)| d.dot(n) > 0.2);
-        match seen.state[i] {
-            VISIBLE => true,
-            UNSEEN => {
-                let start = seen.blockers.len();
+        match state {
+            State::Visible => true,
+            State::Unseen => {
+                let mut found = Vec::new();
                 for (di, &d) in dirs {
-                    let Some(j) = blocker(di, d, &mut seen.last) else {
-                        seen.blockers.truncate(start);
-                        seen.state[i] = VISIBLE;
+                    let Some(j) = blocker(di, d) else {
+                        *state = State::Visible;
                         return true;
                     };
-                    seen.blockers.push(j);
+                    found.push(j);
                 }
-                seen.state[i] = start as u32;
+                *state = State::Hidden(found.into_boxed_slice());
                 false
             }
-            start => {
-                let Seen {
-                    state,
-                    blockers,
-                    last,
-                } = seen;
-                for (slot, (di, &d)) in blockers[start as usize..].iter_mut().zip(dirs) {
+            State::Hidden(found) => {
+                for (slot, (di, &d)) in found.iter_mut().zip(dirs) {
                     if !self.removed[*slot as usize] {
                         continue;
                     }
-                    let Some(j) = blocker(di, d, last) else {
-                        state[i] = VISIBLE;
+                    let Some(j) = blocker(di, d) else {
+                        *state = State::Visible;
                         return true;
                     };
                     *slot = j;
@@ -266,58 +270,84 @@ impl Parts {
         let box_gap = |a: (Vec3, Vec3), b: (Vec3, Vec3)| -> f32 {
             (a.0 - b.1).max(b.0 - a.1).max(Vec3::ZERO).length()
         };
-        let point_gap =
-            |p: Vec3, b: (Vec3, Vec3)| -> f32 { (b.0 - p).max(p - b.1).max(Vec3::ZERO).length() };
         let mut others: Vec<(f32, usize)> = (0..np)
             .filter(|&j| j != k && !self.removed[j] && !self.bvhs[j].is_empty())
             .map(|j| (box_gap(self.boxes[k], self.boxes[j]), j))
             .collect();
         others.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let size = (self.boxes[k].1 - self.boxes[k].0).length();
-        let mut worst = 0.0f32;
-        // Coarse: every 8th sample, a lower bound on the full error.
-        let step = if coarse { 8 } else { 1 };
-        for (i, &(p, n)) in self.samples[k].iter().enumerate().step_by(step) {
-            // Samples hidden behind other parts (outside view from every direction) don't count.
-            if !self.sample_visible(k, i, (p, n), seen) {
-                continue;
-            }
-            // Distance to any kept surface, plus the part's own size, bounds what removing it
-            // can change: back-to-back shells (near, but large) stay protected by the facing
-            // rule, while a small part's sides don't need same-facing surface nearby.
-            let mut any = self.reach;
-            for &(gap, j) in &others {
-                if gap >= any {
+        if coarse {
+            // Every 8th sample, a lower bound on the full error (parts run side by side).
+            let mut worst = 0.0f32;
+            for (&s, state) in self.samples[k].iter().zip(&mut seen.state).step_by(8) {
+                worst = worst.max(self.sample_error(k, &others, size, s, state, &mut seen.last));
+                if worst >= self.reach {
                     break;
                 }
-                if point_gap(p, self.boxes[j]) >= any {
-                    continue;
-                }
-                if let Some(c) = self.bvhs[j].closest_point(p, any) {
-                    any = any.min(c.distance);
-                }
             }
-            let mut best = (any + size).min(self.reach);
-            for &(gap, j) in &others {
-                if gap >= best {
-                    break;
-                }
-                if point_gap(p, self.boxes[j]) >= best {
-                    continue;
-                }
-                let nj = &self.normals[j];
-                if let Some(c) =
-                    self.bvhs[j].closest_point_where(p, best, |t| nj[t as usize].dot(n) > 0.5)
-                {
-                    best = best.min(c.distance);
-                }
-            }
-            worst = worst.max(best);
-            if worst >= self.reach {
+            worst
+        } else {
+            // The largest of the samples' errors, whichever thread finds it.
+            let last = &seen.last;
+            self.samples[k]
+                .par_iter()
+                .zip(seen.state.par_iter_mut())
+                .map_init(
+                    || last.clone(),
+                    |last, (&s, state)| self.sample_error(k, &others, size, s, state, last),
+                )
+                .reduce(|| 0.0, f32::max)
+        }
+    }
+
+    /// Removal error at one sample of part k (see `error_of`); 0 if no ray from it escapes.
+    /// `others` lists the kept parts by box distance, `size` is the part's diagonal.
+    fn sample_error(
+        &self,
+        k: usize,
+        others: &[(f32, usize)],
+        size: f32,
+        (p, n): (Vec3, Vec3),
+        state: &mut State,
+        last: &mut [u32],
+    ) -> f32 {
+        // Samples hidden behind other parts (outside view from every direction) don't count.
+        if !self.sample_visible(k, (p, n), state, last) {
+            return 0.0;
+        }
+        let point_gap =
+            |p: Vec3, b: (Vec3, Vec3)| -> f32 { (b.0 - p).max(p - b.1).max(Vec3::ZERO).length() };
+        // Distance to any kept surface, plus the part's own size, bounds what removing it
+        // can change: back-to-back shells (near, but large) stay protected by the facing
+        // rule, while a small part's sides don't need same-facing surface nearby.
+        let mut any = self.reach;
+        for &(gap, j) in others {
+            if gap >= any {
                 break;
             }
+            if point_gap(p, self.boxes[j]) >= any {
+                continue;
+            }
+            if let Some(c) = self.bvhs[j].closest_point(p, any) {
+                any = any.min(c.distance);
+            }
         }
-        worst
+        let mut best = (any + size).min(self.reach);
+        for &(gap, j) in others {
+            if gap >= best {
+                break;
+            }
+            if point_gap(p, self.boxes[j]) >= best {
+                continue;
+            }
+            let nj = &self.normals[j];
+            if let Some(c) =
+                self.bvhs[j].closest_point_where(p, best, |t| nj[t as usize].dot(n) > 0.5)
+            {
+                best = best.min(c.distance);
+            }
+        }
+        best
     }
 
     /// Input triangles of part k.
