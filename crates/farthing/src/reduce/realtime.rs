@@ -8,8 +8,8 @@
 //! 1. **Octree refinement over a Morton order.** Vertices are radix-sorted by a 30-bit Morton
 //!    code, so every octree cell is a contiguous range. Each vertex carries its plane quadric
 //!    (area-weighted face planes, plus border planes found without an edge table: the sums of
-//!    a vertex's next and previous corner ids, and of their squares, cancel around a closed fan
-//!    and give the two border neighbors of an open one). Cells are split top-down, worst first,
+//!    a vertex's next and previous corners, counted by position, and of their squares, cancel
+//!    around a closed fan and give the two border neighbors of an open one). Cells are split top-down, worst first,
 //!    by the quadric error at their area-weighted centroid plus a normal-cone term that splits
 //!    cells holding opposite sheets. Flat regions stay coarse and curved ones refine, like
 //!    greedy collapse and unlike a uniform grid. The split stops at about one cluster per
@@ -220,19 +220,34 @@ struct FCell {
     st: [f32; NS],
 }
 
-/// A vertex's face sums: area-weighted normal, area, and the corner-id sums that find open
-/// fans (wrapping; exact for the values they are read for).
+/// A vertex's face sums: area-weighted normal, area, and the corner sums that find open fans
+/// (wrapping; exact for the values they are read for). Corners count by position (the first
+/// rank at it), so the copies of a vertex at one position sum to the fan around it.
 #[derive(Clone, Copy, Default)]
 #[repr(C, align(32))]
 struct VSum {
     n: [f32; 3],
     area: f32,
     s1: i32,
+    /// Σ mix(next) − Σ mix(prev): a check on the ends `s1` and `s2` give. They are an open
+    /// fan's only when the fan is one arc; faces forming two arcs around a vertex (common on
+    /// unwelded meshes) pass the other checks with two unrelated vertices about half the time.
+    s3: u32,
     s2: i64,
 }
 
+const _: () = assert!(std::mem::size_of::<VSum>() == 32);
+
+/// A non-linear mix of a vertex id for the fan check sum `VSum::s3`.
+#[inline]
+fn fan_mix(x: u32) -> u32 {
+    let x = (x ^ (x >> 16)).wrapping_mul(0x85eb_ca6b);
+    x ^ (x >> 13)
+}
+
 /// The two border neighbors of an open fan v, a1, ..., ak: Σnext − Σprev = a1 − ak and
-/// Σnext² − Σprev² = a1² − ak², so a1 + ak = (a1² − ak²) / (a1 − ak).
+/// Σnext² − Σprev² = a1² − ak², so a1 + ak = (a1² − ak²) / (a1 − ak); checked against
+/// Σmix(next) − Σmix(prev) = mix(a1) − mix(ak).
 fn fan_ends(v: usize, s: &VSum, nv: usize) -> Option<[usize; 2]> {
     let d1 = s.s1 as i64;
     if d1 == 0 {
@@ -251,7 +266,8 @@ fn fan_ends(v: usize, s: &VSum, nv: usize) -> Option<[usize; 2]> {
     }
     let (a1, ak) = (x / 2, sum.wrapping_sub(x / 2));
     let ok = |o: i64| (0..nv as i64).contains(&o) && o != v as i64;
-    (ok(a1) && ok(ak)).then_some([a1 as usize, ak as usize])
+    (ok(a1) && ok(ak) && fan_mix(a1 as u32).wrapping_sub(fan_mix(ak as u32)) == s.s3)
+        .then_some([a1 as usize, ak as usize])
 }
 
 /// A vertex's quadric from its face sums, moment-matched: the fan's face-normal second
@@ -328,6 +344,7 @@ impl VSum {
         self.area += d.area;
         self.s1 = self.s1.wrapping_add(d.s1);
         self.s2 = self.s2.wrapping_add(d.s2);
+        self.s3 = self.s3.wrapping_add(d.s3);
     }
 }
 
@@ -585,6 +602,21 @@ fn realtime_pass(
         .collect();
     let chunk_tris = |k: usize| routed.iter().flat_map(move |b| b[k].iter());
 
+    // Each vertex's position, as the first rank at it (vertices at one position are
+    // neighbors in rank, see `sort_by_code`). Fan sums count neighbors by these, so the copies
+    // of a vertex split by a seam or unwelded faces sum to one fan.
+    let first_at: Vec<u32> = (0..nv)
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|r| {
+            let mut q = r;
+            while q > 0 && spos[q - 1] == spos[r] {
+                q -= 1;
+            }
+            q as u32
+        })
+        .collect();
+
     // Face sums per vertex. A chunk owns its vertices' sums; corners past its end are handed
     // on and added after, in chunk order.
     let mut vs = vec![VSum::default(); nv];
@@ -608,11 +640,13 @@ fn realtime_pass(
                     (h, area) = (Vec3::ZERO, 0.0);
                 }
                 for (v, nx, pv) in [(a, b, c), (b, c, a), (c, a, b)] {
+                    let (nx, pv) = (first_at[nx as usize], first_at[pv as usize]);
                     let d = VSum {
                         n: h.to_array(),
                         area,
                         s1: (nx as i32).wrapping_sub(pv as i32),
                         s2: (nx as i64 * nx as i64).wrapping_sub(pv as i64 * pv as i64),
+                        s3: fan_mix(nx).wrapping_sub(fan_mix(pv)),
                     };
                     match own.get_mut((v - lo) as usize) {
                         Some(s) => s.add(&d),
@@ -635,86 +669,48 @@ fn realtime_pass(
         return Ok(unchanged(mesh));
     }
     let avg_area = (total_area / live as f64).max(1e-30);
-    // Border edges, worked out once per vertex: an open fan's end edge is a border only if
-    // the surface stops there. Where another vertex at the same position, facing the same
-    // way, has an end edge to the same place, the two fans meet along it: a seam (split UVs or
-    // normals) or unwelded faces, where border planes would pin vertices for no reason.
-    // Vertices at one position are neighbors in rank (see `sort_by_code`). (The back
-    // of a double-sided sheet is there too, facing the other way, and doesn't count.)
+    // Border edges, worked out per position: the fan sums count neighbors by position (see
+    // `first_at`), so the copies of a vertex at one position facing one way (split by a seam,
+    // or unwelded faces) add up to the fan of the surface around that position, closed unless
+    // the surface stops there. The first such copy holds the position's border planes. (The
+    // back of a double-sided sheet is there too, facing the other way, and is summed apart.)
     const NONE: [u32; 2] = [u32::MAX; 2];
     let bw = opts.border_weight;
-    // Each vertex's position, as the first rank at it; end edges are then compared by these
-    // alone, reading only a vertex's rank neighbors.
-    let first_at: Vec<u32> = if bw > 0.0 {
+    let borders: Vec<[u32; 2]> = if bw > 0.0 {
         (0..nv)
             .into_par_iter()
             .with_min_len(PAR_MIN)
             .map(|r| {
-                let mut q = r;
-                while q > 0 && spos[q - 1] == spos[r] {
-                    q -= 1;
+                let (p, f) = (spos[r], first_at[r] as usize);
+                let n = Vec3::from_array(vs[r].n);
+                let n2 = n.length_squared();
+                // Facing within about 154° of each other (cos > −0.9), without the root.
+                let facing = |q: usize| {
+                    let m = Vec3::from_array(vs[q].n);
+                    let d = n.dot(m);
+                    !(d < 0.0 && d * d >= 0.81 * n2 * m.length_squared())
+                };
+                if (f..r).any(facing) {
+                    return NONE;
                 }
-                q as u32
+                let mut sum = vs[r];
+                let mut q = r + 1;
+                while q < nv && spos[q] == p {
+                    if facing(q) {
+                        sum.add(&vs[q]);
+                    }
+                    q += 1;
+                }
+                match fan_ends(f, &sum, nv) {
+                    Some([a, b]) if a != b => [a as u32, b as u32],
+                    _ => NONE,
+                }
             })
             .collect()
     } else {
         Vec::new()
     };
-    let ends: Vec<[u32; 2]> = (0..first_at.len())
-        .into_par_iter()
-        .with_min_len(PAR_MIN)
-        .map(|r| {
-            let e = fan_ends(r, &vs[r], nv).map_or(NONE, |e| e.map(|x| first_at[x]));
-            // Both ends at one position: a seam ends at this vertex, and its fan closes
-            // across the seam's two sides. Not a border.
-            if e[0] == e[1] { NONE } else { e }
-        })
-        .collect();
     drop(first_at);
-    let borders: Vec<[u32; 2]> = (0..ends.len())
-        .into_par_iter()
-        .with_min_len(PAR_MIN)
-        .map(|r| {
-            let mut mine = ends[r];
-            if mine == NONE {
-                return NONE;
-            }
-            let p = spos[r];
-            let n = Vec3::from_array(vs[r].n);
-            let n2 = n.length_squared();
-            let meet = |mut mine: [u32; 2], q: usize| {
-                if (ends[q][0] != mine[0] && ends[q][0] != mine[1])
-                    && (ends[q][1] != mine[0] && ends[q][1] != mine[1])
-                {
-                    return mine;
-                }
-                // Facing within about 154° of each other (cos > −0.9), without the root.
-                let m = Vec3::from_array(vs[q].n);
-                let d = n.dot(m);
-                if d < 0.0 && d * d >= 0.81 * n2 * m.length_squared() {
-                    return mine;
-                }
-                for o in &mut mine {
-                    if ends[q].contains(o) {
-                        *o = u32::MAX;
-                    }
-                }
-                mine
-            };
-            let mut q = r;
-            while q > 0 && spos[q - 1] == p && mine != NONE {
-                q -= 1;
-                mine = meet(mine, q);
-            }
-            let mut q = r + 1;
-            while q < nv && spos[q] == p && mine != NONE {
-                mine = meet(mine, q);
-                q += 1;
-            }
-            mine
-        })
-        .collect();
-    drop(ends);
     // Importance scales a vertex's error, so clusters stay finer and collapse later there.
     let importance = opts.vertex_importance.as_deref();
     let vq = |r: usize| {
