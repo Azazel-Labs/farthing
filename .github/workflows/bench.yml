@@ -36,6 +36,9 @@ on:
       fast:
         description: "Time fast mode instead: triangle target, such as 10000 (base and head take turns)"
         default: ""
+      best:
+        description: "Time the default reducer (best) instead: triangle target, such as 10000 (base and head take turns)"
+        default: ""
       features:
         description: "bench-compare Cargo features for every build, such as 'system-alloc'"
         default: ""
@@ -45,7 +48,7 @@ permissions:
 
 jobs:
   realtime:
-    if: inputs.perf == '' && inputs.run == '' && inputs.fast == ''
+    if: inputs.perf == '' && inputs.run == '' && inputs.fast == '' && inputs.best == ''
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v7
@@ -128,6 +131,8 @@ jobs:
           {
             echo '```'
             $PERF report -i perf.data --stdio --no-children --sort symbol -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60
+            echo '--- inclusive (with callees)'
+            $PERF report -i perf.data --stdio --children --sort symbol -g none 2>/dev/null | grep -v '^#' | grep -v '^$'               | grep -v '(inlined)' | awk '/farthing::/ || !/rayon(_core)?::|std::|core::/' | head -80
             echo '--- by source line'
             $PERF report -i perf.data --stdio --no-children --sort srcline -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120
             echo '```'
@@ -174,10 +179,10 @@ jobs:
           done | tee -a "$GITHUB_STEP_SUMMARY"
 
 
-  # Fast mode A/B: base and head take turns reducing each asset (flattened) to the target;
-  # minimum per asset over all rounds of RT_RUNS calls.
+  # Fast mode (or default reducer) A/B: base and head take turns reducing each asset (flattened)
+  # to the target; minimum per asset over all rounds of RT_RUNS calls.
   fast:
-    if: inputs.fast != ''
+    if: inputs.fast != '' || inputs.best != ''
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v7
@@ -213,17 +218,19 @@ jobs:
         shell: bash
         env:
           ROUNDS: ${{ inputs.rounds }}
-          TARGET: ${{ inputs.fast }}
+          TARGET: ${{ inputs.fast || inputs.best }}
+          METHOD: ${{ inputs.fast != '' && 'farthing fast' || 'farthing' }}
         run: |
           ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
           py=python3; [ "$RUNNER_OS" = Windows ] && py=python
-          echo "base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD), $(nproc 2>/dev/null) cores" >> "$GITHUB_STEP_SUMMARY"
+          echo "$METHOD to $TARGET: base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD), $(nproc 2>/dev/null) cores" >> "$GITHUB_STEP_SUMMARY"
           $py - "$ext" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
           import os, subprocess, sys
           ext = sys.argv[1]
           builds = {b: f"{b}/bench-compare/target/release/bench-compare{ext}" for b in ("base", "head")}
           assets = ["ChronographWatch", "CarConcept", "DragonAttenuation"]
-          env = dict(os.environ, RD_METHODS="farthing_fast", RT_TARGET=os.environ["TARGET"], RT_RUNS="5")
+          method = os.environ["METHOD"].split()
+          env = dict(os.environ, RD_METHODS="_".join(method), RT_TARGET=os.environ["TARGET"], RT_RUNS="5")
           best = {(b, a): 1e18 for b in builds for a in assets}
           for r in range(int(os.environ["ROUNDS"])):
               for b, exe in builds.items():
@@ -231,7 +238,7 @@ jobs:
                                        env=env, capture_output=True, text=True).stdout
                   for line in out.splitlines():
                       f = line.split()
-                      if len(f) > 3 and f[0] in assets and f[2:4] == ["farthing", "fast"]:
+                      if len(f) > 3 and f[0] in assets and f[2:2 + len(method)] == method:
                           best[(b, f[0])] = min(best[(b, f[0])], float(f[-2]))
           print("| asset | base ms | head ms | head/base |")
           print("|---|---|---|---|")
