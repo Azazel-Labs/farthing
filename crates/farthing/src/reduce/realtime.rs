@@ -42,7 +42,7 @@
 
 use crate::reduce::simplify::{SimplifyOptions, SimplifyResult};
 use crate::{Mesh, Result};
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -636,6 +636,7 @@ plain_held!(
     [u32; 3],
     [u32; 1024],
     (f32, u32),
+    (u32, u32),
     ([u32; 3], u32),
     (u32, VSum),
     [f64; NS],
@@ -777,6 +778,10 @@ scratch! {
     srcs: Vec<u32>,
     cluster_out: Vec<u32>,
     normal_parts: Vec<Vec<Vec3>>,
+    uv_slot: Vec<u32>,
+    uv_found: Vec<Vec<(u32, u32)>>,
+    uv_start: Vec<u32>,
+    uv_tris: Vec<u32>,
 }
 
 thread_local! {
@@ -864,6 +869,127 @@ fn reduce_with(
         r = again;
     }
     Ok(r)
+}
+
+/// Triangles per block of the parallel scan in [`carry_uvs`]: fixed, so the blocks and the
+/// order their finds are merged in never depend on the thread count.
+const UV_BLOCK: usize = 16384;
+
+/// Moves each output vertex's UVs with it. A vertex takes its attributes from one input
+/// vertex (its wedge's source) but stands at its cluster's position, which can lie well away
+/// from that source (across a merged layer or at the end of a long cluster), so the texture
+/// there would slide. Each UV set is carried along its surface gradient at the source (the
+/// area-weighted mean over the source's input triangles) by the move, and held to the UV box
+/// of those triangles so it never runs off the end of a chart. Vertices at their source's
+/// position keep its UVs as they are.
+///
+/// The buffers are the scratch's `uv_slot`, `uv_start`, `uv_tris` and `uv_found`.
+fn carry_uvs(
+    mesh: &Mesh,
+    source_vertex: &[u32],
+    out: &mut Mesh,
+    [slot_buf, start_buf, tris_buf]: [&mut Vec<u32>; 3],
+    found_buf: &mut Vec<Vec<(u32, u32)>>,
+) {
+    if mesh.uvs.is_empty() {
+        return;
+    }
+    // A slot per source vertex that moved.
+    let mut slot = filled(std::mem::take(slot_buf), mesh.vertex_count(), u32::MAX);
+    let mut moved = 0usize;
+    for (o, &v) in source_vertex.iter().enumerate() {
+        if out.positions[o] != mesh.positions[v as usize] && slot[v as usize] == u32::MAX {
+            slot[v as usize] = moved as u32;
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        // The input triangles at each moved source, in triangle order: found in fixed blocks
+        // in parallel, then bucketed by slot in block order.
+        let nt = mesh.triangle_count();
+        let blocks = nt.div_ceil(UV_BLOCK);
+        let mut found = std::mem::take(found_buf);
+        if found.len() < blocks {
+            found.resize_with(blocks, Vec::new);
+        }
+        found[..blocks]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(b, f)| {
+                f.clear();
+                for t in b * UV_BLOCK..((b + 1) * UV_BLOCK).min(nt) {
+                    for v in mesh.triangle(t) {
+                        let k = slot[v as usize];
+                        if k != u32::MAX {
+                            f.push((k, t as u32));
+                        }
+                    }
+                }
+            });
+        // Counted into `start[k + 1]`, summed to each slot's start, then advanced past its
+        // triangles while filling: slot `k`'s run ends up at `start[k - 1]..start[k]`.
+        let mut start = filled(std::mem::take(start_buf), moved + 1, 0u32);
+        for &(k, _) in found[..blocks].iter().flatten() {
+            start[k as usize + 1] += 1;
+        }
+        for k in 0..moved {
+            start[k + 1] += start[k];
+        }
+        let mut tris = filled(std::mem::take(tris_buf), start[moved] as usize, 0u32);
+        for &(k, t) in found[..blocks].iter().flatten() {
+            tris[start[k as usize] as usize] = t;
+            start[k as usize] += 1;
+        }
+        let run = |k: usize| {
+            let lo = if k == 0 { 0 } else { start[k - 1] as usize };
+            &tris[lo..start[k] as usize]
+        };
+        for (set, uvs) in mesh.uvs.iter().zip(out.uvs.iter_mut()) {
+            uvs.par_iter_mut()
+                .with_min_len(PAR_MIN)
+                .enumerate()
+                .for_each(|(o, uv)| {
+                    let v = source_vertex[o] as usize;
+                    let d = out.positions[o] - mesh.positions[v];
+                    if d == Vec3::ZERO {
+                        return;
+                    }
+                    let (mut gu, mut gv, mut area) = (Vec3::ZERO, Vec3::ZERO, 0.0);
+                    let (mut lo, mut hi) = (Vec2::INFINITY, Vec2::NEG_INFINITY);
+                    for &t in run(slot[v] as usize) {
+                        let t = mesh.triangle(t as usize);
+                        let x = t.map(|i| mesh.positions[i as usize]);
+                        let n = (x[1] - x[0]).cross(x[2] - x[0]);
+                        let a2 = n.length_squared();
+                        if a2 <= 0.0 {
+                            continue;
+                        }
+                        // The gradients of the triangle's three hat functions.
+                        let h = [
+                            n.cross(x[2] - x[1]) / a2,
+                            n.cross(x[0] - x[2]) / a2,
+                            n.cross(x[1] - x[0]) / a2,
+                        ];
+                        let a = a2.sqrt() * 0.5;
+                        let u = t.map(|i| set[i as usize]);
+                        for w in u {
+                            (lo, hi) = (lo.min(w), hi.max(w));
+                        }
+                        gu += (h[0] * u[0].x + h[1] * u[1].x + h[2] * u[2].x) * a;
+                        gv += (h[0] * u[0].y + h[1] * u[1].y + h[2] * u[2].y) * a;
+                        area += a;
+                    }
+                    if area > 0.0 {
+                        let step = Vec2::new((gu / area).dot(d), (gv / area).dot(d));
+                        *uv = (set[v] + step).clamp(lo, hi);
+                    }
+                });
+        }
+        *found_buf = found;
+        *start_buf = start;
+        *tris_buf = tris;
+    }
+    *slot_buf = slot;
 }
 
 /// One realtime reduction with `per_tri` stage-one clusters per target triangle.
@@ -2207,6 +2333,13 @@ fn realtime_pass(
             mesh.positions[rep[c] as usize]
         };
     }
+    carry_uvs(
+        mesh,
+        &source_vertex,
+        &mut out,
+        [&mut s.uv_slot, &mut s.uv_start, &mut s.uv_tris],
+        &mut s.uv_found,
+    );
     out.indices = indices;
     out.material_ids = material_ids;
 
