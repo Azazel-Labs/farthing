@@ -21,6 +21,12 @@ on:
       time_env:
         description: "Environment for the timed runs, such as 'RT_TARGET=20000'"
         default: ""
+      run:
+        description: "Run instead of timing: bench-compare arguments, once per environment in run_envs"
+        default: ""
+      run_envs:
+        description: "Environments for run, separated by ' | ', such as 'LF_OPTS={} | LF_OPTS={\"gutter_use\":0.25}'"
+        default: ""
       perf:
         description: "Profile instead of timing: bench-compare arguments, such as 'realtime assets/CarConcept.glb'"
         default: ""
@@ -33,7 +39,7 @@ permissions:
 
 jobs:
   realtime:
-    if: inputs.perf == ''
+    if: inputs.perf == '' && inputs.run == ''
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v7
@@ -118,4 +124,43 @@ jobs:
             $PERF report -i perf.data --stdio --no-children --sort srcline -g none 2>/dev/null | grep -v '^#' | grep -v '^$' | head -120
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # One bench-compare command under several environments on a quiet machine, output as is.
+  run:
+    if: inputs.run != ''
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.head || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        id: assets
+        with:
+          path: assets
+          key: bench-assets-8f492390
+      - name: Fetch assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p assets
+          for n in ChronographWatch CarConcept DragonAttenuation; do
+            curl -fsSL -o assets/$n.glb               https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/8f492390ddc7a2ae221a1369ef560589cf8c70fb/Models/$n/glTF-Binary/$n.glb
+          done
+      - name: Build
+        shell: bash
+        run: cd bench-compare && cargo build --release --locked
+      - name: Run
+        shell: bash
+        env:
+          RUN_ENVS: ${{ inputs.run_envs }}
+          RUN_ARGS: ${{ inputs.run }}
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          echo "$RUN_ENVS" | tr '|' '
+' | while IFS= read -r e; do
+            e=$(echo "$e" | sed 's/^ *//; s/ *$//')
+            echo "=== ${e:-(no environment)}"
+            env $e bench-compare/target/release/bench-compare$ext $RUN_ARGS 2>&1 | grep -v '^  '
+          done | tee -a "$GITHUB_STEP_SUMMARY"
 
