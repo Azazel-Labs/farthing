@@ -46,6 +46,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 const DEPTH: u32 = 10;
 /// Stage-one clusters per target triangle.
 const CLUSTERS_PER_TRI: f32 = 0.55;
+/// A mesh of at most `RETRY_MAX_TRIS` triangles that ends below `RETRY_BELOW` of its target
+/// is reduced again with more clusters, up to `RETRIES` times.
+const RETRY_MAX_TRIS: usize = 20_000;
+const RETRY_BELOW: f32 = 0.95;
+const RETRIES: usize = 2;
 /// Weight of the normal-cone term (opposite sheets in one cell) against quadric error.
 const NORMAL_KAPPA: f64 = 0.125;
 /// Share of `max_error` stage one may use, leaving the tail room to collapse.
@@ -448,6 +453,41 @@ pub(crate) fn simplify_realtime(
     opts: &SimplifyOptions,
     target: Option<usize>,
 ) -> Result<SimplifyResult> {
+    // The cluster budget assumes about two triangles per cluster, as on a closed surface. An
+    // open sheet has about one (a disc of k vertices has k - 2 triangles), so stage one can
+    // land under the target, where the tail has nothing to add. A small mesh that comes out
+    // short goes again with the budget scaled by the shortfall; a large one is rarely short
+    // by much and is not worth a second pass.
+    let mut per_tri = CLUSTERS_PER_TRI;
+    let mut r = realtime_pass(mesh, opts, target, per_tri)?;
+    let Some(t) = target else {
+        return Ok(r);
+    };
+    for _ in 0..RETRIES {
+        let got = r.mesh.triangle_count();
+        if mesh.triangle_count() > RETRY_MAX_TRIS
+            || got as f32 >= t as f32 * RETRY_BELOW
+            || got >= mesh.triangle_count()
+        {
+            break;
+        }
+        per_tri *= (1.2 * t as f32 / got.max(1) as f32).min(4.0);
+        let again = realtime_pass(mesh, opts, target, per_tri)?;
+        if again.mesh.triangle_count() <= got {
+            break;
+        }
+        r = again;
+    }
+    Ok(r)
+}
+
+/// One realtime reduction with `per_tri` stage-one clusters per target triangle.
+fn realtime_pass(
+    mesh: &Mesh,
+    opts: &SimplifyOptions,
+    target: Option<usize>,
+    per_tri: f32,
+) -> Result<SimplifyResult> {
     let nv = mesh.vertex_count();
     let nt = mesh.triangle_count();
     let prof = std::env::var_os("FARTHING_RT_PROFILE").is_some();
@@ -680,7 +720,7 @@ pub(crate) fn simplify_realtime(
     // Fine cells: the coarsest level with about FINE_PER_CLUSTER cells per wanted cluster,
     // summed in one ordered pass. Refinement works on these and only goes back to vertices
     // for a fine cell that must split further.
-    let k_target = target.map(|t| ((t as f32 * CLUSTERS_PER_TRI).ceil() as usize).max(4));
+    let k_target = target.map(|t| ((t as f32 * per_tri).ceil() as usize).max(4));
     let fine_level = {
         const NL: usize = DEPTH as usize + 1;
         let first_split = (1..nv)
