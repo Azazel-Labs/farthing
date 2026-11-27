@@ -572,6 +572,27 @@ pass goes from 2.7 to 4.1 ms on the watch). On Linux it is 2 to 4%. A program th
 realtime reducer repeatedly on Windows should set a caching global allocator such as mimalloc;
 every time in this document is measured with it.
 
+Now each thread keeps those buffers between realtime calls (`release_realtime_scratch` frees
+them), and a call allocates under 1 MB: the vertex remap it returns, the output mesh and a few
+small arrays. The penalty is gone. Each pair of columns ran on one Windows runner, mimalloc
+against the system allocator, 4 logical cores, ms per call:
+
+| asset | target | before, mimalloc | before, system | now, mimalloc | now, system |
+|---|---|---|---|---|---|
+| ChronographWatch | 3,000 | 24.50 | 30.73 | 14.45 | 14.64 |
+| CarConcept | 3,000 | 26.99 | 35.31 | 18.15 | 18.08 |
+| DragonAttenuation | 3,000 | 20.53 | 26.85 | 13.84 | 14.06 |
+| ChronographWatch | 20,000 | 40.66 | 50.49 | 35.59 | 36.14 |
+| CarConcept | 20,000 | 43.00 | 56.84 | 36.72 | 36.92 |
+| DragonAttenuation | 20,000 | 34.28 | 45.13 | 30.34 | 30.72 |
+
+(Runs 46058618218 and 46058627874 before, 46058623829 and 46058631884 now; the before and now
+pairs ran on different machines.) On one runner the change also makes realtime 4 to 6% faster
+under mimalloc and 2 to 6% on Linux. Fast mode on the Windows system allocator is still 4 to 6%
+slower than under mimalloc on one runner (run 46058809311), and the default reducer roughly 6
+to 10% (estimated across two runners), so programs using those on Windows still gain a little
+from mimalloc.
+
 ### Specular error (v22)
 
 A still under fixed light hides shading-normal error on glossy surfaces; a moving light or
