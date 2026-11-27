@@ -524,6 +524,34 @@ DragonAttenuation 9.0 → 9.6 ms across the three changes. Local timings on the 
 machine are not comparable with the v21 table (it was busy), so that table's times stand for
 v21.
 
+### Realtime mode: small parts and folds (v23)
+
+- **Small targets get more clusters.** The cluster budget assumes a closed surface's two
+  triangles per cluster. A cluster on an open border has one fewer, and at a small target
+  most clusters are on a border: the watch's crystal, a 62-triangle disc with a target of 6,
+  came out as 2 triangles (a square) where fast mode and meshoptimizer kept a hexagon. The
+  budget is now scaled by 1 + 24 / (target + 8), which fades out by a few hundred triangles,
+  and a mesh of at most 20,000 triangles that still lands a quarter under its target is
+  reduced again with more.
+- **Folds go first.** Clusters stand at member vertices chosen one by one, so three of them
+  can form a triangle facing the other way from the one it stands for: 0.6% to 6% of the
+  triangles entering the tail (the watch 4.4%, DamagedHelmet 2.9%). The tail now takes
+  collapses that remove such a triangle before any other, and refuses a collapse that turns
+  a triangle against the original surface (a triangle of no area had no "before" to compare
+  with). Folded triangles left at 10%: DamagedHelmet 41 to 1, the watch 395 to 82, the dragon
+  scene 285 to 23, the car 503 to 216.
+
+Mean PSNR over 11 assets: 23.87 to 24.02 dB at 10%, 19.88 to 20.10 dB at 3%. On the runner a
+single large model takes 2 to 5% longer (ChronographWatch 13.9 to 14.6 ms, most of it the
+fold test's reads when triangles are built) and a scene reduced mesh by mesh 5 to 17%
+(CarConcept's 97 meshes to 10%: 39.8 to 44.7 ms).
+
+A larger budget everywhere scores higher still: 0.715 clusters per target triangle in place
+of 0.55 gives 24.45 dB at 10% and 20.28 dB at 3%, because the tail then decides more of the
+result. It is not the default: the tail does about 55% more work (single models 11 to 18%
+slower, scenes 25 to 30%), and the car as one mesh at 3,000 triangles gets worse (Hausdorff
+3.7% to 4.1%).
+
 ### Realtime mode and the allocator (v22)
 
 A realtime call allocates 15 to 22 MB in a few dozen large blocks and frees them when it
