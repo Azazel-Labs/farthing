@@ -4144,6 +4144,16 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                         if shared.border[x as usize] && !shared.bnbr[x as usize].contains(&q) {
                             return (x, None);
                         }
+                        // The geometric part alone bounds the cost from below (the attribute
+                        // part only adds to it): x→q cannot beat x's candidate if that does
+                        // not, and nothing else is worked out.
+                        let geom = shared.cost_geom(x, q);
+                        if let Some(old) = cand_ref[x as usize]
+                            && geom.0 >= 0.0
+                            && geom.0.sqrt() * geom.2 >= old.cost
+                        {
+                            return (x, None);
+                        }
                         shared.p_corners(x, corners);
                         if !shared.strict
                             && !shared.relaxed
@@ -4154,8 +4164,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                         if let Some(tear) = shared.map_from_corners(corners, q, map) {
                             // Without its gutter spill the cost is a lower bound: the spill
                             // is priced only if that could beat the candidate x has.
-                            let (attr, geom) =
-                                (shared.cost_attr(x, q, map), shared.cost_geom(x, q));
+                            let attr = shared.cost_attr(x, q, map);
                             let mut c = shared.cost_from(attr, tear, geom);
                             if cand_ref[x as usize].is_some_and(|old| c.0 < old.cost) {
                                 let price = shared.uv_price(corners, q, map);
