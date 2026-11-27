@@ -744,19 +744,19 @@ fn realtime_pass(
     });
     let fine_level = {
         const NL: usize = DEPTH as usize + 1;
-        let first_split = (1..nv)
+        // Counted over blocks with a plain loop each (integer sums, so in any order).
+        let first_split = (0..nv.div_ceil(PAR_MIN))
             .into_par_iter()
-            .with_min_len(PAR_MIN)
-            .fold(
-                || [0usize; NL],
-                |mut h, r| {
+            .map(|b| {
+                let mut h = [0usize; NL];
+                for r in (b * PAR_MIN).max(1)..((b + 1) * PAR_MIN).min(nv) {
                     let x = code(r) ^ code(r - 1);
                     if x != 0 {
                         h[((3 * DEPTH - 1 - (31 - x.leading_zeros())) / 3) as usize] += 1;
                     }
-                    h
-                },
-            )
+                }
+                h
+            })
             .reduce(
                 || [0usize; NL],
                 |mut a, b| {
