@@ -161,6 +161,9 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 | Parts: per-node part labels to skip subtrees in visibility rays | 1.037 × (car 1.054, watch 1.062, dragon 0.983) | — |
 | BVH build: interleaved bounds, centroid and triangle per item | 1.023 ×, 1.008 × on a rerun | — |
 | BVH build: the two part builds joined | No dragon gain beyond building each BVH in parallel | — |
+| Default reducer: the parallel reservation commit at 4 threads (`PAR_COMMIT_THREADS` 8 → 4, and → 2) | 6–8% slower on a 4-thread runner (watch 404 against 371 ms, car 726 against 686, dragon 425 against 401). The parallel commit's overhead is more than the serial commit at this core count | Runners with 8 or more threads (the current threshold) |
+| Default reducer: a stale candidate whose geometric bound alone is over the round's limit skips its attribute and spill terms (output identical) | 1.005 × the time. The bound cuts few stale re-evaluations, and the extra compare costs the rest | — |
+| Default reducer: fewer clusters, or clusters balanced over threads (7 car and 5 dragon clusters on 4 threads) | Not built: the cluster count and split set the output | A change that is allowed to change output |
 
 ## Voxel proxies
 

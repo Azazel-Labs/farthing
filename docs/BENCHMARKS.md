@@ -1656,6 +1656,35 @@ into flat sheets, and the sheets differ from seed to seed. Still behind: Corset,
 Fox at 10% (0.61, 0.15, 0.11 dB), the watch and helmet at 3% (0.29, 0.26), the watch at 5%
 (0.36), and the watch, dragon and Duck at 2%.
 
+### The default reducer: five changes, 84% of the time (v24)
+
+Output is byte-identical (default and fast reducers on all 11 assets at 10% and 3%, and the
+flattened car and dragon at 10,000 and 3,000 triangles at 1, 4 and the default thread count).
+`best=10000` in the Bench workflow (watch, car and dragon flattened), 12 rounds, same run
+against the previous main:
+
+| runner | watch | car | dragon | sum |
+|---|---|---|---|---|
+| Linux | 355.9 → 312.7 ms (0.878) | 669.4 → 558.7 (0.835) | 408.2 → 333.5 (0.817) | 0.840 |
+| Windows | 470.8 → 402.6 (0.855) | 884.0 → 742.0 (0.839) | 525.9 → 437.2 (0.831) | 0.841 |
+
+Each change, timed against the one before (head / base; an A/A run measures 1.002):
+
+| change | watch | car | dragon | sum |
+|---|---|---|---|---|
+| Cluster split: triangle and position sort keys worked out once, sorted on all threads | 1.023 | 0.919 | 0.892 | 0.937 |
+| A wedge weighed against several of q's evaluates its own quadric terms once | 0.968 | 0.992 | 0.935 | 0.970 |
+| Tiling-chart and position-id sorts with precomputed keys, on all threads | 0.973 | 0.995 | 0.998 | 0.990 |
+| A changed neighbor's re-rank skipped when its geometric bound alone reaches its old cost | 0.902 | 0.976 | 0.984 | 0.958 |
+| UV spill pricing reads a fan's UVs once and orders it with bitmasks | 0.986 | 0.976 | 0.967 | 0.976 |
+
+Windows gains the same as Linux, so allocation is not where the default reducer's time goes
+(on Linux, page faults and libc together are about 1.4%). Profiles after, on the watch: the
+wedge map 20%, UV spill pricing about 14%, candidate search 9.4%, the attribute cost 7.3%,
+visibility rays 4.8%; on the car, visibility rays rise to 8%. No single line is over 1.5%.
+The cluster phase is unbalanced (7 car and 5 dragon clusters on 4 threads), but the cluster
+split sets the output, so balancing it is a change in output, not in speed.
+
 ### v14: the dragon's error is in the reduction
 
 v12 left the dragon at 1.39% Hausdorff against baby_shark's 0.87%, and adaptive (octree)
