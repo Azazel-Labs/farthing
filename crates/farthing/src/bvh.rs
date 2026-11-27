@@ -80,11 +80,13 @@ impl Bvh {
             .with_min_len(4096)
             .map(|t| Aabb::from_points(t.iter()))
             .collect();
+        let axis = |a: usize| centroids.iter().map(|c| c[a]).collect::<Vec<f32>>();
         let ctx = Build {
             centroids: &centroids,
+            axes: [&axis(0), &axis(1), &axis(2)],
             bounds: &tri_bounds,
         };
-        let nodes = ctx.subtree(&mut order, 0);
+        let nodes = ctx.subtree(&mut order, 0, None);
         Bvh {
             nodes,
             order,
@@ -459,23 +461,38 @@ pub fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, Vec3) {
 /// Inputs shared by every part of a build.
 struct Build<'a> {
     centroids: &'a [Vec3],
+    /// The centroids' x, y and z apart, for binning along one axis.
+    axes: [&'a [f32]; 3],
     bounds: &'a [Aabb],
 }
+
+/// Bounds of a node's triangles and of their centroids, when its parent's bins already gave
+/// them (min and max are exact, so they equal what the node would gather itself).
+type Known = Option<(Aabb, Aabb)>;
 
 /// Below this many triangles a subtree is built on one thread.
 const PAR_BUILD: usize = 8192;
 
 impl Build<'_> {
     /// Bounds of `order` and, unless it should stay a leaf, the split: `order` is partitioned
-    /// so its first `mid` triangles go left.
-    fn split(&self, order: &mut [u32]) -> (Aabb, Option<usize>) {
+    /// so its first `mid` triangles go left, with what is known of each side. `bins` is
+    /// scratch space.
+    fn split(
+        &self,
+        order: &mut [u32],
+        known: Known,
+        bins: &mut Vec<u8>,
+    ) -> (Aabb, Option<(usize, Known, Known)>) {
         let count = order.len();
-        let mut bounds = Aabb::EMPTY;
-        let mut cb = Aabb::EMPTY;
-        for &t in order.iter() {
-            bounds = bounds.union(&self.bounds[t as usize]);
-            cb.extend(self.centroids[t as usize]);
-        }
+        let (bounds, cb) = known.unwrap_or_else(|| {
+            let mut bounds = Aabb::EMPTY;
+            let mut cb = Aabb::EMPTY;
+            for &t in order.iter() {
+                bounds = bounds.union(&self.bounds[t as usize]);
+                cb.extend(self.centroids[t as usize]);
+            }
+            (bounds, cb)
+        });
         if count <= LEAF_SIZE {
             return (bounds, None);
         }
@@ -486,13 +503,18 @@ impl Build<'_> {
         }
         // Bin triangles by centroid.
         let scale = BINS as f32 / (hi - lo);
-        let bin_of = |c: Vec3| (((c[axis] - lo) * scale) as usize).min(BINS - 1);
+        let along = self.axes[axis];
+        let bin_of = |t: u32| (((along[t as usize] - lo) * scale) as usize).min(BINS - 1);
         let mut bin_bounds = [Aabb::EMPTY; BINS];
+        let mut bin_cb = [Aabb::EMPTY; BINS];
         let mut bin_count = [0usize; BINS];
+        bins.clear();
         for &t in order.iter() {
-            let b = bin_of(self.centroids[t as usize]);
+            let b = bin_of(t);
+            bins.push(b as u8);
             bin_count[b] += 1;
             bin_bounds[b] = bin_bounds[b].union(&self.bounds[t as usize]);
+            bin_cb[b].extend(self.centroids[t as usize]);
         }
         // Sweep for the cheapest split plane.
         let mut left_area = [0.0f32; BINS];
@@ -531,36 +553,51 @@ impl Build<'_> {
         // Partition in place.
         let mut mid = 0;
         for i in 0..count {
-            if bin_of(self.centroids[order[i] as usize]) < best_split {
+            if (bins[i] as usize) < best_split {
                 order.swap(i, mid);
+                bins.swap(i, mid);
                 mid += 1;
             }
         }
         if mid == 0 || mid == count {
-            mid = count / 2; // degenerate split: fall back to median by index
+            // Degenerate split: fall back to median by index.
+            return (bounds, Some((count / 2, None, None)));
         }
-        (bounds, Some(mid))
+        let side = |r: std::ops::Range<usize>| {
+            let (mut b, mut c) = (Aabb::EMPTY, Aabb::EMPTY);
+            for i in r {
+                b = b.union(&bin_bounds[i]);
+                c = c.union(&bin_cb[i]);
+            }
+            Some((b, c))
+        };
+        (
+            bounds,
+            Some((mid, side(0..best_split), side(best_split..BINS))),
+        )
     }
 
     /// Nodes of the subtree over `order` (which starts at `base` in the full order), root
     /// first. Large subtrees build their halves in parallel; the tree is the same for any
     /// thread count.
-    fn subtree(&self, order: &mut [u32], base: u32) -> Vec<Node> {
+    fn subtree(&self, order: &mut [u32], base: u32, known: Known) -> Vec<Node> {
         if order.len() < PAR_BUILD {
-            return self.subtree_serial(order, base);
+            return self.subtree_serial(order, base, known);
         }
-        let (bounds, split) = self.split(order);
+        let (bounds, split) = self.split(order, known, &mut Vec::new());
         let leaf = Node {
             min: bounds.min,
             max: bounds.max,
             first: base,
             count: order.len() as u32,
         };
-        let Some(mid) = split else { return vec![leaf] };
+        let Some((mid, kl, kr)) = split else {
+            return vec![leaf];
+        };
         let (lo, hi) = order.split_at_mut(mid);
         let (l, r) = rayon::join(
-            || self.subtree(lo, base),
-            || self.subtree(hi, base + mid as u32),
+            || self.subtree(lo, base, kl),
+            || self.subtree(hi, base + mid as u32, kr),
         );
         // Layout: root, both children, then the left and the right descendants.
         let nl = l.len() as u32;
@@ -589,7 +626,7 @@ impl Build<'_> {
         out
     }
 
-    fn subtree_serial(&self, order: &mut [u32], base: u32) -> Vec<Node> {
+    fn subtree_serial(&self, order: &mut [u32], base: u32, known: Known) -> Vec<Node> {
         let mut nodes = Vec::with_capacity(2 * order.len() / LEAF_SIZE + 1);
         nodes.push(Node {
             min: Vec3::ZERO,
@@ -597,13 +634,14 @@ impl Build<'_> {
             first: 0,
             count: order.len() as u32,
         });
-        let mut stack = vec![0usize];
-        while let Some(ni) = stack.pop() {
+        let mut stack = vec![(0usize, known)];
+        let mut bins = Vec::new();
+        while let Some((ni, known)) = stack.pop() {
             let (first, count) = (nodes[ni].first as usize, nodes[ni].count as usize);
-            let (bounds, split) = self.split(&mut order[first..first + count]);
+            let (bounds, split) = self.split(&mut order[first..first + count], known, &mut bins);
             nodes[ni].min = bounds.min;
             nodes[ni].max = bounds.max;
-            let Some(mid) = split else { continue };
+            let Some((mid, kl, kr)) = split else { continue };
             let left = nodes.len();
             nodes.push(Node {
                 min: Vec3::ZERO,
@@ -619,8 +657,8 @@ impl Build<'_> {
             });
             nodes[ni].first = left as u32;
             nodes[ni].count = 0;
-            stack.push(left);
-            stack.push(left + 1);
+            stack.push((left, kl));
+            stack.push((left + 1, kr));
         }
         // Leaves index the full order.
         for n in &mut nodes {
