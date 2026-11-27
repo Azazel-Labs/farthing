@@ -33,13 +33,16 @@ on:
       perf_env:
         description: "Environment for the profiled run, such as 'RT_TARGET=20000 RAYON_NUM_THREADS=1'"
         default: "RT_RUNS=40"
+      fast:
+        description: "Time fast mode instead: triangle target, such as 10000 (base and head take turns)"
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
   realtime:
-    if: inputs.perf == '' && inputs.run == ''
+    if: inputs.perf == '' && inputs.run == '' && inputs.fast == ''
     runs-on: ${{ inputs.os }}
     steps:
       - uses: actions/checkout@v7
@@ -163,3 +166,67 @@ jobs:
             env $e bench-compare/target/release/bench-compare$ext $RUN_ARGS 2>&1 | grep -v '^  '
           done | tee -a "$GITHUB_STEP_SUMMARY"
 
+
+  # Fast mode A/B: base and head take turns reducing each asset (flattened) to the target;
+  # minimum per asset over all rounds of RT_RUNS calls.
+  fast:
+    if: inputs.fast != ''
+    runs-on: ${{ inputs.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.head || github.ref }}
+          path: head
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.base }}
+          path: base
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        id: assets
+        with:
+          path: assets
+          key: bench-assets-8f492390
+      - name: Fetch assets
+        if: steps.assets.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          mkdir -p assets
+          for n in ChronographWatch CarConcept DragonAttenuation; do
+            curl -fsSL -o assets/$n.glb               https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Assets/8f492390ddc7a2ae221a1369ef560589cf8c70fb/Models/$n/glTF-Binary/$n.glb
+          done
+      - name: Build
+        shell: bash
+        run: |
+          (cd base/bench-compare && cargo build --release --locked)
+          (cd head/bench-compare && cargo build --release --locked)
+      - name: Time
+        shell: bash
+        env:
+          ROUNDS: ${{ inputs.rounds }}
+          TARGET: ${{ inputs.fast }}
+        run: |
+          ext=""; [ "$RUNNER_OS" = Windows ] && ext=.exe
+          py=python3; [ "$RUNNER_OS" = Windows ] && py=python
+          echo "base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD), $(nproc 2>/dev/null) cores" >> "$GITHUB_STEP_SUMMARY"
+          $py - "$ext" <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, subprocess, sys
+          ext = sys.argv[1]
+          builds = {b: f"{b}/bench-compare/target/release/bench-compare{ext}" for b in ("base", "head")}
+          assets = ["ChronographWatch", "CarConcept", "DragonAttenuation"]
+          env = dict(os.environ, RD_METHODS="farthing_fast", RT_TARGET=os.environ["TARGET"], RT_RUNS="5")
+          best = {(b, a): 1e18 for b in builds for a in assets}
+          for r in range(int(os.environ["ROUNDS"])):
+              for b, exe in builds.items():
+                  out = subprocess.run([exe, "realtime"] + [f"assets/{a}.glb" for a in assets],
+                                       env=env, capture_output=True, text=True).stdout
+                  for line in out.splitlines():
+                      f = line.split()
+                      if len(f) > 3 and f[0] in assets and f[2:4] == ["farthing", "fast"]:
+                          best[(b, f[0])] = min(best[(b, f[0])], float(f[-2]))
+          print("| asset | base ms | head ms | head/base |")
+          print("|---|---|---|---|")
+          for a in assets + ["sum"]:
+              v = [sum(best[(b, x)] for x in assets) if a == "sum" else best[(b, a)] for b in builds]
+              print(f"| {a} | {v[0]:.1f} | {v[1]:.1f} | {v[1] / v[0]:.3f} |")
+          PY

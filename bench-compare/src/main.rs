@@ -1032,12 +1032,29 @@ fn rtexport_mode(args: &[String]) {
         std::path::Path::new(&args[2]),
     );
     std::fs::create_dir_all(out).unwrap();
-    let (scene, materials) = farthing::io::load_gltf(path).expect("load");
+    let (mut scene, materials) = farthing::io::load_gltf(path).expect("load");
     let name = std::path::Path::new(path)
         .file_stem()
         .unwrap()
         .to_string_lossy()
         .to_string();
+    // ONLY_MESH=<i,j,..>: every other mesh emptied, and the unreduced result written as
+    // `<name>_only.glb` (a reference whose views frame just those meshes).
+    if let Ok(v) = std::env::var("ONLY_MESH") {
+        let keep: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+        for (i, m) in scene.meshes.iter_mut().enumerate() {
+            if !keep.contains(&i) {
+                m.indices.clear();
+                m.material_ids.clear();
+            }
+        }
+        farthing::io::save_glb(
+            &scene,
+            out.join(format!("{name}_only.glb")),
+            &farthing::io::ExportTextures::default(),
+        )
+        .unwrap();
+    }
     let input = scene.triangle_count();
     let total = if amount <= 1.0 {
         (input as f64 * amount).round() as usize
@@ -1101,6 +1118,9 @@ fn rtexport_mode(args: &[String]) {
         // Specular error over the scene: each mesh weighed by its area and highlight weight.
         let mut spec = [0f64; 4];
         for (i, m) in scene.meshes.iter().enumerate() {
+            if m.triangle_count() == 0 {
+                continue;
+            }
             let mut m = m.clone();
             if m.normals.is_none() {
                 m.compute_normals(60.0);

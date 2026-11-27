@@ -2,8 +2,10 @@
 //! on one thread.
 //!
 //! Garland–Heckbert plane quadrics in f32 over positions normalized to the unit bounding
-//! box, plus a cheap attribute term: the area-weighted squared distance between each of p's
-//! wedges and the q wedge it maps to (normals, UVs, colors). Each pass rebuilds a flat
+//! box (face planes, border planes, and planes along sharp creases beside narrow faces), plus
+//! a cheap attribute term: per wedge of p, its area × the squared distance between the q
+//! wedge it maps to and its own attributes carried along their surface gradient (normals,
+//! UVs, colors; see `St::wcost`). Each pass rebuilds a flat
 //! position→triangle index, costs every edge in its cheaper allowed direction, sorts the
 //! candidates once, and collapses them in cost order, at most one collapse per neighborhood
 //! per pass, up to a cost limit. There is no candidate heap and no incremental re-ranking:
@@ -100,7 +102,6 @@ impl Q {
     }
 }
 
-/// Attribute scale relative to the default option weights (tuned on the benchmark corpus).
 /// Attribute term scales relative to the default option weights, tuned on the benchmark
 /// corpus (8 assets × 4 ratios): positions are in the unit-diagonal frame, so attribute
 /// differences must be scaled far down to stay comparable to squared distances.
@@ -115,6 +116,19 @@ const COLOR_SCALE: f32 = 1e-3;
 const CARRY_SLIDE: f32 = 16.0;
 /// Squared UV distance (unscaled) under which two wedges of a vertex are on the same island.
 const SAME_UV2: f32 = 1e-10;
+/// Weight of the constraint planes along sharp creases beside narrow faces, relative to the
+/// edge length² × (1 − cos dihedral) / 2. A thin panel (a windshield, a body panel with a
+/// folded rim) has its outline on such a crease: the faces across are a narrow strip whose
+/// planes barely price a vertex sliding inward in the panel's plane, so without these the
+/// outline sank in and the panel's edge showed a gap. Gentle creases get none (the corpus's
+/// smooth assets lose up to 1 dB when strips of a cylinder or bevel are pinned), nor do
+/// creases between wide faces, whose own planes already hold the edge.
+const CREASE_WEIGHT: f32 = 2.0;
+/// Crease value, (1 − cos dihedral) / 2, above which a crease is sharp: 30°.
+const CREASE_SHARP: f32 = 0.067;
+/// A face is narrow across an edge when its area is under this × the edge's length² (a right
+/// isosceles triangle across its hypotenuse is 0.25, an equilateral one 0.43).
+const CREASE_NARROW: f32 = 0.3;
 /// Pass size: candidates up to `PASS_LIMIT` × the cost of the m-th cheapest, m = what is still
 /// needed but at most `PASS_SHARE` of all edges.
 const PASS_SHARE: f32 = 0.5;
@@ -174,16 +188,23 @@ pub(crate) fn simplify_fast(
         }
         twin
     };
-    let mut edges: Vec<u64> = Vec::with_capacity(nt * 3);
+    let mut edges: Vec<(u64, u32)> = Vec::with_capacity(nt * 3);
     for (t, p) in tp.iter().enumerate() {
         if alive[t] && !twin[t] {
             for i in 0..3 {
                 let (a, b) = (p[i].min(p[(i + 1) % 3]), p[i].max(p[(i + 1) % 3]));
-                edges.push(((a as u64) << 32) | b as u64);
+                edges.push((((a as u64) << 32) | b as u64, (t * 3 + i) as u32));
             }
         }
     }
     edges.sort_unstable();
+    let mut quad = vec![Q::default(); np];
+    let face = |t: usize| {
+        let p = tp[t];
+        let (a, b, c) = (pos[p[0] as usize], pos[p[1] as usize], pos[p[2] as usize]);
+        let n = (b - a).cross(c - a);
+        (n.normalize_or_zero(), n.length() * 0.5)
+    };
     let mut locked = vec![false; np];
     let mut border_deg = vec![0u8; np];
     let mut border_edges: Vec<u64> = Vec::new();
@@ -193,21 +214,42 @@ pub(crate) fn simplify_fast(
     let mut k = 0;
     while k < edges.len() {
         let mut j = k + 1;
-        while j < edges.len() && edges[j] == edges[k] {
+        while j < edges.len() && edges[j].0 == edges[k].0 {
             j += 1;
         }
-        let (a, b) = ((edges[k] >> 32) as usize, edges[k] as u32 as usize);
+        let key = edges[k].0;
+        let (a, b) = ((key >> 32) as usize, key as u32 as usize);
         match j - k {
             1 => {
                 border_deg[a] = border_deg[a].saturating_add(1);
                 border_deg[b] = border_deg[b].saturating_add(1);
-                border_edges.push(edges[k]);
+                border_edges.push(key);
             }
-            2 => {}
+            2 => {
+                // A sharp crease beside a narrow face: plane through the edge, perpendicular
+                // to the face, as on an open border (see CREASE_WEIGHT).
+                let (t0, t1) = (edges[k].1 as usize / 3, edges[k + 1].1 as usize / 3);
+                let (n0, a0) = face(t0);
+                let (n1, a1) = face(t1);
+                let crease = (1.0 - n0.dot(n1).clamp(-1.0, 1.0)) * 0.5;
+                if crease > CREASE_SHARP && a0 > 0.0 && a1 > 0.0 {
+                    let (x0, x1) = (pos[a], pos[b]);
+                    let dir = x1 - x0;
+                    let len2 = dir.length_squared();
+                    for (nn, across) in [(n0, a1), (n1, a0)] {
+                        let bn = dir.cross(nn).normalize_or_zero();
+                        if across < CREASE_NARROW * len2 && bn != Vec3::ZERO {
+                            let cq = Q::plane(bn, -bn.dot(x0), len2 * CREASE_WEIGHT * crease);
+                            quad[a].add(&cq);
+                            quad[b].add(&cq);
+                        }
+                    }
+                }
+            }
             _ => {
                 jdeg[a] = jdeg[a].saturating_add(1);
                 jdeg[b] = jdeg[b].saturating_add(1);
-                junction_edges.push(edges[k]);
+                junction_edges.push(key);
             }
         }
         k = j;
@@ -231,7 +273,6 @@ pub(crate) fn simplify_fast(
     let is_border_edge = |a: u32, b: u32| border_edges.contains(&ekey(a, b));
 
     // Quadrics: area-weighted face planes plus border constraint planes.
-    let mut quad = vec![Q::default(); np];
     let mut total_area = 0.0f32;
     let mut warea = vec![0.0f32; nv];
     for t in 0..nt {
@@ -320,6 +361,56 @@ pub(crate) fn simplify_fast(
         0
     };
     let uv_dims = if uw > 0.0 { 2 * mesh.uvs.len() } else { 0 };
+    // Per wedge and attribute dim, the attribute's gradient over the surface: the
+    // area-weighted mean of the gradients over the wedge's faces (see `St::wcost`).
+    let grad = {
+        let mut grad = vec![0f32; nv * dim * 3];
+        let mut gw = vec![0f32; nv];
+        for t in 0..nt {
+            if !alive[t] {
+                continue;
+            }
+            let p = tp[t];
+            let x = p.map(|v| pos[v as usize]);
+            let n = (x[1] - x[0]).cross(x[2] - x[0]);
+            let a2 = n.length_squared();
+            if a2 <= 0.0 {
+                continue;
+            }
+            // Gradients of the barycentric basis: n × (opposite edge) / |n|².
+            let gphi = [
+                n.cross(x[2] - x[1]) / a2,
+                n.cross(x[0] - x[2]) / a2,
+                n.cross(x[1] - x[0]) / a2,
+            ];
+            let area = a2.sqrt() * 0.5;
+            let w = tris[t];
+            for k in 0..dim {
+                let g = gphi[0] * attr[w[0] as usize * dim + k]
+                    + gphi[1] * attr[w[1] as usize * dim + k]
+                    + gphi[2] * attr[w[2] as usize * dim + k];
+                let g = g * area;
+                for &c in &w {
+                    let o = (c as usize * dim + k) * 3;
+                    grad[o] += g.x;
+                    grad[o + 1] += g.y;
+                    grad[o + 2] += g.z;
+                }
+            }
+            for &c in &w {
+                gw[c as usize] += area;
+            }
+        }
+        for v in 0..nv {
+            if gw[v] > 0.0 {
+                let s = 1.0 / gw[v];
+                for g in &mut grad[v * dim * 3..(v + 1) * dim * 3] {
+                    *g *= s;
+                }
+            }
+        }
+        grad
+    };
     let mut st = St {
         uvs: nd..nd + uv_dims,
         same_uv2: SAME_UV2 * uw * uw,
@@ -331,8 +422,8 @@ pub(crate) fn simplify_fast(
         quad,
         warea,
         attr,
+        grad,
         dim,
-        nd,
         avg_area,
         locked,
         border_deg,
@@ -629,9 +720,9 @@ struct St {
     /// Surface area each wedge stands for (grows as wedges merge).
     warea: Vec<f32>,
     attr: Vec<f32>,
+    /// Per wedge, per attribute dim, its surface gradient (empty when unused).
+    grad: Vec<f32>,
     dim: usize,
-    /// The first `nd` attribute dims are the normal.
-    nd: usize,
     /// The attribute dims that hold the UV sets.
     uvs: std::ops::Range<usize>,
     /// [`SAME_UV2`] in the scaled units of `attr`.
@@ -720,24 +811,35 @@ impl St {
         !self.locked[p as usize] && (self.border_deg[p as usize] == 0 || self.is_border_edge(p, q))
     }
 
-    /// Squared attribute distance between wedges a and b (pre-scaled channels).
-    fn adist(&self, a: u32, b: u32) -> f32 {
+    /// Move from p to q.
+    #[inline]
+    fn dx(&self, p: u32, q: u32) -> Vec3 {
+        self.pos[q as usize] - self.pos[p as usize]
+    }
+
+    /// Attribute cost of wedge a, of p, taking wedge b's attributes when p moves `dx` onto q:
+    /// a's area × the squared difference between b's attributes and a's carried along its
+    /// surface gradient (pre-scaled channels). Where the attributes change linearly over the
+    /// surface (UVs inside an island, normals on an evenly curved panel) that is near zero
+    /// however far p moves; what remains is what the larger triangles cannot interpolate: a
+    /// seam, a fold, a rim whose normal leans away from the faces beside it.
+    fn wcost(&self, a: u32, b: u32, dx: Vec3) -> f32 {
         if self.dim == 0 || a == b {
             return 0.0;
         }
         let d = self.dim;
+        let (a, b) = (a as usize, b as usize);
         let (x, y) = (
-            &self.attr[a as usize * d..(a as usize + 1) * d],
-            &self.attr[b as usize * d..(b as usize + 1) * d],
+            &self.attr[a * d..(a + 1) * d],
+            &self.attr[b * d..(b + 1) * d],
         );
-        let sq = |r: std::ops::Range<usize>| -> f32 {
-            x[r.clone()]
-                .iter()
-                .zip(&y[r])
-                .map(|(p, q)| (p - q) * (p - q))
-                .sum()
-        };
-        sq(0..self.nd) + sq(self.nd..d)
+        let g = &self.grad[a * d * 3..(a + 1) * d * 3];
+        let mut e2 = 0.0;
+        for k in 0..d {
+            let e = y[k] - x[k] - (g[3 * k] * dx.x + g[3 * k + 1] * dx.y + g[3 * k + 2] * dx.z);
+            e2 += e * e;
+        }
+        self.warea[a] * e2
     }
 
     /// Wedge map p→q: wedges of p in triangles shared with q map to q's wedge there; the others
@@ -745,6 +847,7 @@ impl St {
     /// the attribute cost (None if p and q share no triangle).
     fn wedge_map(&self, p: u32, q: u32, out: &mut Vec<(u32, u32)>) -> Option<f32> {
         out.clear();
+        let dx = self.dx(p, q);
         let (s, e) = (
             self.start[p as usize] as usize,
             self.start[p as usize + 1] as usize,
@@ -771,10 +874,7 @@ impl St {
         if out.is_empty() {
             return None;
         }
-        let mut cost: f32 = out
-            .iter()
-            .map(|&(pw, qw)| self.warea[pw as usize] * self.adist(pw, qw))
-            .sum();
+        let mut cost: f32 = out.iter().map(|&(pw, qw)| self.wcost(pw, qw, dx)).sum();
         if !single {
             let joined = out.len();
             for k in s..e {
@@ -785,7 +885,7 @@ impl St {
                 if out.iter().any(|&(a, _)| a == pw) {
                     continue;
                 }
-                let (c, to) = self.unshared(pw, &out[..joined]);
+                let (c, to) = self.unshared(pw, &out[..joined], dx);
                 cost += c;
                 out.push((pw, to));
             }
@@ -799,12 +899,12 @@ impl St {
     /// a normal or a color) and takes the nearest q wedge of that island. Otherwise the
     /// collapse leaves its seam behind: it is carried (becomes itself, see the module docs)
     /// at the cost of its texture sliding, or, where it cannot be, takes the nearest q wedge.
-    fn unshared(&self, pw: u32, joined: &[(u32, u32)]) -> (f32, u32) {
+    fn unshared(&self, pw: u32, joined: &[(u32, u32)], dx: Vec3) -> (f32, u32) {
         let mut on = (f32::INFINITY, u32::MAX);
         let mut off = (f32::INFINITY, u32::MAX);
         let mut slide = 0.0f32;
         for &(sw, qw) in joined {
-            let d = self.adist(pw, qw);
+            let d = self.wcost(pw, qw, dx);
             let best = if self.uv_dist(pw, sw) <= self.same_uv2 {
                 &mut on
             } else {
@@ -817,11 +917,11 @@ impl St {
         }
         let w = self.warea[pw as usize];
         if on.1 != u32::MAX {
-            (w * on.0, on.1)
+            on
         } else if self.carry {
             (w * CARRY_SLIDE * slide, pw)
         } else {
-            (w * off.0, off.1)
+            off
         }
     }
 
@@ -867,7 +967,7 @@ impl St {
             if !self.alive[self.list[k] as usize] {
                 continue;
             }
-            return Some(self.warea[pw as usize] * self.adist(pw, qw) / self.avg_area);
+            return Some(self.wcost(pw, qw, self.dx(p, q)) / self.avg_area);
         }
         None
     }
@@ -876,6 +976,7 @@ impl St {
     /// too many wedges for the fixed arrays (the caller falls back to the general map).
     fn attr_cost_seam(&self, p: u32, q: u32) -> Option<f32> {
         const N: usize = 8;
+        let dx = self.dx(p, q);
         let mut pws = [0u32; N];
         let mut np = 0;
         let mut maps = [(0u32, 0u32); N];
@@ -917,8 +1018,8 @@ impl St {
         let mut cost = 0.0;
         for &pw in &pws[..np] {
             cost += match maps[..nm].iter().find(|m| m.0 == pw) {
-                Some(&(_, qw)) => self.warea[pw as usize] * self.adist(pw, qw),
-                None => self.unshared(pw, &maps[..nm]).0,
+                Some(&(_, qw)) => self.wcost(pw, qw, dx),
+                None => self.unshared(pw, &maps[..nm], dx).0,
             };
         }
         Some(cost / self.avg_area)
