@@ -277,8 +277,10 @@ pub struct SimplifyResult {
     /// For each output vertex, the input vertex it is an exact copy of (half-edge collapse),
     /// so callers can carry custom per-vertex attributes across. In realtime mode the copy's
     /// position may be moved along the normal and its normal is a mean over merged vertices.
-    /// In fast mode, with UVs weighted and no `locked_vertices`, a vertex carried across a UV
-    /// seam keeps its attributes but stands at the position of the vertex it moved onto.
+    /// A vertex carried across a UV seam keeps its attributes but stands at the position (with
+    /// the skin weights and morph position deltas) of the vertex it moved onto: in the default
+    /// mode wherever a seam wedge has no partner on the vertex it collapses onto, locked
+    /// vertices or not; in fast mode only with UVs weighted and no `locked_vertices`.
     pub source_vertex: Vec<u32>,
 }
 
@@ -3864,6 +3866,39 @@ fn spread10(v: u32) -> u64 {
     (x | (x << 2)) & 0x0924_9249
 }
 
+/// What a wedge takes from the position it slides onto: the position, skin weights and morph
+/// position deltas.
+struct SlidVertex {
+    position: glam::Vec3,
+    skin: Option<([u16; 4], [f32; 4])>,
+    morph: Vec<glam::Vec3>,
+}
+
+impl SlidVertex {
+    fn read(m: &Mesh, v: usize) -> SlidVertex {
+        SlidVertex {
+            position: m.positions[v],
+            skin: m.skin.as_ref().map(|s| (s.joints[v], s.weights[v])),
+            morph: m
+                .morph_targets
+                .iter()
+                .map(|t| t.position_deltas[v])
+                .collect(),
+        }
+    }
+
+    fn write(&self, m: &mut Mesh, v: usize) {
+        m.positions[v] = self.position;
+        if let (Some(s), Some((j, w))) = (&mut m.skin, self.skin) {
+            s.joints[v] = j;
+            s.weights[v] = w;
+        }
+        for (t, &d) in m.morph_targets.iter_mut().zip(&self.morph) {
+            t.position_deltas[v] = d;
+        }
+    }
+}
+
 /// Cluster-parallel reduction (see [`SimplifyOptions::cluster_threshold`]).
 fn simplify_clustered(
     mesh: &Mesh,
@@ -3925,6 +3960,7 @@ fn simplify_clustered(
         usize,
         Vec<(u32, u32)>,
         Vec<(u32, f32)>,
+        Vec<(u32, SlidVertex)>,
     );
     let parts: Vec<Result<Part>> = (0..k)
         .into_par_iter()
@@ -3999,6 +4035,17 @@ fn simplify_clustered(
                 .iter()
                 .map(|&i| verts[r.source_vertex[i as usize] as usize])
                 .collect();
+            // Wedges that slid onto another position (see `State::slid`): the output names
+            // them by their input vertex, which must stand where they slid to.
+            let slid = (0..r.mesh.vertex_count())
+                .filter(|&i| r.mesh.positions[i] != sub.positions[r.source_vertex[i] as usize])
+                .map(|i| {
+                    (
+                        verts[r.source_vertex[i] as usize],
+                        SlidVertex::read(&r.mesh, i),
+                    )
+                })
+                .collect();
             // Vertices only used by degenerate triangles have no target: keep them pointing at
             // themselves (they are dropped by the final compaction).
             let remap = (0..verts.len())
@@ -4015,6 +4062,7 @@ fn simplify_clustered(
                 r.collapses,
                 remap,
                 used,
+                slid,
             ))
         })
         .collect();
@@ -4026,7 +4074,13 @@ fn simplify_clustered(
     let (mut err, mut collapses) = (0.0f32, 0usize);
     let mut prior_geom2 = 0.0f64;
     for part in parts {
-        let (idx, mats, e, rel, n, remap, used) = part?;
+        let (idx, mats, e, rel, n, remap, used, slid) = part?;
+        // A slid wedge belongs to its cluster alone (a position in two clusters is locked in
+        // both, and only a wedge of a collapsed position slides). Left at its input position,
+        // its triangles would no longer meet their neighbors.
+        for (v, x) in slid {
+            x.write(&mut merged, v as usize);
+        }
         prior_geom2 = prior_geom2.max((rel as f64).powi(2));
         // A vertex on a cluster border is in several clusters: the most drift counts.
         for (v, d) in used {
@@ -4253,11 +4307,23 @@ fn simplify_frame(
     out.indices = out_indices;
     out.material_ids = out_mats;
     let remap = out.compact();
+    // Slid wedges stand where they slid to, with what belongs to that position (skin
+    // weights, morph position deltas); their other attributes are their own.
     for &v in &st.slid {
         let new = remap[v as usize];
         if new != u32::MAX {
-            let src = st.pos_src[st.vpos[v as usize] as usize];
-            out.positions[new as usize] = mesh.positions[src as usize];
+            let (new, src) = (
+                new as usize,
+                st.pos_src[st.vpos[v as usize] as usize] as usize,
+            );
+            out.positions[new] = mesh.positions[src];
+            if let (Some(skin), Some(from)) = (&mut out.skin, &mesh.skin) {
+                skin.joints[new] = from.joints[src];
+                skin.weights[new] = from.weights[src];
+            }
+            for (target, from) in out.morph_targets.iter_mut().zip(&mesh.morph_targets) {
+                target.position_deltas[new] = from.position_deltas[src];
+            }
         }
     }
     let resolve_pos = |mut p: u32| {
@@ -4665,6 +4731,43 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn cluster_parallel_reduction_keeps_slid_wedges_attached() {
+        // A closed sphere in UV islands, large enough to be reduced cluster-parallel. Wedges
+        // that slide off their position inside a cluster must reach the final pass where they
+        // slid to: left at their input position, their triangles open holes in the surface.
+        let m = with_islands(
+            &uv_sphere(264, 128),
+            |c| u32::from(c.x > 0.3) + 2 * u32::from(c.y > -0.2) + 4 * u32::from(c.z > 0.1),
+            |p| Vec2::new(p.x + p.z, p.y + p.z) * 0.25 + 0.5,
+        );
+        assert!(m.triangle_count() >= 2 * CLUSTER_TRIS);
+        let r = simplify(
+            &m,
+            &SimplifyOptions {
+                target_triangles: Some(3000),
+                cluster_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        r.mesh.validate().unwrap();
+        assert!(r.mesh.triangle_count() <= 3000);
+        let key = |v: u32| r.mesh.positions[v as usize].to_array().map(f32::to_bits);
+        let mut edges = std::collections::HashMap::new();
+        for t in 0..r.mesh.triangle_count() {
+            let k = r.mesh.triangle(t).map(key);
+            for i in 0..3 {
+                let (a, b) = (k[i], k[(i + 1) % 3]);
+                *edges
+                    .entry(if a < b { (a, b) } else { (b, a) })
+                    .or_insert(0) += 1;
+            }
+        }
+        let open = edges.values().filter(|&&n| n == 1).count();
+        assert_eq!(open, 0, "{open} open edges");
     }
 
     #[test]
