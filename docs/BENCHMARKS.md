@@ -1383,6 +1383,24 @@ diagonal. Time on a hosted runner (same run, 3,000-triangle target on the merged
 16.55 to 16.99 ms, car 21.22 to 22.46, dragon 15.54 to 16.29: the border pass works out the
 flags per position run (+0.25 ms), the larger sums (+0.15 ms), and the car's tail (+0.35 ms).
 
+### Realtime: small meshes retried below 80% of target (v24)
+
+The car's wider crack at 3% came from two small seat meshes, not from the flange cut itself.
+With the cut their first pass landed at 76 to 81% of target (54 of 71 and 53 of 65
+triangles), just above the 0.75 retry threshold, so they kept the short count and lost the
+border samples their neighbors share; before the cut they landed at 51%, retried, and hit
+target. A mesh of at most 20,000 triangles is now retried below 80%. Output on every merged
+scene (all over 20,000) is unchanged, and the rendered PSNR moves 0.00 dB on all 11 assets.
+Output is identical at 1, 3 and 16 threads.
+
+| `rtcrack`, car | sealed | mean gap (% of diagonal) | p95 gap |
+|---|---|---|---|
+| 10% | 41.4% → 41.4% | 0.27 → 0.27 | 1.26 → 1.26 |
+| 3% | 17.4% → 21.5% | 1.197 → 0.873 | 4.77 → 3.30 |
+
+The watch does not change. Time per mesh on a hosted runner (3% of each mesh, 3 alternating
+rounds): car 33.8 → 34.1 ms (about 1%, the seats' second pass), watch and dragon unchanged.
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
