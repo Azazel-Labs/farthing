@@ -645,7 +645,9 @@ struct AttrLayout {
 }
 
 impl AttrLayout {
-    fn new(mesh: &Mesh, o: &SimplifyOptions) -> AttrLayout {
+    /// `tiles`: per vertex and UV set, the factor its UVs count at (see [`uv_tile_scales`]);
+    /// empty when every factor is 1.
+    fn new(mesh: &Mesh, o: &SimplifyOptions, tiles: &[f32]) -> AttrLayout {
         let mut dim = 0;
         let nw = (o.normal_weight.max(0.0)).sqrt() * 0.5;
         let uw = o.uv_weight.max(0.0).sqrt();
@@ -662,14 +664,16 @@ impl AttrLayout {
             dim += 4;
         }
         let n = mesh.vertex_count();
+        let sets = mesh.uvs.len();
         let mut values = Vec::with_capacity(n * dim);
         for v in 0..n {
             if let (Some(ns), true) = (&mesh.normals, nw > 0.0) {
                 values.extend((ns[v] * nw).to_array());
             }
             if uw > 0.0 {
-                for set in &mesh.uvs {
-                    values.extend((set[v] * uw).to_array());
+                for (s, set) in mesh.uvs.iter().enumerate() {
+                    let k = tiles.get(v * sets + s).copied().unwrap_or(1.0);
+                    values.extend((set[v] * (uw * k)).to_array());
                 }
             }
             if let (Some(cs), true) = (&mesh.colors, cw > 0.0) {
@@ -1154,6 +1158,141 @@ fn position_ids(mesh: &Mesh) -> Vec<u32> {
     id
 }
 
+/// A UV chart whose coordinates span more than this many texture widths (in u or v) repeats
+/// its texture: a tiling detail map, a tread, a weave. No atlas chart can.
+const TILE_SPAN: f32 = 1.1;
+
+/// Per vertex and UV set (index `vertex × sets + set`): the factor the vertex's UVs count at
+/// in the attribute error, 1 on atlas charts; empty when every factor is 1 (`diag` is the
+/// diagonal positions are measured in).
+///
+/// On a chart that repeats its texture, a UV error in texture widths overstates what shows
+/// by about the number of repeats across the surface: the pattern is the same in every
+/// repeat, and what moves on screen is the texture over the surface. Such a chart's UVs are
+/// scaled to surface units (over `diag`, the units of the geometric error), never up. Before,
+/// a chart repeating its weave six times over a watch band (or eighteen times over a floor
+/// mat) priced texture sliding over it like moving the surface many times as far, and kept
+/// interior vertices of the band at the cost of its outline.
+///
+/// Charts are vertices joined by triangles, and by sharing a position and UV (a hard edge
+/// inside a chart splits the vertices but not the chart).
+fn uv_tile_scales(mesh: &Mesh, diag: f64) -> Vec<f32> {
+    let n = mesh.vertex_count();
+    let sets = mesh.uvs.len();
+    let spans = |set: &[Vec2]| {
+        let (lo, hi) = set.iter().fold(
+            (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+            |(lo, hi), &u| (lo.min(u), hi.max(u)),
+        );
+        (hi - lo).max_element() > TILE_SPAN
+    };
+    // No chart spans more than its whole set.
+    if !mesh.uvs.iter().any(|set| spans(set)) {
+        return Vec::new();
+    }
+    fn find(par: &mut [u32], mut x: u32) -> u32 {
+        while par[x as usize] != x {
+            let g = par[par[x as usize] as usize];
+            par[x as usize] = g;
+            x = g;
+        }
+        x
+    }
+    fn join(par: &mut [u32], a: u32, b: u32) {
+        let (ra, rb) = (find(par, a), find(par, b));
+        if ra != rb {
+            par[ra.max(rb) as usize] = ra.min(rb);
+        }
+    }
+    let ids = position_ids(mesh);
+    let mut out = vec![1.0f32; n * sets];
+    let mut par: Vec<u32> = Vec::with_capacity(n);
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let (mut lo, mut hi) = (Vec::new(), Vec::new());
+    let (mut ua, mut wa) = (Vec::new(), Vec::new());
+    for (s, set) in mesh.uvs.iter().enumerate() {
+        if !spans(set) {
+            continue;
+        }
+        par.clear();
+        par.extend(0..n as u32);
+        for t in mesh.indices.chunks_exact(3) {
+            join(&mut par, t[0], t[1]);
+            join(&mut par, t[0], t[2]);
+        }
+        // Vertices of one position with the same UV, found as neighbors in (position, UV)
+        // order.
+        let key = |v: u32| {
+            (
+                ids[v as usize],
+                set[v as usize].to_array().map(f32::to_bits),
+                v,
+            )
+        };
+        order.clear();
+        order.extend(0..n as u32);
+        order.sort_unstable_by_key(|&v| key(v));
+        for w in order.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if ids[a as usize] == ids[b as usize]
+                && (set[a as usize] - set[b as usize]).length_squared() as f64
+                    <= TEAR_SAME_UV * TEAR_SAME_UV
+            {
+                join(&mut par, a, b);
+            }
+        }
+        lo.clear();
+        lo.resize(n, Vec2::splat(f32::INFINITY));
+        hi.clear();
+        hi.resize(n, Vec2::splat(f32::NEG_INFINITY));
+        for v in 0..n as u32 {
+            let r = find(&mut par, v) as usize;
+            lo[r] = lo[r].min(set[v as usize]);
+            hi[r] = hi[r].max(set[v as usize]);
+        }
+        // Texture and surface area per chart, in triangle order.
+        ua.clear();
+        ua.resize(n, 0.0f64);
+        wa.clear();
+        wa.resize(n, 0.0f64);
+        for t in mesh.indices.chunks_exact(3) {
+            let r = find(&mut par, t[0]) as usize;
+            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            ua[r] += (set[b] - set[a]).perp_dot(set[c] - set[a]).abs() as f64 * 0.5;
+            let (x, y) = (
+                mesh.positions[b] - mesh.positions[a],
+                mesh.positions[c] - mesh.positions[a],
+            );
+            wa[r] += x.cross(y).length() as f64 * 0.5;
+        }
+        for v in 0..n as u32 {
+            let r = find(&mut par, v) as usize;
+            if (hi[r] - lo[r]).max_element() > TILE_SPAN && ua[r] > 0.0 && wa[r] > 0.0 {
+                // Texture widths per unit of the diagonal: 1 / that turns a UV error into
+                // surface units.
+                let density = (ua[r] / wa[r]).sqrt() * diag;
+                out[v as usize * sets + s] = (1.0 / density).min(1.0) as f32;
+            }
+        }
+    }
+    if out.iter().all(|&k| k == 1.0) {
+        out.clear();
+    }
+    out
+}
+
+/// The [`uv_tile_scales`] of the vertices `of` (input vertex per piece vertex), for a piece
+/// of the mesh they were worked out on.
+fn pick_tiles(tiles: &[f32], sets: usize, of: &[u32]) -> Vec<f32> {
+    if tiles.is_empty() {
+        return Vec::new();
+    }
+    of.iter()
+        .flat_map(|&v| &tiles[v as usize * sets..(v as usize + 1) * sets])
+        .copied()
+        .collect()
+}
+
 /// Whether [`SimplifyOptions::gutter_use`] applies to `mesh`.
 fn gutter_on(mesh: &Mesh, opts: &SimplifyOptions) -> bool {
     opts.gutter == Gutter::Guarded
@@ -1248,6 +1387,7 @@ impl<'a> State<'a> {
         opts: &'a SimplifyOptions,
         frame: Option<(DVec3, f64)>,
         room: Option<UvRoom<'a>>,
+        tiles: Option<Vec<f32>>,
     ) -> State<'a> {
         let bounds = mesh.bounds();
         let (min, diag) =
@@ -1385,7 +1525,15 @@ impl<'a> State<'a> {
                 seen[p] = true;
             }
         }
-        let attrs = AttrLayout::new(mesh, opts);
+        // Worked out here unless the caller found them on the mesh this one is a piece of.
+        let tiles = tiles.unwrap_or_else(|| {
+            if opts.uv_weight > 0.0 {
+                uv_tile_scales(mesh, diag)
+            } else {
+                Vec::new()
+            }
+        });
+        let attrs = AttrLayout::new(mesh, opts, &tiles);
         let (fp, isle, drift) = match room {
             Some(r) => (Some(r.fp), r.isle, r.drift),
             None => (None, Vec::new(), vec![0.0; mesh.vertex_count()]),
@@ -4051,6 +4199,12 @@ fn simplify_clustered(
     // The UV islands are found on the whole mesh (a cluster does not see the islands next to
     // its own), and what the clusters let them drift is handed on to the final pass.
     let fp = gutter_on(mesh, opts).then(|| UvFootprint::new(mesh, &group));
+    // Tiling charts too, on the whole mesh (see `uv_tile_scales`).
+    let tiles = if opts.uv_weight > 0.0 {
+        uv_tile_scales(mesh, frame.1)
+    } else {
+        Vec::new()
+    };
     let mut drift = vec![0.0f32; if fp.is_some() { vc } else { 0 }];
     // 3. Reduce every cluster interior in parallel (deterministic: results are joined in order).
     type Part = (
@@ -4122,8 +4276,15 @@ fn simplify_clustered(
                 isle: verts.iter().map(|&v| fp.isle[v as usize]).collect(),
                 drift: vec![0.0; verts.len()],
             });
-            let (r, left) =
-                simplify_frame(&sub, &sub_opts, Some(frame), PartsMode::Cluster, sub_room)?;
+            let sub_tiles = pick_tiles(&tiles, mesh.uvs.len(), &verts);
+            let (r, left) = simplify_frame(
+                &sub,
+                &sub_opts,
+                Some(frame),
+                PartsMode::Cluster,
+                sub_room,
+                Some(sub_tiles),
+            )?;
             // (input vertex, drift) of the cluster's remaining vertices.
             let used: Vec<(u32, f32)> = left
                 .iter()
@@ -4226,12 +4387,14 @@ fn simplify_clustered(
         isle: inv.iter().map(|&o| fp.isle[o as usize]).collect(),
         drift: inv.iter().map(|&o| drift[o as usize]).collect(),
     });
+    let final_tiles = pick_tiles(&tiles, mesh.uvs.len(), &inv);
     let (r, _) = simplify_frame(
         &merged,
         &final_opts,
         Some(frame),
         PartsMode::Final(prior_geom2),
         final_room,
+        Some(final_tiles),
     )?;
     let source_vertex = r.source_vertex.iter().map(|&c| inv[c as usize]).collect();
     let vertex_remap = (0..vc)
@@ -4290,7 +4453,7 @@ fn simplify_top(mesh: &Mesh, opts: &SimplifyOptions) -> Result<SimplifyResult> {
         crate::reduce::parts::remap_orphans(mesh, &mut r);
         return Ok(r);
     }
-    let (mut r, _) = simplify_frame(mesh, opts, None, PartsMode::Top, None)?;
+    let (mut r, _) = simplify_frame(mesh, opts, None, PartsMode::Top, None, None)?;
     // Vertices of removed parts map onto the remaining surface.
     crate::reduce::parts::remap_orphans(mesh, &mut r);
     Ok(r)
@@ -4325,6 +4488,7 @@ fn simplify_frame(
     frame: Option<(DVec3, f64)>,
     parts_mode: PartsMode,
     room: Option<UvRoom>,
+    tiles: Option<Vec<f32>>,
 ) -> Result<(SimplifyResult, Vec<f32>)> {
     mesh.validate()?;
     if let Some(r) = opts.target_ratio
@@ -4358,6 +4522,7 @@ fn simplify_frame(
     // worked out alongside building the reducer state.
     let wants_fp = room.is_none() && gutter_on(mesh, opts);
     let mut room = Some(room);
+    let mut tiles = Some(tiles);
     let own_fp;
     let (parts, mut st);
     ((parts, st), own_fp) = rayon::join(
@@ -4374,7 +4539,15 @@ fn simplify_frame(
                         })
                         .flatten()
                 },
-                || State::new(mesh, opts, frame, room.take().flatten()),
+                || {
+                    State::new(
+                        mesh,
+                        opts,
+                        frame,
+                        room.take().flatten(),
+                        tiles.take().flatten(),
+                    )
+                },
             )
         },
         || wants_fp.then(|| UvFootprint::new(mesh, &position_ids(mesh))),
@@ -5320,7 +5493,7 @@ mod attr_quadric_check {
             uv_weight: 0.0,
             ..Default::default()
         };
-        let st = State::new(&m, &opts, None, None);
+        let st = State::new(&m, &opts, None, None, None);
         let p = (4 * n + 4) as u32;
         let nw = 0.5f64; // sqrt(1.0) * 0.5
         for q in st.neighbors(p) {

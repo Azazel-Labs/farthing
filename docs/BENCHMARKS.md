@@ -1579,6 +1579,52 @@ the means also rise: 22.88 → 22.98 dB at 5% (behind fast 2 → 1) and 19.16 �
 (behind 4 → 3; the Duck at 84 triangles drops 0.55). Still behind: Corset, watch, Avocado and
 Fox at 10% (0.11 to 0.61 dB), watch and helmet at 3% (0.34 and 0.26).
 
+### The default reducer: tiling UVs priced in surface units (v24)
+
+The watch band's gap at 10% traced back to its UVs. The carbon-fiber weave repeats about six
+times across the band (UVs −1.2 to 4.4), and a UV error was priced in texture widths. Texture
+sliding over the band therefore cost about as much as moving the surface six times as far,
+and the UV term kept interior vertices at the cost of the band's outline. The same holds on
+the car: its tread and floor-mat charts repeat up to eighteen times.
+
+Changed: a UV chart that spans more than 1.1 texture widths in u or v repeats its texture
+(no atlas chart can). Its UVs now enter the attribute error in surface units: they are scaled
+by 1 / (texture widths per unit of the bounding box diagonal), which is never more than 1.
+Charts are found per UV set by union-find over triangles, also joining vertices that share a
+position and a UV. Clustered meshes find them once on the whole mesh, then hand each cluster
+and the final pass their share. Only the car and the watch have such charts, and every other
+asset reduces exactly as before. Not timed: the cost is setup only, and only for a UV set
+whose whole range spans more than 1.1 (one union-find, one sort of the vertices by position
+and UV, and two passes over the triangles). Nothing is added per collapse.
+
+One caveat: every tiling chart in the corpus drives a normal or metallic-roughness map,
+which the image score (base color only) does not render. The gain measured here is in
+geometry, because the outline is kept. Whether the weave itself reads better is not scored.
+
+| rendered PSNR, dB (5 seeds) | 10%: before | now | fast | 3%: before | now | fast |
+|---|---|---|---|---|---|---|
+| Avocado | 28.74 | 28.74 | 28.89 | 24.64 | 24.64 | 22.50 |
+| BoomBox | 24.08 | 24.08 | 23.88 | 21.01 | 21.01 | 19.83 |
+| CarConcept | 27.55 | 28.48 | 27.48 | 22.27 | 22.60 | 20.20 |
+| ChronographWatch | 21.44 | 22.02 | 21.65 | 16.03 | 16.09 | 16.38 |
+| Corset | 30.10 | 30.10 | 30.71 | 25.87 | 25.87 | 23.99 |
+| DamagedHelmet | 20.17 | 20.17 | 19.76 | 15.30 | 15.30 | 15.56 |
+| DragonAttenuation | 29.76 | 29.76 | 29.50 | 24.96 | 24.96 | 24.85 |
+| Duck | 22.07 | 22.07 | 21.32 | 16.92 | 16.92 | 16.80 |
+| Fox | 18.72 | 18.72 | 18.82 | 15.55 | 15.55 | 15.04 |
+| Lantern | 29.49 | 29.49 | 28.71 | 24.81 | 24.81 | 24.71 |
+| WaterBottle | 32.25 | 32.25 | 31.86 | 24.60 | 24.60 | 23.55 |
+| mean | 25.85 | 25.99 | 25.69 | 21.09 | 21.12 | 20.31 |
+
+Cases behind fast mode: 4 at 10% (1.08 dB in all) before, 3 (0.86 dB) now, with the watch
+going from 0.21 behind to 0.37 ahead. At 3%: 2 (0.60 dB) before, 2 (0.55 dB) now. Between the
+two ratios, at 5% the mean goes from 22.98 to 23.03 dB (car +0.54, watch −0.05, still the only
+case behind fast). At 2% it goes from 19.33 to 19.32: the car gains +0.26 and the watch drops
+0.38 (per seed −0.80 to +0.47). At about 2,500 triangles both versions fold the watch's bands
+into flat sheets, and the sheets differ from seed to seed. Still behind: Corset, Avocado and
+Fox at 10% (0.61, 0.15, 0.11 dB), the watch and helmet at 3% (0.29, 0.26), the watch at 5%
+(0.36), and the watch, dragon and Duck at 2%.
+
 ### v14: the dragon's error is in the reduction
 
 v12 left the dragon at 1.39% Hausdorff against baby_shark's 0.87%, and adaptive (octree)
