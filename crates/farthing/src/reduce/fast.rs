@@ -460,7 +460,6 @@ pub(crate) fn simplify_fast(
     let mut edges: Vec<Edge> = Vec::new();
     let mut bits: Vec<u32> = Vec::new();
     let mut map: Vec<(u32, u32)> = Vec::new();
-    let mut nbr: Vec<u32> = Vec::new();
     let mut stall = 0;
     let mut parts: Option<Option<crate::reduce::parts::Parts>> = None;
     let analyze = || {
@@ -498,47 +497,25 @@ pub(crate) fn simplify_fast(
         }
         pass += 1;
         st.rebuild_stars(nt);
-        // Every edge with an allowed direction, its geometric costs first (cheap).
+        // Every edge with an allowed direction, its geometric costs first (cheap). Large
+        // meshes gather them on all threads, in the same order.
         edges.clear();
-        for p in 0..np as u32 {
-            if !pos_alive[p as usize] || st.star(p).is_empty() {
-                continue;
+        if np < PAR_MIN {
+            for p in 0..np as u32 {
+                st.edges_at(p, &pos_alive, &mut edges);
             }
-            epoch += 1;
-            nbr.clear();
-            for &t in st.star(p) {
-                for &x in &st.tp[t as usize] {
-                    if x > p && mark[x as usize] != epoch {
-                        mark[x as usize] = epoch;
-                        nbr.push(x);
-                    }
-                }
-            }
-            for &q in &nbr {
-                // Both directions share the summed quadric (addition commutes exactly).
-                let mut qq = st.quad[p as usize];
-                qq.add(&st.quad[q as usize]);
-                let mut dirs = [(p, q, f32::INFINITY), (q, p, f32::INFINITY)];
-                for d in &mut dirs {
-                    if st.can(d.0, d.1) {
-                        d.2 = qq.eval(st.pos[d.1 as usize]) / st.avg_area;
-                    }
-                }
-                if dirs[1].2 < dirs[0].2 {
-                    dirs.swap(0, 1);
-                }
-                let (a, b, g) = dirs[0];
-                if g.is_finite() {
-                    edges.push(Edge {
-                        // Never -0.0, so that its bits order like the value.
-                        low: if g > 0.0 { g } else { 0.0 },
-                        a,
-                        b,
-                        g,
-                        g_back: dirs[1].2,
-                    });
-                }
-            }
+        } else {
+            use rayon::prelude::*;
+            edges.par_extend(
+                (0..np as u32)
+                    .into_par_iter()
+                    .with_min_len(PAR_MIN / 4)
+                    .fold(Vec::new, |mut out, p| {
+                        st.edges_at(p, &pos_alive, &mut out);
+                        out
+                    })
+                    .flatten_iter(),
+            );
         }
         if edges.is_empty() {
             break;
@@ -776,38 +753,31 @@ fn cost_edges(
     cands: &mut Vec<(u32, u32, u32, f32)>,
     map: &mut Vec<(u32, u32)>,
 ) {
-    for k in *costed..edges.len() {
-        if edges[k].low > upto {
-            continue;
-        }
-        edges.swap(*costed, k);
-        let e = &edges[*costed];
-        *costed += 1;
-        // The attribute term only where it can still win.
-        let mut best: Option<(f32, u32, u32)> = None;
-        for (a, b, g) in [(e.a, e.b, e.g), (e.b, e.a, e.g_back)] {
-            if !g.is_finite() || best.is_some_and(|x| g >= x.0) {
-                continue;
-            }
-            let Some(ac) = st.attr_cost(a, b, map) else {
-                continue;
-            };
-            let c = g + ac;
-            if best.is_none_or(|x| c < x.0) {
-                best = Some((c, a, b));
-            }
-        }
-        // Every edge has a triangle on it at the start of a pass, so a candidate.
-        debug_assert!(best.is_some());
-        if let Some((c, a, b)) = best {
-            let mut qq = st.quad[a as usize];
-            qq.add(&st.quad[b as usize]);
-            // Mean squared distance, for error reporting and max_error.
-            let w = (qq.0[0] + qq.0[4] + qq.0[7]).max(1e-30);
-            cands.push((c.to_bits(), a, b, qq.eval(st.pos[b as usize]) / w));
+    let first = *costed;
+    for k in first..edges.len() {
+        if edges[k].low <= upto {
+            edges.swap(*costed, k);
+            *costed += 1;
         }
     }
+    let new = &edges[first..*costed];
+    // Candidates are sorted by (cost, p, q) later, all distinct, so their order here is free.
+    if new.len() < PAR_MIN {
+        cands.extend(new.iter().filter_map(|e| st.candidate(e, map)));
+    } else {
+        use rayon::prelude::*;
+        cands.par_extend(
+            new.par_iter()
+                .with_min_len(PAR_MIN / 4)
+                .map_init(Vec::new, |map, e| st.candidate(e, map))
+                .flatten(),
+        );
+    }
 }
+
+/// Below this many positions (edges to cost), a pass gathers edges (costs them) on one
+/// thread.
+const PAR_MIN: usize = 16384;
 
 /// Working state of the fast loop.
 struct St {
@@ -883,6 +853,81 @@ impl St {
                 }
             }
         }
+    }
+
+    /// Adds the edges from p to its higher neighbors (see [`Edge`]), in the order its star
+    /// first meets them.
+    fn edges_at(&self, p: u32, pos_alive: &[bool], out: &mut Vec<Edge>) {
+        if !pos_alive[p as usize] {
+            return;
+        }
+        let mut nbr = [0u32; 32];
+        let mut n = 0;
+        let mut more: Vec<u32> = Vec::new();
+        for &t in self.star(p) {
+            for &x in &self.tp[t as usize] {
+                if x > p && !nbr[..n].contains(&x) && !more.contains(&x) {
+                    if n < nbr.len() {
+                        nbr[n] = x;
+                        n += 1;
+                    } else {
+                        more.push(x);
+                    }
+                }
+            }
+        }
+        for &q in nbr[..n].iter().chain(&more) {
+            // Both directions share the summed quadric (addition commutes exactly).
+            let mut qq = self.quad[p as usize];
+            qq.add(&self.quad[q as usize]);
+            let mut dirs = [(p, q, f32::INFINITY), (q, p, f32::INFINITY)];
+            for d in &mut dirs {
+                if self.can(d.0, d.1) {
+                    d.2 = qq.eval(self.pos[d.1 as usize]) / self.avg_area;
+                }
+            }
+            if dirs[1].2 < dirs[0].2 {
+                dirs.swap(0, 1);
+            }
+            let (a, b, g) = dirs[0];
+            if g.is_finite() {
+                out.push(Edge {
+                    // Never -0.0, so that its bits order like the value.
+                    low: if g > 0.0 { g } else { 0.0 },
+                    a,
+                    b,
+                    g,
+                    g_back: dirs[1].2,
+                });
+            }
+        }
+    }
+
+    /// An edge's candidate: (cost bits, p, q, mean distance²) for its cheaper allowed
+    /// direction by geometry plus attributes. `map` is scratch space.
+    fn candidate(&self, e: &Edge, map: &mut Vec<(u32, u32)>) -> Option<(u32, u32, u32, f32)> {
+        // The attribute term only where it can still win.
+        let mut best: Option<(f32, u32, u32)> = None;
+        for (a, b, g) in [(e.a, e.b, e.g), (e.b, e.a, e.g_back)] {
+            if !g.is_finite() || best.is_some_and(|x| g >= x.0) {
+                continue;
+            }
+            let Some(ac) = self.attr_cost(a, b, map) else {
+                continue;
+            };
+            let c = g + ac;
+            if best.is_none_or(|x| c < x.0) {
+                best = Some((c, a, b));
+            }
+        }
+        // Every edge has a triangle on it at the start of a pass, so a candidate.
+        debug_assert!(best.is_some());
+        let (c, a, b) = best?;
+        let mut qq = self.quad[a as usize];
+        qq.add(&self.quad[b as usize]);
+        // Mean squared distance, for error reporting and max_error.
+        let w = (qq.0[0] + qq.0[4] + qq.0[7]).max(1e-30);
+        Some((c.to_bits(), a, b, qq.eval(self.pos[b as usize]) / w))
     }
 
     /// p's triangles as of the start of the pass, dead ones included (callers skip them). For
