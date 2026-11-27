@@ -1280,6 +1280,27 @@ a hosted runner (4 cores, minimum of 12 rounds, same run): no measurable cost (w
 per-mesh distance and normal blame against the default reducer, and `rtsolo` writes one file
 per mesh with only that mesh reduced, for rendered blame.
 
+### Realtime: nine smaller passes (v24)
+
+Output is byte-identical (hashes of mesh, remap, source vertices, error and collapse counts over
+the whole corpus at 300, 3,000 and 20,000 triangles, an error bound, locked borders, and each
+mesh at 10% and 3%). Changes: runs of one position joined without pairwise compares,
+fine-level counts in plain loops over blocks, face sums filled in parallel, stage-two triangle
+data gathered in parallel, fold checks skipped in stars without folds, Morton bits spread from
+a table, fine cells keeping their end codes for the octree, and the stage-two triangle set in
+one 64-bit word per slot (8 bytes in place of 20). A hosted runner (4 threads, minimum over 16
+rounds, same run against the previous main):
+
+| ms | ChronographWatch | CarConcept | DragonAttenuation |
+|---|---|---|---|
+| 3,000 triangles | 14.36 → 13.70 | 18.80 → 17.98 | 13.86 → 12.77 |
+| 20,000 triangles | 30.49 → 28.52 | 31.69 → 29.92 | 26.05 → 24.06 |
+
+The serial collapse tail is now the largest single phase at a 3,000 target (about 2.5 to 3.5
+ms): on the watch, 4,672 heap pops for 1,884 collapses at roughly 0.75 to 1 µs each, spread
+over cost evaluation, link checks, wedge mapping and the collapse itself with no single hot
+spot.
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with

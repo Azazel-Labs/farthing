@@ -39,6 +39,14 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 | Cell sums as differences of running sums along the Morton order | Not built: claimed by US 10,417,821 B2, and differencing quadrics cancels badly. Cell sums stay hierarchical | The patent lapses (about 2036) |
 | Octree clustering on the GPU | Not built: claimed by US 8,760,450 B2 | The patent lapses (about 2031) |
 | Splitting the tail into spatial blocks with frozen borders | Not built: at 6,000 triangles in 8 blocks the frozen borders are a large share of all edges | — |
+| Realtime: edge classification fused into the tail's first exact pass | Output identical; attributes 0.36 → 0.15 ms but tail 3.54 → 3.72 ms; whole call watch 14.54 → 14.68, car 18.77 → 18.88, dragon 14.25 → 14.20 ms | — |
+| Realtime: an attribute hash per vertex, gathered in the Morton pass, replacing attribute compares in the cluster jobs | Clusters 2.92 → 2.78 ms but Morton 1.77 → 1.99 ms: slower overall | — |
+| Realtime: the same attribute hash per position run, inside the cluster jobs | Clusters 2.31 → 2.64 ms: slower than comparing directly | — |
+| Realtime: first rank at a position found on demand instead of in a parallel pass | Fine level faster, but face sums 1.89 → 2.20, 2.81 → 2.92, 2.49 → 2.99 ms | — |
+| Realtime: parallel fill of cell ranks per chunk, parallel union-find init | Octree +0.03 to 0.04 ms, wedge pass +0.02 to 0.07 ms | — |
+| Realtime: parallel first-touch fills of the wedge best and wedge id arrays | Output identical; triangles −0.27 ms at 3,000, but the tail, which never reads them, +0.37 to +0.59 ms at 20,000; not understood (allocator or page placement?) | Someone profiles why |
+| Realtime: vertex remap worked out in rank order, then gathered by input vertex | Output identical; neutral (0.58 → 0.60, 0.81 → 0.84, 0.84 → 0.81 ms) | — |
+| Realtime: runs of equal position hash instead of equal Morton code for cluster seams | Output changes: the quantized position is coarser than the positions the hash reads | — |
 
 ## Triangle reduction (default and fast)
 
