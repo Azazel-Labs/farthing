@@ -457,6 +457,8 @@ pub(crate) fn simplify_fast(
     let mut used = vec![0u32; np];
     let mut pass = 0u32;
     let mut cands: Vec<(u32, u32, u32, f32)> = Vec::new(); // (cost bits, p, q, mean dist²)
+    let mut edges: Vec<Edge> = Vec::new();
+    let mut bits: Vec<u32> = Vec::new();
     let mut map: Vec<(u32, u32)> = Vec::new();
     let mut nbr: Vec<u32> = Vec::new();
     let mut stall = 0;
@@ -496,8 +498,8 @@ pub(crate) fn simplify_fast(
         }
         pass += 1;
         st.rebuild_stars(nt);
-        // Cost every edge in its cheaper allowed direction.
-        cands.clear();
+        // Every edge with an allowed direction, its geometric costs first (cheap).
+        edges.clear();
         for p in 0..np as u32 {
             if !pos_alive[p as usize] || st.star(p).is_empty() {
                 continue;
@@ -513,7 +515,6 @@ pub(crate) fn simplify_fast(
                 }
             }
             for &q in &nbr {
-                // Geometry first (cheap); the attribute term only where it can still win.
                 let geo = |a: u32, b: u32| {
                     let mut qq = st.quad[a as usize];
                     qq.add(&st.quad[b as usize]);
@@ -528,44 +529,75 @@ pub(crate) fn simplify_fast(
                 if dirs[1].2 < dirs[0].2 {
                     dirs.swap(0, 1);
                 }
-                let mut best: Option<(f32, u32, u32)> = None;
-                for &(a, b, g) in &dirs {
-                    if !g.is_finite() || best.is_some_and(|x| g >= x.0) {
-                        continue;
-                    }
-                    let Some(ac) = st.attr_cost(a, b, &mut map) else {
-                        continue;
-                    };
-                    let c = g + ac;
-                    if best.is_none_or(|x| c < x.0) {
-                        best = Some((c, a, b));
-                    }
-                }
-                if let Some((c, a, b)) = best {
-                    let mut qq = st.quad[a as usize];
-                    qq.add(&st.quad[b as usize]);
-                    // Mean squared distance, for error reporting and max_error.
-                    let w = (qq.0[0] + qq.0[4] + qq.0[7]).max(1e-30);
-                    cands.push((c.to_bits(), a, b, qq.eval(st.pos[b as usize]) / w));
+                let (a, b, g) = dirs[0];
+                if g.is_finite() {
+                    edges.push(Edge {
+                        // Never -0.0, so that its bits order like the value.
+                        low: if g > 0.0 { g } else { 0.0 },
+                        a,
+                        b,
+                        g,
+                        g_back: dirs[1].2,
+                    });
                 }
             }
         }
-        if cands.is_empty() {
+        if edges.is_empty() {
             break;
         }
-        cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
-        let needed = target.map_or(cands.len(), |t| {
+        let needed = target.map_or(edges.len(), |t| {
             alive_tris.saturating_sub(t).div_ceil(2).max(1)
         });
-        // Pass cost limit (see PASS_SHARE, PASS_LIMIT): passes stay close to cost order.
+        // Pass cost limit (see PASS_SHARE, PASS_LIMIT): passes stay close to cost order. It
+        // depends on the m-th cheapest full cost, and a candidate's full cost is at least its
+        // geometric one, so only the edges whose geometric cost is under the limit get their
+        // attribute cost (see `Edge`).
         let m = needed
-            .min((cands.len() as f32 * PASS_SHARE).ceil() as usize)
-            .clamp(1, cands.len());
+            .min((edges.len() as f32 * PASS_SHARE).ceil() as usize)
+            .clamp(1, edges.len());
+        cands.clear();
+        let mut costed = 0;
         let limit = if stall > 0 {
+            cost_edges(
+                &st,
+                &mut edges,
+                &mut costed,
+                f32::INFINITY,
+                &mut cands,
+                &mut map,
+            );
             f32::INFINITY
         } else {
-            f32::from_bits(cands[m - 1].0) * PASS_LIMIT + 1e-12
+            // The m-th smallest of `bits` as a cost.
+            let nth = |bits: &mut Vec<u32>| f32::from_bits(*bits.select_nth_unstable(m - 1).1);
+            // The m-th cheapest geometric cost is a lower bound on the m-th cheapest full
+            // cost, so twice it is under the limit.
+            bits.clear();
+            bits.extend(edges.iter().map(|e| e.low.to_bits()));
+            let mut upto = nth(&mut bits) * PASS_LIMIT + 1e-12;
+            let mth = loop {
+                cost_edges(&st, &mut edges, &mut costed, upto, &mut cands, &mut map);
+                // The edges not costed yet cost more than `upto`, so with m costed candidates
+                // at or under it, the m-th cheapest is among them.
+                let under = cands.iter().filter(|c| c.0 <= upto.to_bits()).count();
+                bits.clear();
+                bits.extend(cands.iter().map(|c| c.0));
+                if under >= m || costed == edges.len() {
+                    break nth(&mut bits);
+                }
+                // Otherwise the m-th cheapest is at least the m-th of the known costs and the
+                // lower bounds left, again within the limit.
+                bits.extend(edges[costed..].iter().map(|e| e.low.to_bits()));
+                let next = nth(&mut bits) * PASS_LIMIT + 1e-12;
+                upto = if next > upto { next } else { f32::INFINITY };
+            };
+            let limit = mth * PASS_LIMIT + 1e-12;
+            if limit > upto {
+                cost_edges(&st, &mut edges, &mut costed, limit, &mut cands, &mut map);
+            }
+            limit
         };
+        cands.sort_unstable_by_key(|c| (c.0, c.1, c.2));
         let mut done = 0;
         for &(cb, p, q, g2) in &cands {
             if target.is_some_and(|t| alive_tris <= t) {
@@ -638,7 +670,7 @@ pub(crate) fn simplify_fast(
                     _ => break,
                 }
             }
-        } else if done * PASS_STUCK < m && m * 8 < cands.len() {
+        } else if done * PASS_STUCK < m && m * 8 < edges.len() {
             stall = 1;
         } else {
             stall = 0;
@@ -721,6 +753,62 @@ pub(crate) fn simplify_fast(
         symmetry_plane: None,
         source_vertex,
     })
+}
+
+/// An edge in its cheaper allowed direction by geometry, a → b. Its candidate (the cheaper
+/// full cost over both directions) costs at least `low`.
+struct Edge {
+    /// `g`, with -0.0 as 0.0.
+    low: f32,
+    a: u32,
+    b: u32,
+    /// Geometric cost of a → b and of b → a (infinite when not allowed).
+    g: f32,
+    g_back: f32,
+}
+
+/// Costs the edges after `edges[..*costed]` whose geometric cost is at most `upto`, moving them
+/// up to the costed part, and adds their candidates: (cost bits, p, q, mean distance²) for the
+/// cheaper allowed direction by geometry plus attributes.
+fn cost_edges(
+    st: &St,
+    edges: &mut [Edge],
+    costed: &mut usize,
+    upto: f32,
+    cands: &mut Vec<(u32, u32, u32, f32)>,
+    map: &mut Vec<(u32, u32)>,
+) {
+    for k in *costed..edges.len() {
+        if edges[k].low > upto {
+            continue;
+        }
+        edges.swap(*costed, k);
+        let e = &edges[*costed];
+        *costed += 1;
+        // The attribute term only where it can still win.
+        let mut best: Option<(f32, u32, u32)> = None;
+        for (a, b, g) in [(e.a, e.b, e.g), (e.b, e.a, e.g_back)] {
+            if !g.is_finite() || best.is_some_and(|x| g >= x.0) {
+                continue;
+            }
+            let Some(ac) = st.attr_cost(a, b, map) else {
+                continue;
+            };
+            let c = g + ac;
+            if best.is_none_or(|x| c < x.0) {
+                best = Some((c, a, b));
+            }
+        }
+        // Every edge has a triangle on it at the start of a pass, so a candidate.
+        debug_assert!(best.is_some());
+        if let Some((c, a, b)) = best {
+            let mut qq = st.quad[a as usize];
+            qq.add(&st.quad[b as usize]);
+            // Mean squared distance, for error reporting and max_error.
+            let w = (qq.0[0] + qq.0[4] + qq.0[7]).max(1e-30);
+            cands.push((c.to_bits(), a, b, qq.eval(st.pos[b as usize]) / w));
+        }
+    }
 }
 
 /// Working state of the fast loop.
