@@ -111,6 +111,15 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 | Normal growth capped at 16, 24 or 48 average triangles with the crease cap (seeds) | +0.15 / +0.10, +0.20 / +0.03, +0.24 / +0.10, against +0.25 / +0.10 at 32 (shipped); 16 and 24 cost Corset 10% 0.4 to 0.5 | — |
 | Dragon: greedy order, silhouette weight 0, cluster-parallel off (single run) | +0.05 / +0.16, 0 / +0.01, identical (its meshes are under the threshold) | — |
 | Default reducer: closing the dragon gap to fast mode | Its UVs drive only a thickness texture the scorer ignores: without UVs the default scores 29.97 / 24.89 against 29.63 / 24.56 with them | The scorer renders thickness |
+| Fast: the default reducer's normal-growth cap (wedge area / mean, capped at 8 or 32) | −0.16 / −0.12 and −0.17 / −0.15 dB (5 seeds): fast's attribute term grows with area directly | — |
+| Fast: crease planes on every edge, gentle ones capped at 12 × area (the default reducer's form) | +0.07 / −0.12 dB; Avocado 10% −1.37, WaterBottle 3% −0.90 | — |
+| Fast: crease planes on sharp edges (over 30°) whatever the face beside | weight 1: +0.11 / −0.13; weight 4: +0.08 / +0.03; over 60° weight 4: +0.24 / −0.19 (Avocado and Fox 3% about −1.0). Shipped only beside narrow faces | — |
+| Fast: narrow-face crease planes on gentle creases too | weight 1 at narrow 0.1: +0.43 / +0.01; weight 4: +0.13 / +0.13 (WaterBottle 10% −2.67) | — |
+| Fast: surface gradient on UVs only, normals only, or both without crease planes | +0.06 / −0.25, +0.42 / +0.07, +0.39 / +0.16 against +0.69 / +0.27 shipped | — |
+| Fast: symmetric gradient ½(J_p + J_q) | +0.46 / +0.10; car 10% +1.23 against +3.48 one-sided, dragon −1.24 | — |
+| Fast: tuning on top of gradient and crease planes (normal weight ×2 or ×4, normal growth 32, UV weight ×2 or ×0.5, crease weight 1 or 4, narrow 0.5 or 0.15) | All within noise of or below the shipped +0.69 / +0.27 (best: normal ×2 at +0.77 / +0.06) | — |
+| Fast: passes closer to one collapse at a time (pass share 0.1 or 0.05, pass limit 1.0) | Car 10% only +0.28 / +0.52, Corset 10% −1.21 at 0.05, and much slower (one seed, 5 assets) | — |
+| Default reducer: silhouette weight 0, to see whether it explains the car lead over fast mode | Car barely moves (+0.04 / +0.18); normal weight 0 drops car 10% 27.53 → 24.91: the lead is the gradient normal quadrics | — |
 
 ## Voxel proxies
 

@@ -1324,6 +1324,47 @@ Fast now renders closer than the default by more than 0.1 dB on WaterBottle and 
 10% and on the watch, dragon and Fox at 3%. Still open in fast: the car's dented panels
 (3.5 dB behind the default) and the Lantern's skewed post top.
 
+### Fast: attribute cost along the surface gradient (v24)
+
+Fast mode priced a collapse by how far the removed wedge's UVs and normals sat from the target
+wedge's, as they are. On a smooth panel or inside a UV island every collapse paid for the
+distance it moved, an edge-length term that spread the budget evenly and broke shading on
+curved panels (the car's hood alone: 18.74 dB, against 21.72 for the default reducer). Each
+wedge now carries its attributes' area-weighted surface gradient J and pays for
+attr_q − attr_p − J_p·(x_q − x_p), near zero wherever attributes change linearly. Sharp
+creases (over 30°) beside a face narrow across the edge (area under 0.3 × length²) also get a
+constraint plane, weight 2 × length² × (1 − cos)/2, so a thin panel's outline no longer sinks
+inward (the windshield). The default reducer's two v24 caps do not carry over: fast mode's
+attribute term grows with area directly, and crease planes on every edge cost it.
+
+Means over five neutral seeds:
+
+| rendered PSNR, dB | 10%: before | now | default | 3%: before | now | default |
+|---|---|---|---|---|---|---|
+| Avocado | 28.45 | 28.89 | 28.74 | 22.81 | 22.50 | 23.19 |
+| BoomBox | 23.22 | 23.88 | 24.08 | 19.41 | 19.83 | 20.28 |
+| CarConcept | 23.99 | 27.48 | 27.55 | 18.65 | 20.20 | 21.98 |
+| ChronographWatch | 21.31 | 21.65 | 21.44 | 15.87 | 16.38 | 16.16 |
+| Corset | 30.29 | 30.71 | 30.10 | 23.02 | 23.99 | 25.91 |
+| DamagedHelmet | 19.42 | 19.76 | 20.17 | 14.86 | 15.56 | 15.24 |
+| DragonAttenuation | 29.95 | 29.50 | 29.76 | 25.32 | 24.85 | 24.97 |
+| Duck | 21.46 | 21.32 | 22.07 | 16.88 | 16.80 | 16.56 |
+| Fox | 18.22 | 18.82 | 18.72 | 15.67 | 15.04 | 15.07 |
+| Lantern | 26.28 | 28.71 | 29.49 | 24.00 | 24.71 | 24.98 |
+| WaterBottle | 32.34 | 31.86 | 32.25 | 23.99 | 23.55 | 24.13 |
+| mean | 25.00 | 25.69 | 25.85 | 20.04 | 20.31 | 20.77 |
+
+The dragon loses 0.45 dB: its UVs drive only an unrendered thickness texture, and the old
+edge-length pull helped it by accident. The car at 3% stays 1.8 dB behind, mostly the wipers
+(thin non-manifold rods), and so does the Corset at 3% (its base disk becomes an octagon).
+
+Time on a hosted runner (`fast=10000` in the Bench workflow, dragon, watch and car flattened,
+12 rounds, same run): 1.061 × the previous fast mode in all (watch 0.997, car 1.045, dragon
+1.196). Wedge data now sits in one block per wedge, and a pass near the target that makes
+under a quarter of its intended collapses lifts the cost limit for the next one (the watch
+used to spend five or six passes collapsing 0 to 27 edges each). The dragon's extra time is
+passes: cheap candidates now cluster in flat regions and block each other, 8 passes against 6.
+
 ### The default reducer against the fast one (v24)
 
 The fast reducer rendered closer to the source than the default on 9 of 22 cases (11 assets
