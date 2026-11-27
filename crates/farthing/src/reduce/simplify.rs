@@ -424,6 +424,10 @@ struct Scratch {
     map3: Vec<(u32, u32)>,
     corners3: Vec<Corner>,
     drift: Vec<(u32, f32)>,
+    /// [`State::best_candidate`]: per costed candidate, its tear error, its entry in
+    /// `bounds`, whether its gutter spill is priced ([`UNPRICED`], [`PRICED`]), and the
+    /// attribute part of its cost ([`State::cost_attr`]).
+    spill: Vec<(f64, u32, u8, [f64; 3])>,
 }
 
 /// Per-position triangle lists in one arena: contiguous, no per-vertex allocations. A list that
@@ -648,6 +652,10 @@ struct State<'a> {
     scratch: thread_local::ThreadLocal<RefCell<Scratch>>,
 }
 
+/// Whether a costed candidate's gutter spill is in its cost yet ([`State::best_candidate`]).
+const UNPRICED: u8 = 0;
+const PRICED: u8 = 1;
+
 /// Gutters wider than this (texture units) count as this wide: no spill reaches further
 /// than its share of it (see [`SimplifyOptions::gutter_use`]).
 const GUTTER_MAX: f64 = 1.0 / 32.0;
@@ -657,6 +665,8 @@ const GUTTER_USE_MAX: f32 = 0.45;
 /// A spill of depth d into the gutter is priced like a UV error of this times d over the
 /// triangle that spills.
 const SPILL_PRICE: f64 = 1.0;
+/// Spills shallower than this (texture units) are not priced.
+const SPILL_MIN: f64 = 1e-6;
 
 /// Where the source mesh's UV islands lie in the texture (UV set 0): what a spilling island
 /// must keep clear of. Triangles are held modulo the texture, in a uniform grid.
@@ -673,10 +683,53 @@ struct UvFootprint {
     isle: Vec<u32>,
     start: Vec<u32>,
     list: Vec<u32>,
+    /// Per cell, up to two islands with a triangle that covers the whole cell.
+    cover: Vec<[u32; 2]>,
+    /// Per cell, the two nearest islands and how many cells away they are (see [`Near`]).
+    near: Vec<Near>,
+}
+
+/// The two nearest islands to a grid cell, nearest first, with their distance in cells
+/// (0: in the cell), exact up to [`UvFootprint::REACH`]; `u32::MAX` where there is none
+/// that near. The nearest island other than a given one is then one of the two.
+#[derive(Clone, Copy)]
+struct Near {
+    isle: [u32; 2],
+    cells: [u8; 2],
+}
+
+impl Near {
+    const NONE: Near = Near {
+        isle: [u32::MAX; 2],
+        cells: [u8::MAX; 2],
+    };
+
+    /// Takes island `l` at `d` cells into the two nearest (ties to the lower id).
+    #[inline]
+    fn take(&mut self, l: u32, d: u8) {
+        let before = |a: (u8, u32), b: (u8, u32)| a < b;
+        if l == self.isle[0] {
+            self.cells[0] = self.cells[0].min(d);
+        } else if l == self.isle[1] {
+            self.cells[1] = self.cells[1].min(d);
+            if before((self.cells[1], self.isle[1]), (self.cells[0], self.isle[0])) {
+                self.isle.swap(0, 1);
+                self.cells.swap(0, 1);
+            }
+        } else if before((d, l), (self.cells[0], self.isle[0])) {
+            self.isle = [l, self.isle[0]];
+            self.cells = [d, self.cells[0]];
+        } else if before((d, l), (self.cells[1], self.isle[1])) {
+            self.isle[1] = l;
+            self.cells[1] = d;
+        }
+    }
 }
 
 impl UvFootprint {
     const G: usize = 256;
+    /// How many cells away [`Near`] looks.
+    const REACH: u8 = 6;
 
     /// Islands are found over welded positions (`vpos`) and equal UVs, so vertices split only
     /// by normals do not cut one. A triangle lying across the texture's edge is held once
@@ -779,33 +832,116 @@ impl UvFootprint {
             tris.push(x.map(|u| u - off));
             tri_isle.push(isle[vs[0] as usize]);
         }
+        // Row by row, the cells each triangle touches and, among them, those it covers whole:
+        // `f(row, first, last, c0, c1)` for touched cells first..=last, covered c0..c1.
+        let h = 1.0 / g as f64;
         let cell = |x: f64| ((x * g as f64).floor().clamp(0.0, g as f64 - 1.0)) as usize;
-        let span = |t: &[DVec2; 3]| {
+        let raster = |t: &[DVec2; 3], f: &mut dyn FnMut(usize, usize, usize, usize, usize)| {
             let (lo, hi) = (t[0].min(t[1]).min(t[2]), t[0].max(t[1]).max(t[2]));
-            (cell(lo.x), cell(hi.x), cell(lo.y), cell(hi.y))
+            // Where the triangle meets a horizontal line.
+            let cross = |line: f64| {
+                let (mut l, mut r) = (f64::INFINITY, f64::NEG_INFINITY);
+                for e in 0..3 {
+                    let (a, b) = (t[e], t[(e + 1) % 3]);
+                    if a.y == line {
+                        l = l.min(a.x);
+                        r = r.max(a.x);
+                    }
+                    if (a.y - line) * (b.y - line) < 0.0 {
+                        let x = a.x + (b.x - a.x) * ((line - a.y) / (b.y - a.y));
+                        l = l.min(x);
+                        r = r.max(x);
+                    }
+                }
+                (l, r)
+            };
+            let mut below = cross(cell(lo.y) as f64 * h);
+            for y in cell(lo.y)..=cell(hi.y) {
+                let (ya, yb) = (y as f64 * h, (y as f64 + 1.0) * h);
+                let above = cross(yb);
+                // The triangle within the row: its corners there and where it crosses the
+                // row's two lines.
+                let (mut l, mut r) = (below.0.min(above.0), below.1.max(above.1));
+                for v in t {
+                    if v.y >= ya && v.y <= yb {
+                        l = l.min(v.x);
+                        r = r.max(v.x);
+                    }
+                }
+                if l <= r {
+                    // Covered: the cells within the triangle on both lines.
+                    let (cl, cr) = (below.0.max(above.0), below.1.min(above.1));
+                    let (c0, c1) = if cl <= cr {
+                        (
+                            ((cl + 1e-12) * g as f64).ceil().max(0.0) as usize,
+                            (((cr - 1e-12) * g as f64).floor().max(0.0) as usize).min(g),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    f(y, cell(l - 1e-12), cell(r + 1e-12), c0, c1.max(c0));
+                }
+                below = above;
+            }
         };
         let mut start = vec![0u32; g * g + 1];
         for t in &tris {
-            let (x0, x1, y0, y1) = span(t);
-            for y in y0..=y1 {
-                for x in x0..=x1 {
+            raster(t, &mut |y, x0, x1, c0, c1| {
+                for x in (x0..=x1).filter(|x| !(c0..c1).contains(x)) {
                     start[y * g + x + 1] += 1;
                 }
-            }
+            });
         }
         for c in 0..g * g {
             start[c + 1] += start[c];
         }
         let mut fill = start.clone();
         let mut list = vec![0u32; start[g * g] as usize];
+        let mut cover = vec![[u32::MAX; 2]; g * g];
+        let mut near = vec![Near::NONE; g * g];
         for (i, t) in tris.iter().enumerate() {
-            let (x0, x1, y0, y1) = span(t);
-            for y in y0..=y1 {
+            let isle = tri_isle[i];
+            raster(t, &mut |y, x0, x1, c0, c1| {
                 for x in x0..=x1 {
-                    list[fill[y * g + x] as usize] = i as u32;
-                    fill[y * g + x] += 1;
+                    let c = y * g + x;
+                    near[c].take(isle, 0);
+                    if (c0..c1).contains(&x) {
+                        let k = &mut cover[c];
+                        if k[0] == u32::MAX {
+                            k[0] = isle;
+                        } else if k[0] != isle && k[1] == u32::MAX {
+                            k[1] = isle;
+                        }
+                    } else {
+                        list[fill[c] as usize] = i as u32;
+                        fill[c] += 1;
+                    }
                 }
-            }
+            });
+        }
+        // Spread the nearest islands a cell per round: after r rounds every cell knows its
+        // two nearest within r cells exactly (a nearer island never hides a further one
+        // unless two others are at least as near).
+        let mut next = near.clone();
+        for _ in 0..Self::REACH {
+            let cur = &near;
+            next.par_chunks_mut(g).enumerate().for_each(|(y, row)| {
+                for (x, out) in row.iter_mut().enumerate() {
+                    let mut best = cur[y * g + x];
+                    for ny in y.saturating_sub(1)..=(y + 1).min(g - 1) {
+                        for nx in x.saturating_sub(1)..=(x + 1).min(g - 1) {
+                            let o = cur[ny * g + nx];
+                            for k in 0..2 {
+                                if o.isle[k] != u32::MAX {
+                                    best.take(o.isle[k], o.cells[k] + 1);
+                                }
+                            }
+                        }
+                    }
+                    *out = best;
+                }
+            });
+            std::mem::swap(&mut near, &mut next);
         }
         UvFootprint {
             tris,
@@ -815,6 +951,8 @@ impl UvFootprint {
             isle,
             start,
             list,
+            cover,
+            near,
         }
     }
 
@@ -831,15 +969,56 @@ impl UvFootprint {
             return true;
         }
         let cell = |v: f64| ((v * g as f64).floor().clamp(0.0, g as f64 - 1.0)) as usize;
+        let c = cell(x.y) * g + cell(x.x);
+        // Inside another island's triangle that covers the cell: blocked.
+        let k = self.cover[c];
+        if (k[0] != u32::MAX && k[0] != own) || k[1] != u32::MAX {
+            return true;
+        }
+        // No other island within so many cells that none can be within `radius`: free.
+        let n = self.near[c];
+        let cells = if n.isle[0] != own {
+            n.cells[0]
+        } else {
+            n.cells[1]
+        };
+        let cells = if cells == u8::MAX {
+            Self::REACH + 1
+        } else {
+            cells
+        };
+        if cells >= 1 && (cells - 1) as f64 / g as f64 >= radius {
+            return false;
+        }
         let (x0, x1) = (cell(x.x - radius), cell(x.x + radius));
         let (y0, y1) = (cell(x.y - radius), cell(x.y + radius));
         for cy in y0..=y1 {
             for cx in x0..=x1 {
                 let c = cy * g + cx;
+                // A triangle is not listed in the cells it covers: one of another island
+                // there is as near as the cell is.
+                let k = self.cover[c];
+                if ((k[0] != u32::MAX && k[0] != own) || k[1] != u32::MAX) && {
+                    let lo = DVec2::new(cx as f64, cy as f64) / g as f64;
+                    let d = (lo - x).max(x - lo - 1.0 / g as f64).max(DVec2::ZERO);
+                    d.length() < radius
+                } {
+                    return true;
+                }
                 for &t in &self.list[self.start[c] as usize..self.start[c + 1] as usize] {
-                    if self.tri_isle[t as usize] != own
-                        && tri_distance(x, self.tris[t as usize]) < radius
-                    {
+                    if self.tri_isle[t as usize] == own {
+                        continue;
+                    }
+                    // Not within `radius` of the triangle's bounds: not of the triangle.
+                    let tri = self.tris[t as usize];
+                    let (lo, hi) = (
+                        tri[0].min(tri[1]).min(tri[2]),
+                        tri[0].max(tri[1]).max(tri[2]),
+                    );
+                    if (lo - x).max(x - hi).max(DVec2::ZERO).length_squared() >= radius * radius {
+                        continue;
+                    }
+                    if tri_distance(x, tri) < radius {
                         return true;
                     }
                 }
@@ -1806,11 +1985,17 @@ impl<'a> State<'a> {
         q: u32,
         map: &[(u32, u32)],
         tear: f64,
-        (geom2, mean2, imp): (f64, f64, f64),
+        geom: (f64, f64, f64),
     ) -> (f64, f64) {
+        self.cost_from(self.cost_attr(p, q, map), tear, geom)
+    }
+
+    /// The attribute part of [`State::cost_with`] that the tear error adds to: (attribute
+    /// error, area, skin and morph cost). With [`State::cost_from`], a cost can be worked out
+    /// again for another tear error without evaluating the attribute quadrics twice.
+    fn cost_attr(&self, p: u32, q: u32, map: &[(u32, u32)]) -> [f64; 3] {
         let qp = self.pos[q as usize];
         let (m, h) = (kernels::monomials(qp), kernels::homogeneous(qp));
-        let norm = |w: f64| self.norm(w);
         let (mut en, mut eo, mut w) = (0.0, 0.0, 0.0);
         for &(pw, qw) in map {
             let (n, o, wi) = self.attr_eval_m(pw, &m, &h, qw);
@@ -1820,11 +2005,22 @@ impl<'a> State<'a> {
             eo += o;
             w += wi;
         }
+        [en + eo, w, self.skin_morph_cost(p, q, map)]
+    }
+
+    /// [`State::cost_with`] from its attribute part ([`State::cost_attr`]).
+    #[inline]
+    fn cost_from(
+        &self,
+        [attr, w, skin]: [f64; 3],
+        tear: f64,
+        (geom2, mean2, imp): (f64, f64, f64),
+    ) -> (f64, f64) {
         let attr2 = if w > 0.0 {
-            (en + eo + tear) / norm(w)
+            (attr + tear) / self.norm(w)
         } else {
             0.0
-        } + self.skin_morph_cost(p, q, map);
+        } + skin;
         ((geom2 + attr2).sqrt() * imp, mean2)
     }
 
@@ -1888,7 +2084,7 @@ impl<'a> State<'a> {
         if self.attrs.nuv > 0 {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
             let ok = match wedges {
-                Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift).is_some(),
+                Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift),
                 None => self.uv_drift(p, q, &mut drift),
             };
             self.scratch().borrow_mut().drift = drift;
@@ -1960,7 +2156,7 @@ impl<'a> State<'a> {
         };
         self.p_corners(p, &mut corners);
         let ok = self.map_from_corners(&corners, q, &mut map).is_some()
-            && self.uv_drift_with(&corners, q, &map, out).is_some();
+            && self.uv_drift_with(&corners, q, &map, out);
         let mut s = self.scratch().borrow_mut();
         s.corners3 = corners;
         s.map3 = map;
@@ -1974,21 +2170,30 @@ impl<'a> State<'a> {
         q: u32,
         map: &[(u32, u32)],
         out: &mut Vec<(u32, f32)>,
-    ) -> Option<f64> {
+    ) -> bool {
         out.clear();
-        let mut price = 0.0;
-        for &(pw, qw) in map {
-            if pw != qw {
-                price += self.uv_merge_ok(corners, q, pw, qw, out)?;
-            }
-        }
-        Some(price)
+        map.iter()
+            .filter(|&&(pw, qw)| pw != qw)
+            .all(|&(pw, qw)| self.uv_merge_ok(corners, q, pw, qw, out))
     }
 
     /// What the gutter spill of collapsing onto `q` with wedge map `map` costs, to add to the
-    /// tear error in [`Self::cost`] (see [`SimplifyOptions::gutter_use`]); 0 for a collapse
-    /// the UV check rejects anyway.
+    /// tear error in [`Self::cost`] (see [`SimplifyOptions::gutter_use`]): for each triangle
+    /// that leaves its wedge's old fan in UV set 0, a UV error of the depth it reaches over
+    /// its area. That is the spill this collapse adds: what has drifted there before is not
+    /// in the price (it is in what [`State::uv_merge_ok`] allows), so the price depends on
+    /// the fan alone. Whether the spill is allowed at all is for `uv_merge_ok` to say; this
+    /// only ranks.
+    ///
+    /// The depth comes from the fan's shape, without clipping or sampling. A fan is
+    /// star-shaped about p, so the triangle from q's corner to a ring edge stays inside it if
+    /// q sees both ends of that edge: the fan turns less than half way round p between them,
+    /// and no ring vertex in between pokes into the line of sight. Where one does, or p itself
+    /// lies beyond the line (a reflex island boundary), the line leaves the fan by about that
+    /// vertex's distance from it. Fans too odd to order (in pieces, folded in UV, more than
+    /// [`FAN_MAX`] triangles) are not priced.
     fn spill_price(&self, corners: &[Corner], q: u32, map: &[(u32, u32)]) -> f64 {
+        const FAN_MAX: usize = 16;
         if self.fp.is_none() {
             return 0.0;
         }
@@ -2000,9 +2205,132 @@ impl<'a> State<'a> {
         {
             return 0.0;
         }
-        let mut drift = Vec::new();
-        self.uv_drift_with(corners, q, map, &mut drift)
-            .unwrap_or(0.0)
+        let set = &self.mesh.uvs[0];
+        let uv = |w: u32| set[w as usize].as_dvec2();
+        let same = |a: u32, b: u32| {
+            a == b || (uv(a) - uv(b)).length_squared() <= TEAR_SAME_UV * TEAR_SAME_UV
+        };
+        let mut price = 0.0;
+        for &(pw, qw) in map {
+            if pw == qw {
+                continue;
+            }
+            // p's fan on pw's island, as indices into `corners`.
+            let mut fan = [0usize; FAN_MAX];
+            let mut n = 0;
+            for (i, c) in corners.iter().enumerate() {
+                if same(c.pw, pw) {
+                    if n == FAN_MAX {
+                        return price;
+                    }
+                    fan[n] = i;
+                    n += 1;
+                }
+            }
+            let fan = &fan[..n];
+            let at_q = |c: &Corner| (c.pa == q && same(c.a, qw)) || (c.pb == q && same(c.b, qw));
+            if !fan.iter().any(|&i| at_q(&corners[i])) {
+                continue; // a tear: priced as one
+            }
+            // The fan in order round p: each triangle's second ring vertex is the next one's
+            // first. If every triangle has a next one the fan is closed: nothing to spill over.
+            let follows = |d: &Corner, c: &Corner| d.pa == c.pb && same(d.a, c.b);
+            if fan
+                .iter()
+                .all(|&i| fan.iter().any(|&j| follows(&corners[j], &corners[i])))
+            {
+                continue;
+            }
+            let mut firsts = fan
+                .iter()
+                .filter(|&&i| !fan.iter().any(|&j| follows(&corners[i], &corners[j])));
+            let (Some(&first), None) = (firsts.next(), firsts.next()) else {
+                continue;
+            };
+            // Triangles and ring vertices in order, and where q is among them.
+            let mut order = [0usize; FAN_MAX];
+            let mut ring = [DVec2::ZERO; FAN_MAX + 1];
+            let mut qi = None;
+            let mut cur = first;
+            ring[0] = uv(corners[cur].a);
+            if corners[cur].pa == q && same(corners[cur].a, qw) {
+                qi = Some(0);
+            }
+            let mut whole = true;
+            for k in 0..n {
+                let c = &corners[cur];
+                order[k] = cur;
+                ring[k + 1] = uv(c.b);
+                if c.pb == q && same(c.b, qw) {
+                    qi = Some(k + 1);
+                }
+                if k + 1 < n {
+                    match fan.iter().find(|&&j| follows(&corners[j], c)) {
+                        Some(&next) => cur = next,
+                        None => {
+                            whole = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            let (Some(qi), true) = (qi, whole) else {
+                continue;
+            };
+            let ring = &ring[..=n];
+            // All triangles must wind the same way round p.
+            let pu = uv(pw);
+            let turn = (ring[0] - pu).perp_dot(ring[1] - pu);
+            if turn == 0.0
+                || (1..n).any(|k| (ring[k] - pu).perp_dot(ring[k + 1] - pu) * turn <= 0.0)
+            {
+                continue;
+            }
+            // How far the line of sight from q to ring vertex j leaves the fan.
+            let depth = |j: usize| {
+                let (lo, hi) = (qi.min(j), qi.max(j));
+                if hi - lo <= 1 {
+                    return 0.0;
+                }
+                let (a, b) = (ring[lo], ring[hi]);
+                let chord = b - a;
+                let l2 = chord.length_squared();
+                if l2 == 0.0 {
+                    return 0.0;
+                }
+                // Positive on the fan's side of the line.
+                let side = |x: DVec2| chord.perp_dot(x - a) * turn.signum();
+                let off = |x: DVec2| {
+                    let k = ((x - a).dot(chord) / l2).clamp(0.0, 1.0);
+                    (x - (a + chord * k)).length()
+                };
+                let mut d: f64 = 0.0;
+                if side(pu) <= 0.0 {
+                    d = off(pu);
+                }
+                for &x in &ring[lo + 1..hi] {
+                    if side(x) > 0.0 {
+                        d = d.max(off(x));
+                    }
+                }
+                // (Less than the UVs resolve is no spill: boundaries that are straight but
+                // for round-off cost nothing.)
+                if d < SPILL_MIN { 0.0 } else { d }
+            };
+            // Triangle k has ring vertices k and k + 1; those at q die.
+            for k in (0..n).filter(|&k| k != qi && k + 1 != qi) {
+                let reach = depth(k).max(depth(k + 1));
+                if reach <= 0.0 {
+                    continue;
+                }
+                let c = &corners[order[k]];
+                let x = [q, c.pa, c.pb].map(|v| self.pos[v as usize]);
+                let area3 = (x[1] - x[0]).cross(x[2] - x[0]).length() * 0.5;
+                let deep = SPILL_PRICE * reach;
+                price += self.attrs.uv_weight * area3 * deep * deep;
+            }
+        }
+        price
     }
 
     fn record_drift(&mut self, drift: &[(u32, f32)]) {
@@ -2018,8 +2346,7 @@ impl<'a> State<'a> {
     /// lies on the island; whatever it covers outside is texture gutter. That spill, as the
     /// height of a sliver over the triangle's longest edge, is added to the drift already at
     /// its corners and capped at [`DRIFT_UV`], or, with [`SimplifyOptions::gutter_use`], at
-    /// what the gutter there has room for. `None` if the merge is not allowed; otherwise what
-    /// its spill costs (0 without `gutter_use`).
+    /// what the gutter there has room for. False if the merge is not allowed.
     fn uv_merge_ok(
         &self,
         corners: &[Corner],
@@ -2027,8 +2354,7 @@ impl<'a> State<'a> {
         pw: u32,
         qw: u32,
         out: &mut Vec<(u32, f32)>,
-    ) -> Option<f64> {
-        let mut price = 0.0;
+    ) -> bool {
         let same =
             |a: Vec2, b: Vec2| (a - b).length_squared() as f64 <= TEAR_SAME_UV * TEAR_SAME_UV;
         let carried = self.drift[pw as usize];
@@ -2056,7 +2382,7 @@ impl<'a> State<'a> {
                 let before = (a - uv(c.pw)).perp_dot(b - uv(c.pw));
                 let after = (a - q2).perp_dot(b - q2);
                 if before * after < 0.0 || (before != 0.0 && after == 0.0) {
-                    return None; // folds over in UV
+                    return false; // folds over in UV
                 }
                 if closed {
                     continue;
@@ -2087,9 +2413,14 @@ impl<'a> State<'a> {
                 };
                 let mut probes: Vec<DVec2> = Vec::new();
                 let gap = |x: DVec2| {
-                    fan()
-                        .map(|o| tri_distance(x, [uv(o.pw), uv(o.a), uv(o.b)]))
-                        .fold(f64::INFINITY, f64::min)
+                    let mut least = f64::INFINITY;
+                    for o in fan() {
+                        least = least.min(tri_distance(x, [uv(o.pw), uv(o.a), uv(o.b)]));
+                        if least == 0.0 {
+                            break;
+                        }
+                    }
+                    least
                 };
                 let mut reach = 0.0f64;
                 for end in [a, b] {
@@ -2116,7 +2447,7 @@ impl<'a> State<'a> {
                         }
                     }
                     if near + reach > cap {
-                        return None;
+                        return false;
                     }
                 }
                 let drift = near + reach;
@@ -2132,21 +2463,16 @@ impl<'a> State<'a> {
                             + self.opts.texel_size.max(0.0) as f64;
                         let own = self.isle[pw as usize];
                         if probes.iter().any(|&y| fp.blocked(y, own, need)) {
-                            return None;
+                            return false;
                         }
                     }
-                    // Priced like a UV error of the spill's depth over the moved triangle.
-                    let x = [q, c.pa, c.pb].map(|v| self.pos[v as usize]);
-                    let area3 = (x[1] - x[0]).cross(x[2] - x[0]).length() * 0.5;
-                    let depth = SPILL_PRICE * drift;
-                    price += self.attrs.uv_weight * area3 * depth * depth;
                 }
                 for w in [qw, c.a, c.b] {
                     out.push((w, drift as f32));
                 }
             }
         }
-        Some(price)
+        true
     }
 
     /// Debug (`LF_STALL`): why each live position has no collapse left.
@@ -2280,7 +2606,7 @@ impl<'a> State<'a> {
         if !self.pos_alive[p as usize] || self.locked[p as usize] {
             return None;
         }
-        let (mut nbrs, mut bounds, mut costed, mut maps, mut map, mut corners) = {
+        let (mut nbrs, mut bounds, mut costed, mut maps, mut map, mut corners, mut spill) = {
             let mut s = self.scratch().borrow_mut();
             (
                 std::mem::take(&mut s.nbr_b),
@@ -2289,8 +2615,10 @@ impl<'a> State<'a> {
                 std::mem::take(&mut s.maps),
                 std::mem::take(&mut s.map),
                 std::mem::take(&mut s.corners),
+                std::mem::take(&mut s.spill),
             )
         };
+        spill.clear();
         let put_back = |nbrs, bounds, costed, maps, map, corners| {
             let mut s = self.scratch().borrow_mut();
             s.nbr_b = nbrs;
@@ -2345,12 +2673,30 @@ impl<'a> State<'a> {
                 let (a, b) = (&costed[i], &costed[j]);
                 a.0.total_cmp(&b.0).then_with(|| rank(a.2).cmp(&rank(b.2)))
             });
+            if let Some(i) = cheapest
+                && spill[i].2 == UNPRICED
+            {
+                // A candidate is costed without its gutter spill (a lower bound) and the
+                // spill is priced only once it is the cheapest: the choice is the same as
+                // with every candidate priced, and most never need pricing.
+                let (tear, b, _, attr) = spill[i];
+                let c = costed[i];
+                let m = &maps[c.3 as usize..c.4 as usize];
+                let price = self.spill_price(&corners, c.2, m);
+                if price > 0.0 {
+                    let (_, geom2, mean2, imp, _) = bounds[b as usize];
+                    costed[i].0 = self.cost_from(attr, tear + price, (geom2, mean2, imp)).0;
+                }
+                spill[i].2 = PRICED;
+                continue;
+            }
             if let Some(i) = cheapest {
                 let c = costed[i];
                 // Settled once no uncosted candidate can beat or tie it: their costs are at
                 // least their bounds, which are at least `bounds[next].0`.
                 if bounds.get(next).is_none_or(|b| c.0.total_cmp(&b.0).is_lt()) {
                     costed.swap_remove(i);
+                    spill.swap_remove(i);
                     if !validate {
                         break Some(Candidate {
                             cost: c.0,
@@ -2377,13 +2723,16 @@ impl<'a> State<'a> {
             };
             next += 1;
             if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
-                let tear = tear + self.spill_price(&corners, q, &map);
-                let (c, g) = self.cost_with(p, q, &map, tear, (geom2, mean2, imp));
+                let attr = self.cost_attr(p, q, &map);
+                let (c, g) = self.cost_from(attr, tear, (geom2, mean2, imp));
                 let start = maps.len() as u32;
                 maps.extend_from_slice(&map);
                 costed.push((c, g, q, start, maps.len() as u32));
+                let known = if self.fp.is_some() { UNPRICED } else { PRICED };
+                spill.push((tear, next as u32 - 1, known, attr));
             }
         };
+        self.scratch().borrow_mut().spill = spill;
         put_back(nbrs, bounds, costed, maps, map, corners);
         best
     }
@@ -3335,8 +3684,18 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                             return (x, None);
                         }
                         if let Some(tear) = shared.map_from_corners(corners, q, map) {
-                            let tear = tear + shared.spill_price(corners, q, map);
-                            (x, Some(shared.cost(x, q, map, tear)))
+                            // Without its gutter spill the cost is a lower bound: the spill
+                            // is priced only if that could beat the candidate x has.
+                            let (attr, geom) =
+                                (shared.cost_attr(x, q, map), shared.cost_geom(x, q));
+                            let mut c = shared.cost_from(attr, tear, geom);
+                            if cand_ref[x as usize].is_some_and(|old| c.0 < old.cost) {
+                                let price = shared.spill_price(corners, q, map);
+                                if price > 0.0 {
+                                    c = shared.cost_from(attr, tear + price, geom);
+                                }
+                            }
+                            (x, Some(c))
                         } else {
                             (x, None)
                         }
@@ -3735,33 +4094,36 @@ fn simplify_frame(
         PartsMode::Final(g) => g,
         _ => 0.0,
     };
-    // The source UV islands, if they may spill into the gutter around them and the caller
-    // has not found them on the mesh this one is a piece of.
-    let own_fp = (room.is_none() && gutter_on(mesh, opts))
-        .then(|| UvFootprint::new(mesh, &position_ids(mesh)));
-    let room = room.or_else(|| {
-        own_fp.as_ref().map(|fp| UvRoom {
-            fp,
-            isle: fp.isle.clone(),
-            drift: vec![0.0; mesh.vertex_count()],
-        })
-    });
+    // The part analysis and (if UV islands may spill into the gutter around them, and the
+    // caller has not found them on the mesh this one is a piece of) the source UV islands are
+    // worked out alongside building the reducer state.
+    let wants_fp = room.is_none() && gutter_on(mesh, opts);
     let mut room = Some(room);
-    // The part analysis runs alongside building the reducer state.
-    let (parts, mut st) = rayon::join(
+    let own_fp;
+    let (parts, mut st);
+    ((parts, st), own_fp) = rayon::join(
         || {
-            wants_parts
-                .then(|| {
-                    crate::reduce::parts::Parts::analyze(
-                        mesh,
-                        opts.locked_vertices.as_deref(),
-                        &opts.transparent_materials,
-                    )
-                })
-                .flatten()
+            rayon::join(
+                || {
+                    wants_parts
+                        .then(|| {
+                            crate::reduce::parts::Parts::analyze(
+                                mesh,
+                                opts.locked_vertices.as_deref(),
+                                &opts.transparent_materials,
+                            )
+                        })
+                        .flatten()
+                },
+                || State::new(mesh, opts, frame, room.take().flatten()),
+            )
         },
-        || State::new(mesh, opts, frame, room.take().flatten()),
+        || wants_fp.then(|| UvFootprint::new(mesh, &position_ids(mesh))),
     );
+    if let Some(fp) = &own_fp {
+        st.fp = Some(fp);
+        st.isle = fp.isle.clone();
+    }
     st.parts = parts;
     st.prior_geom2 = prior;
     let (alive_tris, worst_geom2, collapses) = run_dispatch(&mut st, target);
