@@ -645,11 +645,15 @@ first version of this option, `gutter_tolerance`, removed) scored higher in rend
 and 25.24 dB at 10% for 0.01 and 0.05) but put 0.51% of UV area over half a texel into the
 gutter at 0.05 and, on the watch, nearly all of its spill inside another island.
 
-It is off by default until its cost is timed on a quiet machine (the flattened car may be 1.4
-to 2.8 times slower with it on; the dragon was inconclusive), and because
+It is off by default because of its cost and because
 `uv_islands_never_spill_into_the_gutter` asserts the old rule. The closest-point UV metric
 overstates slides (a seam moved by one edge length reads as a jump between islands), so the
 UV columns here are harsher on the default reducer than a render is.
+
+Time with it on, on a GitHub-hosted Linux runner (`Bench` workflow's `run` job, each asset as
+one mesh to 10,000 triangles, best of 3): dragon scene 575 → 1,386 ms, car 1,521 → 2,659 ms,
+watch 630 → 1,249 ms, about twice as long. Probing every spill against the source triangles
+is the cost; it needs to get cheaper before the option can be on by default.
 
 ### Aggressive targets (v14)
 
