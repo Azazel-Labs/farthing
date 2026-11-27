@@ -1255,6 +1255,31 @@ to crack against, but one call cannot tell. Sealing at most a third of shared ve
 leaves gaps of 0.15 to 1% of the diagonal on average: meshes reduced apart diverge whatever
 the border rule, and `lock_border` or reducing a scene as one mesh are what close them.
 
+### Realtime: border planes per position (v24)
+
+Realtime finds open borders without an edge table, from sums of each vertex's next and
+previous corner ids. Those sums were kept per vertex, so on an unwelded mesh each copy of a
+vertex held only a piece of its fan, every piece read as an open border, and the border planes
+went in at full weight. The dragon scene's cloth (62,570 vertices on 22,199 positions) was
+nailed flat by them. Corners now count by position, so the copies at one position facing one
+way add up to the whole fan, and a third sum (a non-linear mix of the corner ids, kept in the
+sums' padding) rejects fans of two arcs that the two-moment recovery read as borders. On the
+cloth, mean distance falls from 5.65e-4 to 2.19e-4 and normal error from 4.0° to 2.1°.
+
+| rendered PSNR, dB | 10%: before | now | 3%: before | now |
+|---|---|---|---|---|
+| ChronographWatch | 19.78 | 20.02 | 15.33 | 15.32 |
+| DragonAttenuation | 26.85 | 28.80 | 21.48 | 24.66 |
+| other nine assets | within ±0.06 | | within ±0.06 | |
+| mean of 11 | 24.19 | 24.38 | 20.23 | 20.52 |
+
+Shared borders sealed between separately reduced meshes (`bench-compare rtcrack`): watch
+30.3% to 40.0% at 10% and 11.6% to 14.7% at 3%; car 32.2% to 34.3% and 17.3% to 17.4%. Time on
+a hosted runner (4 cores, minimum of 12 rounds, same run): no measurable cost (watch 30.90 to
+30.38 ms, car 57.49 to 57.15, dragon 28.83 to 27.62 at 10%). `bench-compare rtmesh` gives
+per-mesh distance and normal blame against the default reducer, and `rtsolo` writes one file
+per mesh with only that mesh reduced, for rendered blame.
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
