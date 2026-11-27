@@ -319,11 +319,27 @@ const DRIFT_UV: f64 = 1.0 / 2048.0;
 const SPILL_SAMPLES: usize = 8;
 /// Weight of the constraint planes along creases, relative to open borders' `border_weight`:
 /// each face adds a plane through each of its edges, perpendicular to the face, weighted by
-/// edge length² × this × (1 − cos dihedral) / 2. Without them a vertex sliding along a sharp
-/// edge costs only the area of the faces beside it, so the outline of a thin closed part (a
-/// panel or slab whose rims are a few narrow faces) slides freely in its plane until the part
-/// is a sliver; UV seams along such rims used to hide this, a seamless atlas exposes it.
+/// edge length² (capped on gentle creases, see `CREASE_SLIVER_AREA`) × this × (1 − cos
+/// dihedral) / 2. Without them a vertex sliding along a sharp edge costs only the area of the
+/// faces beside it, so the outline of a thin closed part (a panel or slab whose rims are a few
+/// narrow faces) slides freely in its plane until the part is a sliver; UV seams along such
+/// rims used to hide this, a seamless atlas exposes it.
 const CREASE_WEIGHT: f64 = 1.0;
+/// A gentle crease's plane (dihedral under 30°, see `CREASE_GENTLE`) weighs at most this times
+/// its face's area, in place of its edge length². On a smooth surface tessellated in long
+/// strips (a cylinder's side, a bevel) the faces beside the crease already price a vertex
+/// moving across it; uncapped, the plane of a long edge outweighed them several times over and
+/// pinned every strip, so the outline of a bottle cap, a post or a dial came out lopsided for
+/// lack of vertices. Sharp creases keep the full weight: there the face across may be the
+/// narrow rim of a thin part, whose outline only the crease plane holds.
+const CREASE_SLIVER_AREA: f64 = 12.0;
+/// Crease value, (1 − cos dihedral) / 2, under which a crease counts as gentle: 30°.
+const CREASE_GENTLE: f64 = 0.067;
+/// The normal term grows with the area a wedge stands for (see `State::cost_attr`) up to this
+/// many average input triangles. Past it, at aggressive targets, the growth made normals
+/// outbid the shape: dense smooth meshes (the dragon, the watch) kept the shading of a few
+/// wide regions and gave up silhouette and surface for it.
+const NORMAL_GROWTH_MAX: f64 = 32.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Validity {
@@ -1433,7 +1449,8 @@ impl<'a> State<'a> {
             let mut border = [None; 3];
             for (i, slot) in border.iter_mut().enumerate() {
                 let (e0, e1v) = (p[i], p[(i + 1) % 3]);
-                let w = if bnbr[e0 as usize].contains(&e1v) {
+                let is_border = bnbr[e0 as usize].contains(&e1v);
+                let w = if is_border {
                     opts.border_weight as f64
                 } else {
                     CREASE_WEIGHT * crease[i]
@@ -1442,12 +1459,12 @@ impl<'a> State<'a> {
                     let (x0, x1) = (pos[e0 as usize], pos[e1v as usize]);
                     let dir = x1 - x0;
                     let bn = dir.cross(nn).normalize_or_zero();
+                    let mut len2 = dir.length_squared();
+                    if !is_border && crease[i] < CREASE_GENTLE {
+                        len2 = len2.min(CREASE_SLIVER_AREA * area);
+                    }
                     if bn != DVec3::ZERO {
-                        *slot = Some(Quadric::constraint(
-                            bn,
-                            -bn.dot(x0),
-                            dir.length_squared() * w,
-                        ));
+                        *slot = Some(Quadric::constraint(bn, -bn.dot(x0), len2 * w));
                     }
                 }
             }
@@ -2082,8 +2099,9 @@ impl<'a> State<'a> {
         for &(pw, qw) in map {
             let (n, o, wi) = self.attr_eval_m(pw, &m, &h, qw);
             // A normal deviation over a region of area A shades like a bump of height ~θ·√A:
-            // weight it by region size so normals keep mattering as triangles grow.
-            en += n * (wi / self.avg_area);
+            // weight it by region size so normals keep mattering as triangles grow, up to
+            // NORMAL_GROWTH_MAX.
+            en += n * (wi / self.avg_area).min(NORMAL_GROWTH_MAX);
             eo += self.uv_capped(o, wi);
             w += wi;
         }
