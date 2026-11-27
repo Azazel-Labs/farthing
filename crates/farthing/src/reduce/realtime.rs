@@ -229,10 +229,12 @@ struct Node {
     st: [f64; NS],
 }
 
-/// A fine cell: a range of the Morton order and its sums.
+/// A fine cell: a range of the Morton order, the codes at its two ends, and its sums.
 struct FCell {
     s: u32,
     e: u32,
+    c0: u32,
+    c1: u32,
     st: [f32; NS],
 }
 
@@ -815,11 +817,14 @@ fn realtime_pass(
             .map(|w| FCell {
                 s: w[0],
                 e: w[1],
+                c0: 0,
+                c1: 0,
                 st: [0.0; NS],
             })
             .collect()
     };
     fcells.par_iter_mut().with_min_len(16).for_each(|f| {
+        (f.c0, f.c1) = (code(f.s as usize), code(f.e as usize - 1));
         for r in f.s as usize..f.e as usize {
             vstats(&mut f.st, &vq(r), &vs[r], spos[r]);
         }
@@ -828,8 +833,9 @@ fn realtime_pass(
 
     // Refinement: split the worst cell until there are enough.
     let cube_to_unit = (ext * inv) as f64;
-    let vlevel = |s: usize, e: usize| -> u32 {
-        let x = code(s) ^ code(e - 1);
+    // The level of a range whose first and last codes are these.
+    let vlevel = |first: u32, last: u32| -> u32 {
+        let x = first ^ last;
         if x == 0 {
             DEPTH
         } else {
@@ -858,7 +864,7 @@ fn realtime_pass(
         nodes.push(Node {
             fs: 0,
             fe: fcells.len() as u32,
-            level: vlevel(0, nv),
+            level: vlevel(code(0), code(nv - 1)),
             st,
         });
     }
@@ -876,23 +882,25 @@ fn realtime_pass(
                 let mut f = FCell {
                     s: r as u32,
                     e: 0,
+                    c0: code(r),
+                    c1: 0,
                     st: [0.0; NS],
                 };
                 while r < e && (code(r) >> shift) & 7 == d {
                     vstats(&mut f.st, &vq(r), &vs[r], spos[r]);
                     r += 1;
                 }
-                f.e = r as u32;
+                (f.e, f.c1) = (r as u32, code(r - 1));
                 fcells.push(f);
             }
             fe = fcells.len();
         }
         let mut k = fs;
         while k < fe {
-            let d = (code(fcells[k].s as usize) >> shift) & 7;
+            let d = (fcells[k].c0 >> shift) & 7;
             let start = k;
             let mut st = [0f64; NS];
-            while k < fe && (code(fcells[k].s as usize) >> shift) & 7 == d {
+            while k < fe && (fcells[k].c0 >> shift) & 7 == d {
                 for (a, b) in st.iter_mut().zip(&fcells[k].st) {
                     *a += *b as f64;
                 }
@@ -902,7 +910,7 @@ fn realtime_pass(
             nodes.push(Node {
                 fs: start as u32,
                 fe: k as u32,
-                level: vlevel(fcells[start].s as usize, fcells[k - 1].e as usize),
+                level: vlevel(fcells[start].c0, fcells[k - 1].c1),
                 st,
             });
         }
