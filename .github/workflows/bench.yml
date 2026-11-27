@@ -36,6 +36,9 @@ on:
       fast:
         description: "Time fast mode instead: triangle target, such as 10000 (base and head take turns)"
         default: ""
+      features:
+        description: "bench-compare Cargo features for every build, such as 'system-alloc'"
+        default: ""
 
 permissions:
   contents: read
@@ -70,14 +73,16 @@ jobs:
           done
       - name: Build
         shell: bash
+        env:
+          FEATURES: ${{ inputs.features }}
         run: |
-          (cd base/bench-compare && cargo build --release --locked)
-          (cd head/bench-compare && cargo build --release --locked)
+          (cd base/bench-compare && cargo build --release --locked ${FEATURES:+--features "$FEATURES"})
+          (cd head/bench-compare && cargo build --release --locked ${FEATURES:+--features "$FEATURES"})
       - name: Machine
         shell: bash
         run: |
           { echo '```'; (lscpu 2>/dev/null | grep -E 'Model name|^CPU\(s\)|Thread|Core' || powershell -c "(Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores,NumberOfLogicalProcessors | Format-List | Out-String).Trim()" || echo unknown); echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          echo "base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "base $(git -C base rev-parse --short HEAD), head $(git -C head rev-parse --short HEAD), features: ${{ inputs.features || 'default' }}" >> "$GITHUB_STEP_SUMMARY"
       - name: Time
         shell: bash
         run: |
@@ -152,7 +157,9 @@ jobs:
           done
       - name: Build
         shell: bash
-        run: cd bench-compare && cargo build --release --locked
+        env:
+          FEATURES: ${{ inputs.features }}
+        run: cd bench-compare && cargo build --release --locked ${FEATURES:+--features "$FEATURES"}
       - name: Run
         shell: bash
         env:
@@ -197,9 +204,11 @@ jobs:
           done
       - name: Build
         shell: bash
+        env:
+          FEATURES: ${{ inputs.features }}
         run: |
-          (cd base/bench-compare && cargo build --release --locked)
-          (cd head/bench-compare && cargo build --release --locked)
+          (cd base/bench-compare && cargo build --release --locked ${FEATURES:+--features "$FEATURES"})
+          (cd head/bench-compare && cargo build --release --locked ${FEATURES:+--features "$FEATURES"})
       - name: Time
         shell: bash
         env:
