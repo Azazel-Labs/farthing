@@ -16,6 +16,9 @@
 //!    target triangle (about twice the target in triangles). A leaf cell holding a tube or
 //!    strut narrower than itself, which would fall to one point and vanish, is instead cut
 //!    into sectors around the part's axis when that removes enough error for its clusters.
+//!    A leaf cell at an open border whose border vertices turn away from the rest (a sheet's
+//!    edge turned down, such as glass modeled with its thickness) is cut in two, so the
+//!    turned-down strip keeps its width.
 //! 2. **Clusters as vertices.** Each cluster keeps the summed quadric of the original surface
 //!    and is represented by its member vertex of least error (vertices are never invented, so
 //!    attributes stay exact). Members joined by an edge inside the cluster share a wedge:
@@ -102,13 +105,19 @@ const THIN_SECTORS: usize = 3;
 const THIN_GAIN: f64 = 0.05;
 /// No thin splits on a mesh with open borders whose cluster budget is below this.
 const THIN_OPEN_MIN_TARGET: usize = 300;
+/// A cell is cut at an open border with a crease beside it (see `cheap_flange`) when the
+/// normals of its border positions and of the rest meet at a cosine below `FLANGE_COS`, and
+/// the rest's normals keep at least `FLANGE_REST` of their area.
+const FLANGE_COS: f64 = 0.5;
+const FLANGE_REST: f64 = 0.7;
 
 /// Vertices per parallel chunk, and the most chunks; items per task for parallel maps.
 const CHUNK_VERTS: usize = 4096;
 const MAX_CHUNKS: usize = 128;
 const PAR_MIN: usize = 4096;
-/// Refinement sums: quadric (10), area, area-weighted normal (3), area-weighted position (3).
-const NS: usize = 17;
+/// Refinement sums: quadric (10), area, area-weighted normal (3), area-weighted position (3),
+/// and over vertices at an open-border position, area-weighted normal (3) and area.
+const NS: usize = 21;
 type Q = [f64; 10];
 /// A thin cell's axes: its two cross-section directions and its centroid.
 type Axes = ([f64; 3], [f64; 3], [f64; 3]);
@@ -387,9 +396,10 @@ fn vertex_quadric(v: usize, s: &VSum, upos: &[Vec3], bw: f32, borders: [u32; 2])
     q
 }
 
-/// Adds a vertex to refinement sums: quadric, area, area-weighted normal and position.
+/// Adds a vertex to refinement sums: quadric, area, area-weighted normal and position, and
+/// its normal and area again when it stands at an open-border position (`border`).
 #[inline]
-fn vstats(st: &mut [f32; NS], q: &[f32; 10], s: &VSum, p: Vec3) {
+fn vstats(st: &mut [f32; NS], q: &[f32; 10], s: &VSum, p: Vec3, border: bool) {
     for i in 0..10 {
         st[i] += q[i];
     }
@@ -400,6 +410,12 @@ fn vstats(st: &mut [f32; NS], q: &[f32; 10], s: &VSum, p: Vec3) {
     st[14] += s.area * p.x;
     st[15] += s.area * p.y;
     st[16] += s.area * p.z;
+    if border {
+        st[17] += s.n[0];
+        st[18] += s.n[1];
+        st[19] += s.n[2];
+        st[20] += s.area;
+    }
 }
 
 impl VSum {
@@ -707,6 +723,7 @@ scratch! {
     vs: Vec<VSum>,
     spill: Vec<Vec<(u32, VSum)>>,
     borders: Vec<[u32; 2]>,
+    bflag: Vec<bool>,
     starts: Vec<u32>,
     fcells: Vec<FCell>,
     nodes: Vec<Node>,
@@ -714,6 +731,7 @@ scratch! {
     kids: Vec<u32>,
     heap: BinaryHeap<(u64, std::cmp::Reverse<u32>)>,
     tstate: Vec<u8>,
+    fl: Vec<bool>,
     tinfo: std::collections::HashMap<u32, Thin>,
     pending: Vec<u32>,
     found: Vec<Option<Thin>>,
@@ -1037,40 +1055,90 @@ fn realtime_pass(
     const NONE: [u32; 2] = [u32::MAX; 2];
     let bw = opts.border_weight;
     if bw > 0.0 {
-        (0..nv)
-            .into_par_iter()
-            .with_min_len(PAR_MIN)
-            .map(|r| {
-                let (p, f) = (spos[r], first_at[r] as usize);
-                let n = Vec3::from_array(vs[r].n);
-                let n2 = n.length_squared();
-                // Facing within about 154° of each other (cos > −0.9), without the root.
-                let facing = |q: usize| {
-                    let m = Vec3::from_array(vs[q].n);
-                    let d = n.dot(m);
-                    !(d < 0.0 && d * d >= 0.81 * n2 * m.length_squared())
-                };
-                if (f..r).any(facing) {
-                    return NONE;
+        let holder = |r: usize| {
+            let (p, f) = (spos[r], first_at[r] as usize);
+            let n = Vec3::from_array(vs[r].n);
+            let n2 = n.length_squared();
+            // Facing within about 154° of each other (cos > −0.9), without the root.
+            let facing = |q: usize| {
+                let m = Vec3::from_array(vs[q].n);
+                let d = n.dot(m);
+                !(d < 0.0 && d * d >= 0.81 * n2 * m.length_squared())
+            };
+            if (f..r).any(facing) {
+                return NONE;
+            }
+            let mut sum = vs[r];
+            let mut q = r + 1;
+            while q < nv && spos[q] == p {
+                if facing(q) {
+                    sum.add(&vs[q]);
                 }
-                let mut sum = vs[r];
-                let mut q = r + 1;
-                while q < nv && spos[q] == p {
-                    if facing(q) {
-                        sum.add(&vs[q]);
+                q += 1;
+            }
+            match fan_ends(f, &sum, nv) {
+                Some([a, b]) if a != b => [a as u32, b as u32],
+                _ => NONE,
+            }
+        };
+        // Whether each vertex stands at an open-border position: a copy there facing its way
+        // holds border planes (the back of a double-sided sheet faces the other way and is not
+        // on that border). The copies split by a seam fall on the same side of a flange cut.
+        // Both worked out per position run, a run straddling a chunk's end in both chunks.
+        // Every entry is written below, so the buffers are only sized here.
+        let (mut borders, mut bflag) =
+            (std::mem::take(&mut s.borders), std::mem::take(&mut s.bflag));
+        borders.resize(nv, NONE);
+        bflag.resize(nv, false);
+        borders
+            .par_chunks_mut(PAR_MIN)
+            .zip(bflag.par_chunks_mut(PAR_MIN))
+            .enumerate()
+            .for_each(|(k, (ob, of))| {
+                let (lo, hi) = (k * PAR_MIN, k * PAR_MIN + ob.len());
+                let mut run: Vec<[u32; 2]> = Vec::new();
+                let mut r = lo;
+                while r < hi {
+                    let (p, f) = (spos[r], first_at[r] as usize);
+                    let mut e = r + 1;
+                    while e < nv && spos[e] == p {
+                        e += 1;
                     }
-                    q += 1;
+                    if e - f == 1 {
+                        let b = holder(r);
+                        (ob[r - lo], of[r - lo]) = (b, b != NONE);
+                        r = e;
+                        continue;
+                    }
+                    run.clear();
+                    run.extend((f..e).map(holder));
+                    let any = run.iter().any(|b| *b != NONE);
+                    for x in r..e.min(hi) {
+                        ob[x - lo] = run[x - f];
+                        of[x - lo] = any && {
+                            let n = Vec3::from_array(vs[x].n);
+                            let n2 = n.length_squared();
+                            (f..e).any(|q| {
+                                if run[q - f] == NONE {
+                                    return false;
+                                }
+                                let m = Vec3::from_array(vs[q].n);
+                                let d = n.dot(m);
+                                !(d < 0.0 && d * d >= 0.81 * n2 * m.length_squared())
+                            })
+                        };
+                    }
+                    r = e;
                 }
-                match fan_ends(f, &sum, nv) {
-                    Some([a, b]) if a != b => [a as u32, b as u32],
-                    _ => NONE,
-                }
-            })
-            .collect_into_vec(&mut s.borders);
+            });
+        (s.borders, s.bflag) = (borders, bflag);
     } else {
         s.borders.clear();
+        s.bflag.clear();
     }
     let borders = &s.borders[..];
+    let bflag = &s.bflag[..];
+    let at_border = |r: usize| bflag.get(r).copied().unwrap_or(false);
     // Importance scales a vertex's error, so clusters stay finer and collapse later there.
     let importance = opts.vertex_importance.as_deref();
     let vq = |r: usize| {
@@ -1158,7 +1226,7 @@ fn realtime_pass(
     fcells.par_iter_mut().with_min_len(16).for_each(|f| {
         (f.c0, f.c1) = (code(f.s as usize), code(f.e as usize - 1));
         for r in f.s as usize..f.e as usize {
-            vstats(&mut f.st, &vq(r), &vs[r], spos[r]);
+            vstats(&mut f.st, &vq(r), &vs[r], spos[r], at_border(r));
         }
     });
     lap("fine");
@@ -1214,6 +1282,25 @@ fn realtime_pass(
         let t = a + d + g;
         let s2 = a * d - b * b + a * g - c * c + d * g - f * f;
         s2 >= THIN_SPREAD * t * t
+    };
+    // A cell holding an open border with a crease beside it (a sheet's edge turned down, as
+    // on glass modeled with its thickness): the normals at its border positions turn from
+    // those of the rest by more than `FLANGE_COS`, and the rest is one surface (its normals
+    // cancel by less than `FLANGE_REST`; the open end of a tube, whose border normals point
+    // all ways, is not a flange). One cluster would press the turned-down strip flat into
+    // the sheet and lose its shading, so such a cell is cut in two, border positions and the
+    // rest, and counted as two clusters while it is a leaf.
+    let cheap_flange = |st: &[f64; NS]| -> bool {
+        let (ab, ar) = (st[20], st[10] - st[20]);
+        if !(ab > 0.0 && ar > 1e-6 * st[10]) {
+            return false;
+        }
+        let nb = [st[17], st[18], st[19]];
+        let nr = [st[11] - nb[0], st[12] - nb[1], st[13] - nb[2]];
+        let d = nb[0] * nr[0] + nb[1] * nr[1] + nb[2] * nr[2];
+        let lb = nb[0] * nb[0] + nb[1] * nb[1] + nb[2] * nb[2];
+        let lr = nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2];
+        lr >= FLANGE_REST * FLANGE_REST * ar * ar && d < FLANGE_COS * (lb * lr).sqrt()
     };
     // The sector of a thin cell a position falls in, by its angle around the part's axis.
     let sector_of = |p: Vec3, t: &Axes| -> usize {
@@ -1295,7 +1382,13 @@ fn realtime_pass(
         );
         let mut parts = [[0f32; NS]; THIN_SECTORS];
         for r in s as usize..e as usize {
-            vstats(&mut parts[sector_of(spos[r], &t)], &vq(r), &vs[r], spos[r]);
+            vstats(
+                &mut parts[sector_of(spos[r], &t)],
+                &vq(r),
+                &vs[r],
+                spos[r],
+                at_border(r),
+            );
         }
         let after: f64 = parts
             .iter()
@@ -1337,7 +1430,7 @@ fn realtime_pass(
                     st: [0.0; NS],
                 };
                 while r < e && (code(r) >> shift) & 7 == d {
-                    vstats(&mut f.st, &vq(r), &vs[r], spos[r]);
+                    vstats(&mut f.st, &vq(r), &vs[r], spos[r], at_border(r));
                     r += 1;
                 }
                 (f.e, f.c1) = (r as u32, code(r - 1));
@@ -1391,7 +1484,9 @@ fn realtime_pass(
     let mut tinfo = std::mem::take(&mut s.tinfo);
     tinfo.clear();
     let (mut pending, mut found) = (std::mem::take(&mut s.pending), std::mem::take(&mut s.found));
-    let mut count = 1 + tstate[0] as usize * extra;
+    // Flange cells (see `cheap_flange`) count one extra cluster while they are leaves.
+    let mut fl: Vec<bool> = filled(std::mem::take(&mut s.fl), 1, cheap_flange(&nodes[0].st));
+    let mut count = 1 + tstate[0] as usize * extra + fl[0] as usize;
     if let Some(k) = k_target {
         loop {
             while count < k {
@@ -1402,13 +1497,16 @@ fn realtime_pass(
                     count -= extra;
                 }
                 tstate[i as usize] = 0;
+                count -= fl[i as usize] as usize;
                 split(&mut nodes, &mut fcells, i as usize, &mut kids);
                 count += kids.len() - 1;
                 for &c in &kids {
                     let n = &nodes[c as usize];
                     let t = reserve(n);
                     tstate.push(t);
-                    count += t as usize * extra;
+                    let f = cheap_flange(&n.st);
+                    fl.push(f);
+                    count += t as usize * extra + f as usize;
                     if n.level == DEPTH {
                         leaves.push(c);
                     } else {
@@ -1496,8 +1594,43 @@ fn realtime_pass(
     let mut cell_st: Vec<[f64; NS]> = reuse(std::mem::take(&mut s.cell_st), ncell);
     let mut chunks: Vec<[usize; 4]> = Vec::new();
     let (mut r0, mut c0) = (0usize, 0usize);
-    let mut nsplit = 0;
+    let (mut nsplit, mut nflange) = (0, 0);
+    // Flange cells' two parts, worked out ahead (in parallel when there is enough work):
+    // border positions summed over their vertices, the rest as the cell less those. A cell
+    // that turns out thin below drops its parts.
+    let fcand: Vec<usize> = (0..cells.len())
+        .filter(|&k| {
+            let i = cells[k].2 as usize;
+            tstate[i] != 2 && cheap_flange(&nodes[i].st)
+        })
+        .collect();
+    let fpart = |&k: &usize| {
+        let (s, e, i) = cells[k];
+        let mut b = [0f32; NS];
+        for r in s as usize..e as usize {
+            if at_border(r) {
+                vstats(&mut b, &vq(r), &vs[r], spos[r], true);
+            }
+        }
+        let b = b.map(|x| x as f64);
+        let all = &nodes[i as usize].st;
+        [b, std::array::from_fn(|j| all[j] - b[j])]
+    };
+    let fwork: usize = fcand
+        .iter()
+        .map(|&k| (cells[k].1 - cells[k].0) as usize)
+        .sum();
+    let fparts: Vec<[[f64; NS]; 2]> = if fwork < PAR_MIN * 4 {
+        fcand.iter().map(fpart).collect()
+    } else {
+        fcand.par_iter().map(fpart).collect()
+    };
+    let mut fnext = fcand.iter().zip(fparts).peekable();
     for (k, &(s, e, i)) in cells.iter().enumerate() {
+        let flange = match fnext.peek() {
+            Some(&(&j, _)) if j == k => fnext.next().map(|x| x.1),
+            _ => None,
+        };
         let c = cell_st.len();
         let thin = match tstate[i as usize] {
             2 => tinfo.get(&i).copied(),
@@ -1510,6 +1643,13 @@ fn realtime_pass(
                 cellr[r] = (c + sector_of(spos[r], t)) as u32;
             }
             cell_st.extend(parts.iter().map(|p| p.map(|x| x as f64)));
+        } else if let Some(parts) = flange {
+            // Border positions first, then the rest.
+            nflange += 1;
+            for r in s as usize..e as usize {
+                cellr[r] = (c + !at_border(r) as usize) as u32;
+            }
+            cell_st.extend(parts);
         } else {
             cellr[s as usize..e as usize].fill(c as u32);
             cell_st.push(nodes[i as usize].st);
@@ -1520,10 +1660,13 @@ fn realtime_pass(
         }
     }
     if prof {
-        eprintln!("  thin cells {nsplit} of {}", cells.len());
+        eprintln!(
+            "  thin cells {nsplit}, flange cells {nflange} of {}",
+            cells.len()
+        );
     }
     (s.cells, s.nodes, s.leaves, s.fcells) = (cells, nodes, leaves, fcells);
-    (s.kids, s.heap, s.tstate, s.tinfo) = (kids, heap, tstate, tinfo);
+    (s.kids, s.heap, s.tstate, s.tinfo, s.fl) = (kids, heap, tstate, tinfo, fl);
     (s.pending, s.found, s.rest) = (pending, found, rest);
     lap("octree");
 
@@ -3140,5 +3283,62 @@ mod tests {
             "outline moved: area {area}"
         );
         assert!(r.mesh.triangle_count() <= 64, "{}", r.mesh.triangle_count());
+    }
+
+    #[test]
+    fn turned_down_edge_keeps_its_strip() {
+        // A flat sheet whose outline turns down into a narrow strip (glass modeled with its
+        // thickness): one cluster per border cell would press the strip into the sheet.
+        let (n, w) = (40u32, 0.2f32);
+        let mut pos = Vec::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                pos.push(glam::Vec3::new(x as f32, y as f32, 0.0));
+            }
+        }
+        let mut idx = Vec::new();
+        for y in 0..n {
+            for x in 0..n {
+                let i = y * (n + 1) + x;
+                idx.extend_from_slice(&[i, i + 1, i + n + 2, i, i + n + 2, i + n + 1]);
+            }
+        }
+        // The outline counterclockwise from above, and a copy of it lowered by w.
+        let mut ring: Vec<u32> = (0..n).collect();
+        ring.extend((0..n).map(|y| y * (n + 1) + n));
+        ring.extend((1..=n).rev().map(|x| n * (n + 1) + x));
+        ring.extend((1..=n).rev().map(|y| y * (n + 1)));
+        let low: Vec<u32> = ring
+            .iter()
+            .map(|&v| {
+                pos.push(pos[v as usize] - glam::Vec3::Z * w);
+                pos.len() as u32 - 1
+            })
+            .collect();
+        for k in 0..ring.len() {
+            let j = (k + 1) % ring.len();
+            let (a, b, c, d) = (ring[k], ring[j], low[j], low[k]);
+            idx.extend_from_slice(&[a, d, c, a, c, b]);
+        }
+        let mut m = Mesh::new(pos, idx);
+        m.compute_normals(60.0);
+        let strip = |m: &Mesh| -> f32 {
+            m.indices
+                .chunks(3)
+                .map(|t| {
+                    let p = [0, 1, 2].map(|k| m.positions[t[k] as usize]);
+                    let c = (p[1] - p[0]).cross(p[2] - p[0]);
+                    if c.z.abs() < 0.5 * c.length() {
+                        c.length() * 0.5
+                    } else {
+                        0.0
+                    }
+                })
+                .sum()
+        };
+        let r = simplify(&m, &opts(0.03)).unwrap();
+        r.mesh.validate().unwrap();
+        let (before, after) = (strip(&m), strip(&r.mesh));
+        assert!(after > 0.8 * before, "strip area {before} -> {after}");
     }
 }
