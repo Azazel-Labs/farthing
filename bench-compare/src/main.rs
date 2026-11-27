@@ -70,6 +70,7 @@ pub fn peak() -> usize {
 }
 
 mod cluster_bench;
+mod crack_diag;
 
 fn load(path: &str) -> Mesh {
     let mut scene = farthing::io::load(path).expect("load");
@@ -1531,6 +1532,7 @@ fn main() {
         Some("export") => export_mode(&args[1..]),
         Some("rtexport") => rtexport_mode(&args[1..]),
         Some("rtscene") => rtscene_mode(&args[1..]),
+        Some("rtcrack") => crack_diag::rtcrack_mode(&args[1..]),
         Some("remesh") => remesh_mode(&args[1..]),
         Some("rmdiag") => rmdiag_mode(&args[1..]),
         Some("pack") => pack_bench::pack_mode(&args[1..]),

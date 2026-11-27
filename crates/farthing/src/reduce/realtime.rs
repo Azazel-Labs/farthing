@@ -394,6 +394,7 @@ struct ChunkOut {
     cq: Vec<Q>,
     best: Vec<(f64, u32)>,
     clocked: Vec<bool>,
+    cbord: Vec<bool>,
     worst1: f64,
 }
 
@@ -1155,10 +1156,12 @@ fn realtime_pass(
             let mut best = vec![(f64::INFINITY, 0u32); nc];
             let mut score = vec![f64::INFINITY; nc];
             let mut clocked = vec![false; nc];
+            let mut cbord = vec![false; nc];
             for i in 0..n {
                 let (r, c) = (r0 + i, sp[i] as usize);
                 clocked[c] |=
                     locked_v.as_ref().is_some_and(|l| l[r]) || (lock_border && vs[r].s1 != 0);
+                cbord[c] |= borders.get(r).is_some_and(|b| *b != NONE);
                 let p = spos[r];
                 let e = qeval_v(&cq[c], p);
                 let d2 = (p.x as f64 - cen[c][0]).powi(2)
@@ -1252,6 +1255,7 @@ fn realtime_pass(
                 cq,
                 best,
                 clocked,
+                cbord,
                 worst1,
             }
         })
@@ -1274,12 +1278,14 @@ fn realtime_pass(
     let mut cpos: Vec<Vec3> = Vec::with_capacity(nc);
     let mut rep: Vec<u32> = Vec::with_capacity(nc);
     let mut clocked: Vec<bool> = Vec::with_capacity(nc);
+    let mut cbord: Vec<bool> = Vec::with_capacity(nc);
     let mut worst1 = 0f64;
     for o in outs {
         cq.extend(o.cq);
         cpos.extend(o.best.iter().map(|b| spos[b.1 as usize]));
         rep.extend(o.best.iter().map(|b| vert(b.1 as usize)));
         clocked.extend(o.clocked);
+        cbord.extend(o.cbord);
         worst1 = worst1.max(o.worst1);
     }
     lap("clusters");
@@ -1401,6 +1407,7 @@ fn realtime_pass(
         locked: clocked,
         side: vec![[u32::MAX; 2]; nc],
         sdeg: vec![0; nc],
+        cbord,
         soff: vec![0; nc],
         slen: vec![0; nc],
         scap: vec![0; nc],
@@ -1573,6 +1580,9 @@ struct Tail {
     /// slide to; `sdeg` counts such edges (0: unconstrained).
     side: Vec<[u32; 2]>,
     sdeg: Vec<u8>,
+    /// Holds an input vertex on an open border: its position stays an input position, so
+    /// where a separately reduced neighbor picks the same vertex the two stay sealed.
+    cbord: Vec<bool>,
     /// Cluster → triangles, as growable runs in one pool.
     soff: Vec<u32>,
     slen: Vec<u32>,
@@ -1657,14 +1667,18 @@ impl Tail {
 
     /// Moves each remaining cluster that is not locked to the minimum of its summed quadric
     /// (it has stood at one of its member vertices so far), where that stays inside its
-    /// neighborhood and turns no triangle. Border clusters move too: the move is along the
-    /// surface normal, which their border planes contain. Returns which clusters moved.
+    /// neighborhood and turns no triangle. Clusters that slide along a junction move too: the
+    /// move is along the surface normal, which their planes contain. Clusters holding an open
+    /// border vertex stay put. Returns which clusters moved.
     fn relax(&mut self, cremap: &[u32], min_dot: f32) -> Vec<bool> {
         let nc = self.cpos.len();
         let mut moved = vec![false; nc];
         let mut star: Vec<([Vec3; 3], Vec3, usize)> = Vec::new();
         for c in 0..nc {
-            if cremap[c] != c as u32 || self.locked[c] {
+            // A cluster on an open border keeps its input position: moved along the normal it
+            // leaves the border line, and a mesh reduced on its own beside it, sharing that
+            // border, would come apart from it.
+            if cremap[c] != c as u32 || self.locked[c] || self.cbord[c] {
                 continue;
             }
             let p = self.cpos[c];

@@ -1213,7 +1213,8 @@ Four changes from looking at why realtime trails the default on the watch and th
   was given two border planes (122 such vertices on the Duck, which has no border). No more.
 - A cluster on both a border and a junction slides along its border instead of being locked
   (1,880 of 37,500 clusters at 10%).
-- Border clusters take part in the position solve along the normal.
+- Border clusters take part in the position solve along the normal (since withdrawn for
+  clusters on an open border, see below).
 - In the tail, a wedge with no partner across the collapsed edge is kept when its normal
   differs by more than about 29 degrees, instead of merging into the nearest wedge.
 
@@ -1230,7 +1231,29 @@ struts thinner than a cell being pressed flat; the watch to plain geometric erro
 large meshes (mean distance about twice the default's). Both want smaller cells, that is, a
 larger budget. Not measured: cracks between separately reduced meshes that share a border,
 whose border vertices can now move up to a quarter of their shortest edge along the normal
-(`lock_border` still pins them).
+(`lock_border` still pins them). Measured next.
+
+Cracks between meshes reduced one at a time (`bench-compare rtcrack`): source border edges
+are marked shared where both ends coincide with another part's border. Shared border is
+67.8% of the watch's border length, 7.5% of the car's, none on the dragon scene. Each reduced
+border vertex is measured against the neighboring part's reduced border; "sealed" is the
+share that lands on it. Gap in % of the scene diagonal.
+
+| shared borders (sealed / mean gap / 95th pct) | before | position solve on borders | open borders kept |
+|---|---|---|---|
+| watch, 10% | 22.6% / 0.162 / 0.81 | 0.5% / 0.176 / 0.87 | 30.3% / 0.145 / 0.83 |
+| watch, 3% | 7.4% / 1.31 / 8.3 | 0.7% / 1.03 / 4.2 | 11.6% / 1.03 / 4.8 |
+| car, 10% | 31.7% / 0.279 / 1.25 | 1.9% / 0.292 / 1.15 | 32.2% / 0.271 / 1.25 |
+| car, 3% | 17.3% / 0.587 / 1.99 | 0.0% / 0.661 / 2.55 | 17.3% / 0.587 / 1.99 |
+
+Moving border clusters along the normal unsealed nearly every vertex that two neighbors had
+picked in common. A cluster holding an open-border input vertex now keeps that position
+(junction-only clusters still move). Mean rendered PSNR: 24.46 to 24.19 dB at 10%, 20.37 to
+20.23 at 3%, still above the 24.02 / 20.10 before these changes. The loss is mostly
+WaterBottle (30.93 to 29.38 at 10%) and Avocado (29.16 to 28.04), single meshes with nothing
+to crack against, but one call cannot tell. Sealing at most a third of shared vertices still
+leaves gaps of 0.15 to 1% of the diagonal on average: meshes reduced apart diverge whatever
+the border rule, and `lock_border` or reducing a scene as one mesh are what close them.
 
 ### Fast: wedges carried across UV seams (v24)
 
