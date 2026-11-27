@@ -202,8 +202,7 @@ impl Bvh {
         }
         let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
         let mut w = 0;
-        let mut stack: Vec<u32> = Vec::with_capacity(64);
-        stack.push(0);
+        let mut stack = Stack::new(0u32);
         while let Some(top) = stack.pop() {
             let node = &self.nodes[top as usize];
             if slab(origin, inv, node.min, node.max, 0.0, f32::INFINITY).is_none() {
@@ -241,11 +240,12 @@ impl Bvh {
         }
         let inv = Vec3::new(1.0 / dir.x, 1.0 / dir.y, 1.0 / dir.z);
         let mut best: Option<Hit> = None;
-        let mut stack: Vec<u32> = Vec::with_capacity(64);
-        stack.push(0);
+        let mut stack = Stack::new(0u32);
         while let Some(top) = stack.pop() {
             let node = &self.nodes[top as usize];
-            if slab(origin, inv, node.min, node.max, t_min, t_max).is_none() {
+            // A child was pushed because the segment passes its box. Until the first hit the
+            // segment stays the same, so an any-hit search need not test that box again.
+            if (top == 0 || !any) && slab(origin, inv, node.min, node.max, t_min, t_max).is_none() {
                 continue;
             }
             if node.count > 0 {
@@ -324,8 +324,7 @@ impl Bvh {
         }
         let mut best_d2 = max_distance * max_distance;
         let mut best: Option<Closest> = None;
-        let mut stack: Vec<(u32, f32)> =
-            vec![(0, box_dist2(p, self.nodes[0].min, self.nodes[0].max))];
+        let mut stack = Stack::new((0u32, box_dist2(p, self.nodes[0].min, self.nodes[0].max)));
         while let Some((ni, d2)) = stack.pop() {
             if d2 > best_d2 {
                 continue;
@@ -379,6 +378,48 @@ fn slab(o: Vec3, inv: Vec3, min: Vec3, max: Vec3, t_min: f32, t_max: f32) -> Opt
         Some(enter)
     } else {
         None
+    }
+}
+
+/// A last-in first-out stack for tree walks: the first 64 entries in place (enough for any
+/// balanced tree, so walks do not allocate), more on the heap.
+struct Stack<T> {
+    near: [T; 64],
+    len: usize,
+    more: Vec<T>,
+}
+
+impl<T: Copy> Stack<T> {
+    /// A stack holding `first`.
+    #[inline]
+    fn new(first: T) -> Self {
+        Stack {
+            near: [first; 64],
+            len: 1,
+            more: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, x: T) {
+        if self.len < self.near.len() && self.more.is_empty() {
+            self.near[self.len] = x;
+            self.len += 1;
+        } else {
+            self.more.push(x);
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<T> {
+        if let Some(x) = self.more.pop() {
+            return Some(x);
+        }
+        if self.len == 0 {
+            return None;
+        }
+        self.len -= 1;
+        Some(self.near[self.len])
     }
 }
 
