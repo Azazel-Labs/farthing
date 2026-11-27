@@ -1214,6 +1214,163 @@ fn rtscene_mode(args: &[String]) {
     }
 }
 
+/// `rtmesh <asset> <ratio>`: each mesh reduced by the ratio with realtime and the default
+/// reducer; per mesh, the mean surface distance times the mesh's area (its share of the
+/// asset's error), largest realtime share first.
+fn rtmesh_mode(args: &[String]) {
+    let (scene, _) = farthing::io::load_gltf(&args[0]).expect("load");
+    let ratio: f64 = args[1].parse().unwrap();
+    let diag = scene.bounds().diagonal();
+    use farthing::reduce::Quality;
+    let mut rows = Vec::new();
+    let only: Option<usize> = std::env::var("RTMESH_ONLY")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    for (i, m) in scene.meshes.iter().enumerate() {
+        if only.is_some_and(|o| o != i) {
+            continue;
+        }
+        let mut m = m.clone();
+        if m.normals.is_none() {
+            m.compute_normals(60.0);
+        }
+        let target = ((m.triangle_count() as f64 * ratio).round() as usize).max(4);
+        let area = m.surface_area();
+        if std::env::var_os("RTMESH_INFO").is_some() {
+            let mut p: Vec<[u32; 3]> = m
+                .positions
+                .iter()
+                .map(|x| x.to_array().map(f32::to_bits))
+                .collect();
+            if let Some(ns) = &m.normals {
+                let mut idx: Vec<usize> = (0..m.vertex_count()).collect();
+                idx.sort_by_key(|&v| m.positions[v].to_array().map(f32::to_bits));
+                let mut hist = [0usize; 8];
+                let mut uvd = 0usize;
+                for w in idx.windows(2) {
+                    if m.positions[w[0]] == m.positions[w[1]] {
+                        let a = ns[w[0]].dot(ns[w[1]]).clamp(-1.0, 1.0).acos().to_degrees();
+                        let b = [0.01, 0.1, 1.0, 5.0, 15.0, 30.0, 60.0, 360.0]
+                            .iter()
+                            .position(|&x| a <= x)
+                            .unwrap();
+                        hist[b] += 1;
+                        uvd += m.uvs.first().is_some_and(|u| u[w[0]] != u[w[1]]) as usize;
+                    }
+                }
+                println!(
+                    "  coincident pairs by normal angle <=0.01,0.1,1,5,15,30,60,more: {hist:?}, uv differs {uvd}"
+                );
+            }
+            p.sort_unstable();
+            p.dedup();
+            println!(
+                "mesh {i}: {} verts, {} positions, {} uv sets, normals {}",
+                m.vertex_count(),
+                p.len(),
+                m.uvs.len(),
+                m.normals.is_some()
+            );
+        }
+        let mut row = (
+            i,
+            m.triangle_count(),
+            area,
+            [0f32; 2],
+            [0f32; 2],
+            [0usize; 2],
+        );
+        for (k, q) in [Quality::Realtime, Quality::Best].into_iter().enumerate() {
+            let r = simplify(
+                &m,
+                &SimplifyOptions {
+                    quality: q,
+                    ..lf_opts(target)
+                },
+            )
+            .unwrap()
+            .mesh;
+            if let Ok(dir) = std::env::var("RTMESH_DUMP") {
+                let dump = |m: &Mesh, tag: &str| {
+                    let mut b: Vec<u8> = Vec::new();
+                    b.extend((m.vertex_count() as u32).to_le_bytes());
+                    b.extend((m.triangle_count() as u32).to_le_bytes());
+                    for p in &m.positions {
+                        p.to_array().iter().for_each(|x| b.extend(x.to_le_bytes()));
+                    }
+                    let ns = m.normals.clone().unwrap_or(vec![Vec3::Z; m.vertex_count()]);
+                    for p in &ns {
+                        p.to_array().iter().for_each(|x| b.extend(x.to_le_bytes()));
+                    }
+                    m.indices.iter().for_each(|x| b.extend(x.to_le_bytes()));
+                    std::fs::write(format!("{dir}/m{i}_{tag}.bin"), b).unwrap();
+                };
+                dump(&r, ["rt", "best"][k]);
+                if k == 0 {
+                    dump(&m, "orig");
+                }
+            }
+            let d = surface_distance(&m, &r, 20000);
+            row.3[k] = d.mean / diag * area;
+            row.4[k] = d.normal_mean_degrees;
+            row.5[k] = r.triangle_count();
+        }
+        rows.push(row);
+    }
+    let tot: [f32; 2] = [0, 1].map(|k| rows.iter().map(|r| r.3[k]).sum());
+    println!(
+        "total area x mean: realtime {:.4e} best {:.4e}",
+        tot[0], tot[1]
+    );
+    rows.sort_by(|a, b| (b.3[0] - b.3[1]).total_cmp(&(a.3[0] - a.3[1])));
+    for r in rows.iter().take(12) {
+        println!(
+            "mesh {:3} tris {:7} area {:.3e}  rt {:.3e} ({:5.1}°, {} t)  best {:.3e} ({:5.1}°, {} t)",
+            r.0, r.1, r.2, r.3[0], r.4[0], r.5[0], r.3[1], r.4[1], r.5[1]
+        );
+    }
+}
+
+/// `rtsolo <asset> <ratio> <out_dir> [min_tris]`: one GLB per mesh (of at least `min_tris`
+/// triangles) and reducer, with only that mesh reduced, to find which meshes carry the
+/// rendered error.
+fn rtsolo_mode(args: &[String]) {
+    let (scene, _) = farthing::io::load_gltf(&args[0]).expect("load");
+    let ratio: f64 = args[1].parse().unwrap();
+    let out = std::path::Path::new(&args[2]);
+    let min: usize = args.get(3).map_or(500, |v| v.parse().unwrap());
+    std::fs::create_dir_all(out).unwrap();
+    use farthing::reduce::Quality;
+    for (i, m) in scene.meshes.iter().enumerate() {
+        if m.triangle_count() < min {
+            continue;
+        }
+        let mut m = m.clone();
+        if m.normals.is_none() {
+            m.compute_normals(60.0);
+        }
+        let target = ((m.triangle_count() as f64 * ratio).round() as usize).max(4);
+        for (q, tag) in [(Quality::Realtime, "realtime"), (Quality::Best, "best")] {
+            let mut lod = scene.clone();
+            lod.meshes[i] = simplify(
+                &m,
+                &SimplifyOptions {
+                    quality: q,
+                    ..lf_opts(target)
+                },
+            )
+            .unwrap()
+            .mesh;
+            farthing::io::save_glb(
+                &lod,
+                out.join(format!("m{i}_{tag}.glb")),
+                &farthing::io::ExportTextures::default(),
+            )
+            .unwrap();
+        }
+    }
+}
+
 fn lf_opts(target: usize) -> SimplifyOptions {
     let mut v = serde_json::to_value(SimplifyOptions::default()).unwrap();
     if let Ok(e) = std::env::var("LF_OPTS") {
@@ -1563,6 +1720,8 @@ fn main() {
         Some("rtexport") => rtexport_mode(&args[1..]),
         Some("rtscene") => rtscene_mode(&args[1..]),
         Some("rtcrack") => crack_diag::rtcrack_mode(&args[1..]),
+        Some("rtmesh") => rtmesh_mode(&args[1..]),
+        Some("rtsolo") => rtsolo_mode(&args[1..]),
         Some("remesh") => remesh_mode(&args[1..]),
         Some("rmdiag") => rmdiag_mode(&args[1..]),
         Some("pack") => pack_bench::pack_mode(&args[1..]),
