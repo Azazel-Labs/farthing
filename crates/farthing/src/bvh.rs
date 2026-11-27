@@ -120,6 +120,20 @@ impl Bvh {
             .is_some()
     }
 
+    /// The first triangle `keep` accepts that [`occluded_where`](Self::occluded_where) finds
+    /// blocking the segment (the same search: `Some` exactly when that returns true).
+    pub fn first_occluder_where(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        t_min: f32,
+        t_max: f32,
+        keep: impl Fn(u32) -> bool,
+    ) -> Option<u32> {
+        self.traverse(origin, dir, t_min, t_max, true, keep)
+            .map(|h| h.triangle)
+    }
+
     /// Winding number of `origin` along the ray `dir`: over every triangle the ray crosses
     /// ahead, +1 where it leaves (direction along the face normal) and −1 where it enters.
     /// For closed, consistently oriented shells this is how many shells enclose the origin,

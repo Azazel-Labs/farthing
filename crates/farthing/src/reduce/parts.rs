@@ -43,7 +43,24 @@ pub(crate) struct Parts {
     /// Removal count at which `err[k]` was last computed exactly.
     exact_at: Vec<Option<usize>>,
     removals: usize,
+    /// Per part, what the visibility tests of its samples found (see [`Seen`]).
+    seen: Vec<Seen>,
 }
+
+/// What earlier visibility tests found for one part's samples. Removing parts only frees
+/// rays, so a sample once visible stays visible, and a ray blocked by a part that is still
+/// kept is still blocked: a later test only casts the rays whose blocking part has gone.
+/// The answers are the ones a fresh test would give.
+#[derive(Default)]
+struct Seen {
+    /// Per sample: [`UNSEEN`], [`VISIBLE`], or where its blocking parts start in `blockers`.
+    state: Vec<u32>,
+    /// Per hidden sample, per outward direction it tests, the part that blocked that ray.
+    blockers: Vec<u32>,
+}
+
+const UNSEEN: u32 = u32::MAX;
+const VISIBLE: u32 = u32::MAX - 1;
 
 impl Parts {
     /// None for single-part meshes and when every part has a locked vertex.
@@ -121,16 +138,31 @@ impl Parts {
             heap: Default::default(),
             exact_at: vec![None; np],
             removals: 0,
+            seen: Vec::new(),
         };
+        let mut seen: Vec<Seen> = parts
+            .samples
+            .iter()
+            .map(|s| Seen {
+                state: vec![UNSEEN; s.len()],
+                blockers: Vec::new(),
+            })
+            .collect();
         let coarse: Vec<f32> = {
-            use rayon::prelude::*;
             let p = &parts;
             // Pinned parts never enter the queue: their errors are not needed.
-            (0..np)
-                .into_par_iter()
-                .map(|k| if pinned[k] { 0.0 } else { p.error_of(k, true) })
+            seen.par_iter_mut()
+                .enumerate()
+                .map(|(k, s)| {
+                    if pinned[k] {
+                        0.0
+                    } else {
+                        p.error_of(k, true, s)
+                    }
+                })
                 .collect()
         };
+        parts.seen = seen;
         parts.heap = (0..np)
             .filter(|&k| !pinned[k])
             .map(|k| std::cmp::Reverse((Key(coarse[k]), k)))
@@ -147,27 +179,58 @@ impl Parts {
     /// visited in order of box distance, so a query only touches parts whose box can still
     /// beat the best distance so far. Both the visible set and the distances only grow as parts
     /// go, so a value computed earlier is a lower bound.
-    fn error_of(&self, k: usize, coarse: bool) -> f32 {
-        self.distance_of(k, coarse)
+    fn error_of(&self, k: usize, coarse: bool, seen: &mut Seen) -> f32 {
+        self.distance_of(k, coarse, seen)
     }
 
-    /// Whether a ray from sample (p, n) of part k escapes the parts still kept in one of the
-    /// outward directions. Removing parts only frees rays, so a visible sample stays visible.
-    fn sample_visible(&self, k: usize, p: Vec3, n: Vec3) -> bool {
+    /// Whether a ray from sample `i` (p, n) of part k escapes the parts still kept in one of
+    /// the outward directions. Removing parts only frees rays, so a visible sample stays
+    /// visible (see [`Seen`]).
+    fn sample_visible(&self, k: usize, i: usize, (p, n): (Vec3, Vec3), seen: &mut Seen) -> bool {
         let eps = self.reach * 1e-6;
-        vis_dirs().iter().any(|d| {
-            d.dot(n) > 0.2
-                && !self
-                    .all
-                    .occluded_where(p + n * eps, *d, eps, self.reach, |t| {
-                        let j = self.tri_part[t as usize] as usize;
-                        j != k && !self.removed[j] && self.occluder[t as usize]
-                    })
-        })
+        // The part whose triangle blocks the ray in direction d, if any.
+        let blocker = |d: Vec3| {
+            self.all
+                .first_occluder_where(p + n * eps, d, eps, self.reach, |t| {
+                    let j = self.tri_part[t as usize] as usize;
+                    j != k && !self.removed[j] && self.occluder[t as usize]
+                })
+                .map(|t| self.tri_part[t as usize])
+        };
+        let dirs = vis_dirs().iter().filter(|d| d.dot(n) > 0.2);
+        match seen.state[i] {
+            VISIBLE => true,
+            UNSEEN => {
+                let start = seen.blockers.len();
+                for &d in dirs {
+                    let Some(j) = blocker(d) else {
+                        seen.blockers.truncate(start);
+                        seen.state[i] = VISIBLE;
+                        return true;
+                    };
+                    seen.blockers.push(j);
+                }
+                seen.state[i] = start as u32;
+                false
+            }
+            start => {
+                for (slot, &d) in seen.blockers[start as usize..].iter_mut().zip(dirs) {
+                    if !self.removed[*slot as usize] {
+                        continue;
+                    }
+                    let Some(j) = blocker(d) else {
+                        seen.state[i] = VISIBLE;
+                        return true;
+                    };
+                    *slot = j;
+                }
+                false
+            }
+        }
     }
 
     /// Largest distance from part k's samples to the parts still kept (see `error_of`).
-    fn distance_of(&self, k: usize, coarse: bool) -> f32 {
+    fn distance_of(&self, k: usize, coarse: bool, seen: &mut Seen) -> f32 {
         let np = self.bvhs.len();
         let box_gap = |a: (Vec3, Vec3), b: (Vec3, Vec3)| -> f32 {
             (a.0 - b.1).max(b.0 - a.1).max(Vec3::ZERO).length()
@@ -183,9 +246,9 @@ impl Parts {
         let mut worst = 0.0f32;
         // Coarse: every 8th sample, a lower bound on the full error.
         let step = if coarse { 8 } else { 1 };
-        for &(p, n) in self.samples[k].iter().step_by(step) {
+        for (i, &(p, n)) in self.samples[k].iter().enumerate().step_by(step) {
             // Samples hidden behind other parts (outside view from every direction) don't count.
-            if !self.sample_visible(k, p, n) {
+            if !self.sample_visible(k, i, (p, n), seen) {
                 continue;
             }
             // Distance to any kept surface, plus the part's own size, bounds what removing it
@@ -261,7 +324,10 @@ impl Parts {
             let now = if self.exact_at[k] == Some(self.removals) {
                 e
             } else {
-                self.error_of(k, false)
+                let mut seen = std::mem::take(&mut self.seen[k]);
+                let now = self.error_of(k, false, &mut seen);
+                self.seen[k] = seen;
+                now
             };
             self.exact_at[k] = Some(self.removals);
             if now != e {
