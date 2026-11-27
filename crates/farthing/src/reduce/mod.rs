@@ -29,7 +29,7 @@ pub mod symmetry;
 
 pub use quad::{QuadReduceOptions, QuadReduceResult, reduce_quads};
 pub use simplify::{
-    CollapseOrder, LodLevel, Quality, SeamMode, SimplifyOptions, SimplifyResult, StopWhen,
+    CollapseOrder, Gutter, LodLevel, Quality, SeamMode, SimplifyOptions, SimplifyResult, StopWhen,
     lod_chain, screen_size_to_max_error, simplify, simplify_scene,
 };
 pub use symmetry::{Symmetry, detect_symmetry};

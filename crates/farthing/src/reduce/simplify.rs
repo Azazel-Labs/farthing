@@ -59,6 +59,26 @@ pub enum SeamMode {
     Strict,
 }
 
+/// What keeps reduced UV islands on their texels. Cutting a corner of an island's boundary,
+/// or turning a triangle over in UV, makes the surface there show texture from outside the
+/// island (the gutter, or a mirror image).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Gutter {
+    /// Such collapses cost: a spill like a UV error of its depth, a fold like a seam tear,
+    /// neither more than a tear, so they happen where every other way to the target is worse
+    /// (default). Islands keep their outlines at moderate reductions and give way, a little
+    /// at a time, at aggressive ones, where a hard rule left nothing but far worse collapses.
+    #[default]
+    Priced,
+    /// Such collapses are never made, at any target: no island boundary moves more than half
+    /// a texel at 1024² off its source island (more with
+    /// [`SimplifyOptions::gutter_use`]). For textures with nothing painted beyond the
+    /// islands. Seam vertices on a boundary that bends in UV can then only go by dragging one
+    /// island over its neighbor, so shape and texture placement suffer on meshes with many
+    /// seams, and reduction can stop above a triangle target.
+    Guarded,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimplifyOptions {
     /// Fraction of the input triangle count to keep (0..1).
@@ -81,9 +101,10 @@ pub struct SimplifyOptions {
     /// Weight of the constraint planes along open borders.
     pub border_weight: f32,
     /// How collapse error is normalized by the surface area a vertex represents: 0 ranks by
-    /// area-weighted error plus mean distance (the default; best mean, UV and normal fidelity,
-    /// while the mean term keeps vertices with little surface from drifting far), 1 by mean
-    /// distance alone (classic QEM; protects tiny features at the cost of overall fidelity).
+    /// area-weighted error (the default; best mean, UV and normal fidelity; attribute errors
+    /// also count by their mean, which keeps wedges with little surface from drifting far),
+    /// 1 by mean distance alone (classic QEM; protects tiny features at the cost of overall
+    /// fidelity).
     pub error_normalization: f32,
     /// Meshes with at least this many triangles are reduced cluster-parallel: fixed-size spatial
     /// clusters are reduced concurrently with their borders locked, then one exact pass cleans
@@ -131,7 +152,10 @@ pub struct SimplifyOptions {
     /// of deleting a prominent part. 0 disables (stalls delete parts of any error).
     #[serde(default = "default_part_protection")]
     pub part_protection: f32,
-    /// Share of the free texture gutter beside a UV island (UV set 0) that the reduced island
+    /// What keeps reduced UV islands on their texels (see [`Gutter`]).
+    #[serde(default)]
+    pub gutter: Gutter,
+    /// With [`Gutter::Guarded`] only: share of the free texture gutter beside a UV island (UV set 0) that the reduced island
     /// may grow into, 0 to 0.45. The gutter is measured where it would be spent: a spill d
     /// deep is allowed if no other island's source triangle, and no edge of the texture, lies
     /// within d × (1 − share) / share of it, and never deeper than this share of 1/32 of the
@@ -219,6 +243,7 @@ impl Default for SimplifyOptions {
             remove_parts: true,
             transparent_materials: Vec::new(),
             part_protection: default_part_protection(),
+            gutter: Gutter::Priced,
             gutter_use: 0.0,
             texel_size: 0.0,
             material_gloss: Vec::new(),
@@ -261,11 +286,17 @@ pub fn screen_size_to_max_error(diagonal: f32, screen_size_px: f32, pixel_tolera
     diagonal / screen_size_px.max(1.0) * pixel_tolerance
 }
 
-/// Positions with more wedges than this are never collapse sources in permissive mode.
-const MAX_SOURCE_WEDGES: usize = 8;
+/// Positions with more wedges than this are collapse sources only once collapses stall.
+const MAX_SOURCE_WEDGES: usize = 64;
 
-/// Least UV jump (texture units) a seam tear is priced at (see `State::tear_error`).
-const TEAR_UV: f64 = 1.0;
+/// The UV jump (texture units) a seam tear is priced at (see `State::tear_error`), and the
+/// most any UV error is priced at (`State::uv_capped`): texture that is wrong is not made
+/// wronger by being further off. With the default `uv_weight` it weighs like moving the
+/// surface 3.5% of the bounding-box diagonal, so a tear is taken before shape is wrecked to
+/// avoid one. (It was 1, a tear weighing like 70% of the diagonal: on meshes whose seams
+/// could not be reduced any other way, collapses with errors of a fifth of the model went
+/// first.)
+const TEAR_UV: f64 = 0.05;
 /// Wedges whose UVs are closer than this have the same UV (a normal-only seam).
 const TEAR_SAME_UV: f64 = 1e-4;
 /// Furthest (texture units) a UV island's boundary may drift outward, summed over the
@@ -647,6 +678,8 @@ struct State<'a> {
     fp: Option<&'a UvFootprint>,
     isle: Vec<u32>,
     gutter_use: f64,
+    /// [`Gutter::Guarded`]: UV islands are held to their source footprint.
+    guarded: bool,
     /// Per-thread scratch buffers (marker array sized for this mesh), so `State` can be shared
     /// by parallel evaluations.
     scratch: thread_local::ThreadLocal<RefCell<Scratch>>,
@@ -1055,7 +1088,10 @@ fn position_ids(mesh: &Mesh) -> Vec<u32> {
 
 /// Whether [`SimplifyOptions::gutter_use`] applies to `mesh`.
 fn gutter_on(mesh: &Mesh, opts: &SimplifyOptions) -> bool {
-    opts.gutter_use > 0.0 && opts.uv_weight > 0.0 && !mesh.uvs.is_empty()
+    opts.gutter == Gutter::Guarded
+        && opts.gutter_use > 0.0
+        && opts.uv_weight > 0.0
+        && !mesh.uvs.is_empty()
 }
 
 #[inline]
@@ -1593,6 +1629,7 @@ impl<'a> State<'a> {
             fp,
             isle,
             gutter_use,
+            guarded: opts.gutter == Gutter::Guarded,
             scratch: thread_local::ThreadLocal::new(),
             alpha: opts.error_normalization.clamp(0.0, 1.0) as f64,
         }
@@ -1797,7 +1834,8 @@ impl<'a> State<'a> {
             // Or the wedge slides onto q keeping its own attributes: its triangles stay on
             // their UV island and only stretch, where any wedge of q would move them to
             // another island (q has no wedge of pw's island, or it would be partnered).
-            let (en, eo, _) = self.attr_eval_m(pw, &m, &h, pw);
+            let (en, eo, w) = self.attr_eval_m(pw, &m, &h, pw);
+            let eo = self.uv_capped(eo, w);
             let mut best: Option<(f64, u32, f64)> = Some((en + eo, pw, 0.0));
             for &qw in &q_wedges {
                 let (en, eo, w) = self.attr_eval_m(pw, &m, &h, qw);
@@ -1812,7 +1850,7 @@ impl<'a> State<'a> {
                 } else {
                     self.tear_error(pw, qw, eo, w)
                 };
-                let e = en + eo + t;
+                let e = en + self.uv_capped(eo, w) + t;
                 if best.is_none_or(|b| e < b.0) {
                     best = Some((e, qw, t));
                 }
@@ -1848,6 +1886,20 @@ impl<'a> State<'a> {
             return 0.0;
         }
         (w * a.uv_weight * TEAR_UV * TEAR_UV - eo).max(0.0)
+    }
+
+    /// A wedge's attribute error `eo` over area `w`, held to what a tear costs: once a wedge's
+    /// triangles show the wrong texture they cannot show a wronger one, so a UV error is
+    /// never dearer than a [`TEAR_UV`] jump. Without the cap a stretched or extrapolated UV
+    /// map could outbid any geometric error, and shape was given up to spare texture that was
+    /// lost either way.
+    #[inline]
+    fn uv_capped(&self, eo: f64, w: f64) -> f64 {
+        if self.attrs.nuv > 0 {
+            eo.min(w * self.attrs.uv_weight * TEAR_UV * TEAR_UV)
+        } else {
+            eo
+        }
     }
 
     /// Whether wedges `a` and `b` have the same UVs in every UV set.
@@ -1963,14 +2015,26 @@ impl<'a> State<'a> {
         }
     }
 
-    /// The geometric part of [`State::cost`]: (normalized error², mean squared distance,
-    /// importance). The attribute part only adds to the error², so `geom2.sqrt() * imp` is a
+    /// The geometric part of [`State::cost`]: (error², mean squared distance, importance).
+    /// The error² is the area-weighted squared distance of q from the planes p stands for and
+    /// from those q stands for already, per average triangle area (or, with
+    /// [`SimplifyOptions::error_normalization`], normalized by their area). The attribute part only adds to the error², so `geom2.sqrt() * imp` is a
     /// lower bound on the cost.
     #[inline(always)]
     fn cost_geom(&self, p: u32, q: u32) -> (f64, f64, f64) {
         let qd = &self.quadric[p as usize];
-        let raw = qd.eval_m(&kernels::monomials(self.pos[q as usize]));
-        let geom2 = raw / self.norm(qd.w);
+        let m = kernels::monomials(self.pos[q as usize]);
+        let raw = qd.eval_m(&m);
+        // With the error q already carries at its own position: a vertex that has absorbed
+        // much is a dearer target, which spreads the error instead of piling it up on a few
+        // vertices.
+        let qq = &self.quadric[q as usize];
+        let both = raw + qq.eval_m(&m).max(0.0);
+        let geom2 = if self.alpha == 0.0 {
+            both / self.avg_area
+        } else {
+            both / self.norm(qd.w + qq.w)
+        };
         let imp =
             ((self.importance[p as usize] + self.importance[q as usize]) * 0.5).max(1e-3) as f64;
         // Second value: mean squared distance, for max_error and reporting.
@@ -2002,7 +2066,7 @@ impl<'a> State<'a> {
             // A normal deviation over a region of area A shades like a bump of height ~θ·√A:
             // weight it by region size so normals keep mattering as triangles grow.
             en += n * (wi / self.avg_area);
-            eo += o;
+            eo += self.uv_capped(o, wi);
             w += wi;
         }
         [en + eo, w, self.skin_morph_cost(p, q, map)]
@@ -2081,7 +2145,7 @@ impl<'a> State<'a> {
                 return Validity::Flip;
             }
         }
-        if self.attrs.nuv > 0 {
+        if self.guarded && self.attrs.nuv > 0 {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
             let ok = match wedges {
                 Some((corners, map)) => self.uv_drift_with(corners, q, map, &mut drift),
@@ -2177,28 +2241,42 @@ impl<'a> State<'a> {
             .all(|&(pw, qw)| self.uv_merge_ok(corners, q, pw, qw, out))
     }
 
-    /// What the gutter spill of collapsing onto `q` with wedge map `map` costs, to add to the
-    /// tear error in [`Self::cost`] (see [`SimplifyOptions::gutter_use`]): for each triangle
-    /// that leaves its wedge's old fan in UV set 0, a UV error of the depth it reaches over
-    /// its area. That is the spill this collapse adds: what has drifted there before is not
-    /// in the price (it is in what [`State::uv_merge_ok`] allows), so the price depends on
-    /// the fan alone. Whether the spill is allowed at all is for `uv_merge_ok` to say; this
-    /// only ranks.
+    /// Whether collapses carry a UV price from [`State::uv_price`].
+    #[inline]
+    fn prices_uv(&self) -> bool {
+        self.fp.is_some() || (!self.guarded && self.attrs.nuv > 0)
+    }
+
+    /// What collapsing onto `q` with wedge map `map` costs for what it does to UV islands (UV
+    /// set 0), to add to the tear error in [`Self::cost`]. For each triangle of a merged
+    /// wedge's fan:
+    ///
+    /// * if it leaves the fan (the island's boundary loses a corner and the triangle covers
+    ///   texture outside the island), a UV error of the depth it reaches over its area. That
+    ///   is the spill this collapse adds: what has drifted there before is not in the price,
+    ///   so the price depends on the fan alone;
+    /// * with [`Gutter::Priced`], if it turns over in UV, a tear's error over its area; and
+    ///   no spill costs more than that either.
+    ///
+    /// With [`Gutter::Guarded`], whether a spill is allowed at all is for
+    /// [`State::uv_merge_ok`] to say, and only spills into free gutter
+    /// ([`SimplifyOptions::gutter_use`]) are priced.
     ///
     /// The depth comes from the fan's shape, without clipping or sampling. A fan is
     /// star-shaped about p, so the triangle from q's corner to a ring edge stays inside it if
     /// q sees both ends of that edge: the fan turns less than half way round p between them,
     /// and no ring vertex in between pokes into the line of sight. Where one does, or p itself
     /// lies beyond the line (a reflex island boundary), the line leaves the fan by about that
-    /// vertex's distance from it. Fans too odd to order (in pieces, folded in UV, more than
-    /// [`FAN_MAX`] triangles) are not priced.
-    fn spill_price(&self, corners: &[Corner], q: u32, map: &[(u32, u32)]) -> f64 {
+    /// vertex's distance from it. Fans too odd to order (in pieces, folded in UV already,
+    /// more than [`FAN_MAX`] triangles) are not priced.
+    fn uv_price(&self, corners: &[Corner], q: u32, map: &[(u32, u32)]) -> f64 {
         const FAN_MAX: usize = 16;
-        if self.fp.is_none() {
+        if !self.prices_uv() {
             return 0.0;
         }
-        // A fan of one wedge that closes on itself has no boundary to spill over.
-        if let [(pw, _)] = *map
+        // Guarded, a fan of one wedge that closes on itself has no boundary to spill over.
+        if self.guarded
+            && let [(pw, _)] = *map
             && corners
                 .iter()
                 .all(|c| c.pw == pw && corners.iter().any(|d| d.pa == c.pb && d.a == c.b))
@@ -2233,19 +2311,25 @@ impl<'a> State<'a> {
                 continue; // a tear: priced as one
             }
             // The fan in order round p: each triangle's second ring vertex is the next one's
-            // first. If every triangle has a next one the fan is closed: nothing to spill over.
+            // first. If every triangle has a next one the fan is closed: no boundary to
+            // spill over, but its triangles can still turn over.
             let follows = |d: &Corner, c: &Corner| d.pa == c.pb && same(d.a, c.b);
-            if fan
+            let closed = fan
                 .iter()
-                .all(|&i| fan.iter().any(|&j| follows(&corners[j], &corners[i])))
-            {
+                .all(|&i| fan.iter().any(|&j| follows(&corners[j], &corners[i])));
+            if closed && self.guarded {
                 continue;
             }
-            let mut firsts = fan
-                .iter()
-                .filter(|&&i| !fan.iter().any(|&j| follows(&corners[i], &corners[j])));
-            let (Some(&first), None) = (firsts.next(), firsts.next()) else {
-                continue;
+            let first = if closed {
+                fan[0]
+            } else {
+                let mut firsts = fan
+                    .iter()
+                    .filter(|&&i| !fan.iter().any(|&j| follows(&corners[i], &corners[j])));
+                let (Some(&first), None) = (firsts.next(), firsts.next()) else {
+                    continue;
+                };
+                first
             };
             // Triangles and ring vertices in order, and where q is among them.
             let mut order = [0usize; FAN_MAX];
@@ -2261,11 +2345,14 @@ impl<'a> State<'a> {
                 let c = &corners[cur];
                 order[k] = cur;
                 ring[k + 1] = uv(c.b);
-                if c.pb == q && same(c.b, qw) {
+                if qi.is_none() && c.pb == q && same(c.b, qw) {
                     qi = Some(k + 1);
                 }
                 if k + 1 < n {
-                    match fan.iter().find(|&&j| follows(&corners[j], c)) {
+                    match fan
+                        .iter()
+                        .find(|&&j| follows(&corners[j], c) && !order[..=k].contains(&j))
+                    {
                         Some(&next) => cur = next,
                         None => {
                             whole = false;
@@ -2317,17 +2404,30 @@ impl<'a> State<'a> {
                 // for round-off cost nothing.)
                 if d < SPILL_MIN { 0.0 } else { d }
             };
-            // Triangle k has ring vertices k and k + 1; those at q die.
-            for k in (0..n).filter(|&k| k != qi && k + 1 != qi) {
-                let reach = depth(k).max(depth(k + 1));
-                if reach <= 0.0 {
-                    continue;
-                }
+            let uq = uv(qw);
+            for k in 0..n {
                 let c = &corners[order[k]];
-                let x = [q, c.pa, c.pb].map(|v| self.pos[v as usize]);
-                let area3 = (x[1] - x[0]).cross(x[2] - x[0]).length() * 0.5;
-                let deep = SPILL_PRICE * reach;
-                price += self.attrs.uv_weight * area3 * deep * deep;
+                if c.pa == q || c.pb == q {
+                    continue; // dies with the collapse
+                }
+                let deep =
+                    if !self.guarded && (ring[k] - uq).perp_dot(ring[k + 1] - uq) * turn <= 0.0 {
+                        TEAR_UV // turns over (or collapses) in UV
+                    } else if closed {
+                        0.0
+                    } else {
+                        let reach = SPILL_PRICE * depth(k).max(depth(k + 1));
+                        if self.guarded {
+                            reach
+                        } else {
+                            reach.min(TEAR_UV)
+                        }
+                    };
+                if deep > 0.0 {
+                    let x = [q, c.pa, c.pb].map(|v| self.pos[v as usize]);
+                    let area3 = (x[1] - x[0]).cross(x[2] - x[0]).length() * 0.5;
+                    price += self.attrs.uv_weight * area3 * deep * deep;
+                }
             }
         }
         price
@@ -2522,7 +2622,7 @@ impl<'a> State<'a> {
         self.p_corners(p, &mut corners);
         let tear = self
             .map_from_corners(&corners, q, &mut map)
-            .map(|t| t + self.spill_price(&corners, q, &map));
+            .map(|t| t + self.uv_price(&corners, q, &map));
         let r = match tear {
             Some(t) if self.validity_with(p, q, Some((&corners, &map)), None) == Validity::Ok => {
                 Some(self.cost(p, q, &map, t))
@@ -2629,8 +2729,10 @@ impl<'a> State<'a> {
             s.corners = corners;
         };
         self.p_corners(p, &mut corners);
-        // UV singularities (pole fans: one wedge per triangle) stay as collapse targets only:
-        // mapping their many wedges on every re-rank is quadratic and rarely pays off.
+        // UV singularities with very many wedges (the pole of a large fan: one wedge per
+        // triangle) stay as collapse targets only until collapses stall: mapping their wedges
+        // on every re-rank is quadratic. (The limit was 8, which also held back every vertex
+        // where a handful of small parts or hard edges meet.)
         if !self.strict && !self.relaxed && Self::distinct_wedges(&corners) > MAX_SOURCE_WEDGES {
             put_back(nbrs, bounds, costed, maps, map, corners);
             return None;
@@ -2682,7 +2784,7 @@ impl<'a> State<'a> {
                 let (tear, b, _, attr) = spill[i];
                 let c = costed[i];
                 let m = &maps[c.3 as usize..c.4 as usize];
-                let price = self.spill_price(&corners, c.2, m);
+                let price = self.uv_price(&corners, c.2, m);
                 if price > 0.0 {
                     let (_, geom2, mean2, imp, _) = bounds[b as usize];
                     costed[i].0 = self.cost_from(attr, tear + price, (geom2, mean2, imp)).0;
@@ -2728,7 +2830,7 @@ impl<'a> State<'a> {
                 let start = maps.len() as u32;
                 maps.extend_from_slice(&map);
                 costed.push((c, g, q, start, maps.len() as u32));
-                let known = if self.fp.is_some() { UNPRICED } else { PRICED };
+                let known = if self.prices_uv() { UNPRICED } else { PRICED };
                 spill.push((tear, next as u32 - 1, known, attr));
             }
         };
@@ -2763,7 +2865,7 @@ impl<'a> State<'a> {
         self.p_corners(p, &mut corners);
         let ok = self.map_from_corners(&corners, q, &mut map).is_some();
         debug_assert!(ok);
-        if self.attrs.nuv > 0 {
+        if self.guarded && self.attrs.nuv > 0 {
             let mut drift = std::mem::take(&mut self.scratch().borrow_mut().drift);
             if ok {
                 self.uv_drift_with(&corners, q, &map, &mut drift);
@@ -2912,7 +3014,7 @@ impl<'a> State<'a> {
         let mut quadric = self.quadric[q as usize];
         quadric.add(&self.quadric[p as usize]);
         let mut drift = Vec::new();
-        if self.attrs.nuv > 0 && ok {
+        if self.guarded && self.attrs.nuv > 0 && ok {
             self.uv_drift_with(&corners, q, &map, &mut drift);
         }
         self.scratch().borrow_mut().corners2 = corners;
@@ -3044,7 +3146,7 @@ impl<'a> State<'a> {
                 continue;
             }
             if let Some(tear) = self.map_from_corners(&corners, q, &mut map) {
-                let tear = tear + self.spill_price(&corners, q, &map);
+                let tear = tear + self.uv_price(&corners, q, &map);
                 let (c, g) = self.cost(x, q, &map, tear);
                 let old = heap.key[x as usize];
                 if c < old || target == q && c <= old * 1.0001 + 1e-12 {
@@ -3690,7 +3792,7 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
                                 (shared.cost_attr(x, q, map), shared.cost_geom(x, q));
                             let mut c = shared.cost_from(attr, tear, geom);
                             if cand_ref[x as usize].is_some_and(|old| c.0 < old.cost) {
-                                let price = shared.spill_price(corners, q, map);
+                                let price = shared.uv_price(corners, q, map);
                                 if price > 0.0 {
                                     c = shared.cost_from(attr, tear + price, geom);
                                 }
@@ -4596,6 +4698,7 @@ pub(crate) mod tests {
                     &SimplifyOptions {
                         target_triangles: Some(target),
                         seams,
+                        gutter: Gutter::Guarded,
                         ..Default::default()
                     },
                 )
@@ -4671,6 +4774,7 @@ pub(crate) mod tests {
                     &m,
                     &SimplifyOptions {
                         target_triangles: Some(target),
+                        gutter: Gutter::Guarded,
                         gutter_use: share,
                         ..Default::default()
                     },
@@ -4728,6 +4832,7 @@ pub(crate) mod tests {
                 &m,
                 &SimplifyOptions {
                     target_triangles: Some(400),
+                    gutter: Gutter::Guarded,
                     gutter_use,
                     ..Default::default()
                 },

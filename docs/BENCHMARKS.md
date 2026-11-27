@@ -641,6 +641,9 @@ spills past the island's edge, the gutter guard (`DRIFT_UV`, 1/2048) forbids it,
 vertex can then only slide, at a price that drags the accepted geometric error up. On the
 dragon to 1,000 triangles, half of the UV validity checks fail on spill.
 
+(Since v24 the default prices spill instead of forbidding it, see "The default reducer
+against the fast one" below; what follows describes `Gutter::Guarded`.)
+
 The opt-in `gutter_use` lets a seam vertex go where the atlas has room for it. A spill of
 depth d is allowed if no other island's source triangle, and no texture edge, lies within
 d x (1 - share) / share of it (with a small margin), so a spill takes at most its share of
@@ -1201,6 +1204,55 @@ What changed in v7:
 
 Duck/Fox/BoomBox/Lantern/dragon mean error went from 0.0172/0.0213/0.0393/0.1065/0.0891
 (v6 defaults, 3000 tris) to 0.0153/0.0151/0.0249/0.0915/0.0394.
+
+### The default reducer against the fast one (v24)
+
+The fast reducer rendered closer to the source than the default on 9 of 22 cases (11 assets
+at 10% and 3% of their triangles), by 4.8 dB on the watch. Causes, all in the default:
+
+- The gutter guard forbade nearly every seam and border move on a part whose UVs run outside
+  0..1 (the watch strap), and a seam tear was priced as a UV jump of 1.0, as dear as moving
+  the surface 70% of the bounding-box diagonal. A collapse a fifth of the model wide was
+  cheaper than a tear and went first: 23.1% Hausdorff on that part, against 1.46% in fast.
+- Positions with more than 8 wedges were never removed until a stall (the watch dial).
+- The geometric cost counted only the planes of the vertex removed, so error piled up on a
+  few targets.
+
+Changed: `Gutter::Priced` is the default (a spill costs like a UV error of its depth, a UV
+fold like a tear, neither more than a tear; `Gutter::Guarded` keeps the hard rule and
+`gutter_use`), the tear level is 0.05, the geometric cost includes the error the target
+already carries, and the wedge limit is 64.
+
+| rendered PSNR, dB | 10%: before | fast | now | 3%: before | fast | now |
+|---|---|---|---|---|---|---|
+| Avocado | 28.27 | 27.69 | 28.61 | 22.92 | 20.85 | 23.33 |
+| BoomBox | 23.70 | 23.05 | 24.06 | 20.31 | 19.52 | 20.69 |
+| CarConcept | 26.42 | 23.71 | 27.33 | 20.49 | 18.37 | 22.19 |
+| ChronographWatch | 15.15 | 19.97 | 21.36 | 13.43 | 15.57 | 15.26 |
+| Corset | 28.78 | 30.36 | 30.10 | 21.61 | 23.70 | 25.44 |
+| DamagedHelmet | 18.44 | 18.08 | 20.12 | 13.97 | 13.98 | 15.21 |
+| DragonAttenuation | 28.82 | 29.45 | 29.63 | 23.02 | 24.38 | 24.56 |
+| Duck | 21.99 | 21.80 | 22.11 | 15.29 | 16.15 | 16.82 |
+| Fox | 17.99 | 17.15 | 18.71 | 15.35 | 13.88 | 14.78 |
+| Lantern | 28.73 | 20.47 | 28.60 | 24.12 | 18.49 | 24.83 |
+| WaterBottle | 30.40 | 32.49 | 31.18 | 22.65 | 23.41 | 24.02 |
+| mean | 24.43 | 24.02 | 25.62 | 19.38 | 18.94 | 20.65 |
+
+Fast still leads on three cases: WaterBottle at 10% (1.3 dB, consistent across variants; the
+default's cap comes out lopsided at 451 triangles), Corset at 10% (0.26) and the watch at 3%
+(0.31), the last two inside the 0.5 to 1 dB a case moves under changes that should not
+matter. Specular impact (weighted share of misplaced highlights) is 0.0089 against fast's
+0.0205 at 10%, and 0.0169 against 0.0350 at 3%.
+
+Eight assets by four ratios, geometric means (Hausdorff % / mean % / UV p90 / normals deg):
+2.396 / 0.1723 / 0.0084 / 6.93 at 97% reached before, 2.101 / 0.1466 / 0.0062 / 6.36 at 100%
+now, fast 2.257 / 0.1413 / 0.0093 / 8.18. With both attribute weights at zero the default's
+mean error matches fast's, so the rest of that gap is what the normal term buys.
+
+What pricing costs: UV area more than half a texel off its island is 0.21% on average (1.09%
+worst), against 0.008% (0.26%) guarded; 0.009% lands inside another island (0.11% worst),
+against none. The Lantern, the asset the guard was written for, renders the same (28.73 to
+28.60 dB at 10%, 24.12 to 24.83 at 3%).
 
 ### v14: the dragon's error is in the reduction
 
