@@ -1232,6 +1232,29 @@ larger budget. Not measured: cracks between separately reduced meshes that share
 whose border vertices can now move up to a quarter of their shortest edge along the normal
 (`lock_border` still pins them).
 
+### Fast: wedges carried across UV seams (v24)
+
+When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
+the nearest attributes, on whatever UV island that was; its triangles then spanned two
+islands and showed the atlas between them, and later collapses stretched them (the Lantern's
+post: 22.3% of its surface with UVs outside the source islands, 484 of 2,443 collapses at 10%
+tore a wedge). Such a wedge is now carried: it keeps its own attributes and moves to q's
+position, at a price of its area x 16 x the largest squared UV move of the joined wedges.
+Off when UVs are not weighted or `locked_vertices` is given (the cluster builder rebuilds
+triangles from `source_vertex` and needs exact copies).
+
+Mean rendered PSNR over the 11 assets: 24.02 to 25.03 dB at 10%, 18.94 to 20.05 at 3%.
+Lantern +5.79 / +5.39, DamagedHelmet +1.43 / +0.92, watch +1.37 / +0.19, Fox +1.07 / +1.83,
+Avocado +0.79 / +2.59. One case worse: Corset at 3%, 23.70 to 22.86, a case that moves 0.8 dB
+under 10% weight changes. Specular impact 0.0205 to 0.0160 at 10%, 0.0350 to 0.0268 at 3%.
+Output vertices rise 21% (to the default reducer's level). Work counts flat (attribute-cost
+evaluations down 7%); on cloud runners the dragon, watch and car flattened to 10,000
+triangles took 437 ms before and 405 ms after, on different machines.
+
+Fast now renders closer than the default by more than 0.1 dB on WaterBottle and Corset at
+10% and on the watch, dragon and Fox at 3%. Still open in fast: the car's dented panels
+(3.5 dB behind the default) and the Lantern's skewed post top.
+
 ### The default reducer against the fast one (v24)
 
 The fast reducer rendered closer to the source than the default on 9 of 22 cases (11 assets
