@@ -639,7 +639,18 @@ fn layered_mode() -> Result<()> {
 
 fn score_mode(args: &[String]) -> Result<()> {
     let mut engine = Engine::new()?;
-    let original = load_gltf_into_engine(&mut engine, &args[0])?;
+    let mut original = load_gltf_into_engine(&mut engine, &args[0])?;
+    // SCORE_REF=<glb>: render that scene as the reference and frame the views on it (a region
+    // clipped from the asset, see `bench-compare rtexport` CLIP), materials from the asset.
+    if let Some(r) = std::env::var_os("SCORE_REF") {
+        let (mut clip, _) = farthing::io::load_gltf(r)?;
+        for (slot, m) in clip.materials.iter_mut().enumerate() {
+            if let Some(src) = original.materials.get(slot) {
+                m.id = src.id;
+            }
+        }
+        original = clip;
+    }
     let views = views_for(&original);
     let render = |engine: &mut Engine, scene: &Scene| -> Vec<Image> {
         views

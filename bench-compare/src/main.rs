@@ -1055,6 +1055,44 @@ fn rtexport_mode(args: &[String]) {
         )
         .unwrap();
     }
+    // CLIP=<x,y,z,r>: after reducing, keep only triangles whose centroid lies within r of
+    // (x, y, z) in mesh coordinates; the source clipped the same way is written as
+    // `<name>_clip.glb`, a reference whose views frame just that region.
+    let clip: Option<(Vec3, f32)> = std::env::var("CLIP").ok().map(|v| {
+        let c: Vec<f32> = v.split(',').map(|x| x.parse().unwrap()).collect();
+        (Vec3::new(c[0], c[1], c[2]), c[3])
+    });
+    let clip_scene = |s: &mut farthing::Scene| {
+        let Some((c, r)) = clip else { return };
+        for m in &mut s.meshes {
+            let (mut idx, mut mats) = (Vec::new(), Vec::new());
+            for (t, tri) in m.indices.chunks(3).enumerate() {
+                let g = (m.positions[tri[0] as usize]
+                    + m.positions[tri[1] as usize]
+                    + m.positions[tri[2] as usize])
+                    / 3.0;
+                if g.distance(c) < r {
+                    idx.extend_from_slice(tri);
+                    mats.push(m.material_ids[t]);
+                }
+            }
+            m.indices = idx;
+            m.material_ids = mats;
+        }
+    };
+    if clip.is_some() {
+        let mut s = scene.clone();
+        clip_scene(&mut s);
+        for m in &mut s.meshes {
+            m.compact();
+        }
+        farthing::io::save_glb(
+            &s,
+            out.join(format!("{name}_clip.glb")),
+            &farthing::io::ExportTextures::default(),
+        )
+        .unwrap();
+    }
     let input = scene.triangle_count();
     let total = if amount <= 1.0 {
         (input as f64 * amount).round() as usize
@@ -1176,6 +1214,7 @@ fn rtexport_mode(args: &[String]) {
             spec[2] += w * e.misplaced as f64;
             spec[3] += w * e.normal_degrees as f64;
         }
+        clip_scene(&mut lod);
         let file = out.join(format!("{name}_{tag}_{label}.glb"));
         farthing::io::save_glb(&lod, &file, &farthing::io::ExportTextures::default()).unwrap();
         println!(

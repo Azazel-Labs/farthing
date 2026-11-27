@@ -128,6 +128,15 @@ another look. Add to it whenever an experiment is dropped. Experiments that work
 | Fast: tuning on top of gradient and crease planes (normal weight ×2 or ×4, normal growth 32, UV weight ×2 or ×0.5, crease weight 1 or 4, narrow 0.5 or 0.15) | All within noise of or below the shipped +0.69 / +0.27 (best: normal ×2 at +0.77 / +0.06) | — |
 | Fast: passes closer to one collapse at a time (pass share 0.1 or 0.05, pass limit 1.0) | Car 10% only +0.28 / +0.52, Corset 10% −1.21 at 0.05, and much slower (one seed, 5 assets) | — |
 | Default reducer: silhouette weight 0, to see whether it explains the car lead over fast mode | Car barely moves (+0.04 / +0.18); normal weight 0 drops car 10% 27.53 → 24.91: the lead is the gradient normal quadrics | — |
+| Default reducer: sharp creases beside narrow faces weighted ×1.5 to ×4 at every target (5 seeds) | ×1.5: −0.07 / +0.32 dB; ×2: −0.05 / +0.25 (Corset 10% −0.25, a choker hole); ×3, ×4: −0.17 / +0.27, −0.13 / +0.23. Shipped at ×1.5 under 10% targets only | A form that also pays at 10% |
+| Default reducer: fast mode's exact crease rule (planes only for sharp creases beside narrow faces, weight 2) | −0.06 / +0.01 dB; Fox 10% −0.81 without the narrow face's own plane | — |
+| Default reducer: no crease planes between two wide faces, or at half weight | +0.04 / +0.04 and −0.01 / +0.06 dB; Lantern 10% +1.01 but Fox 10% −0.63 | A test that tells the Lantern post from the Fox's ridges |
+| Default reducer: narrow-face boost only where the narrow face has another sharp crease (a rim), ×1.5 to ×4 | −0.04 to −0.14 / +0.03 to +0.14 dB; the Lantern post top turns into a spike (−0.7 at both ratios) | — |
+| Default reducer: narrow-face boost with narrow at 0.15 × length², or only on creases over 60° | −0.14 / +0.22 and −0.13 / +0.09 dB, against −0.05 / +0.25 at 0.3 and 30° | — |
+| Default reducer: crease planes in a separate quadric that grows with the merged region, ((w_p + w_q) / 6 avg)^0.5, on narrow, sharp or all creases | −0.27 / +0.14, −0.26 / +0.06, −0.26 / −0.31 dB | — |
+| Default reducer: narrow-face boost gated on strip height under k × √(area / target) (k 0.25, 0.5, 1), or weighted len × max(len, k × √(area / target)) | The gate changes nothing; the target-length weight −0.07 to −0.18 / −0.01 to +0.26 dB | — |
+| Default reducer: UV weight 0.25 in place of 0.5, for the Corset's relief disks | Corset 10% +0.21 but mean −0.19 / −0.02 dB, Avocado 10% −1.43 | — |
+| Default reducer: closing the watch band gap at 10% (tiling UVs, outline spent on UV error): tear 0.1, 0.02, 0.01; gutter pricing off; normal growth capped at 1, 4, 8; attribute error normalized by mean area | None helps the band (21.2 dB close up against fast's 23.4); reduced without UVs it reaches 23.9, and the whole watch 21.76 at 10% but 15.85 at 3% | A UV cost that knows a tiling chart from an atlas |
 
 ## Voxel proxies
 

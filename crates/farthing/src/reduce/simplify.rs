@@ -335,6 +335,34 @@ const CREASE_WEIGHT: f64 = 1.0;
 const CREASE_SLIVER_AREA: f64 = 12.0;
 /// Crease value, (1 − cos dihedral) / 2, under which a crease counts as gentle: 30°.
 const CREASE_GENTLE: f64 = 0.067;
+/// The face across an edge is narrow when its area is under this × the edge's length² (a
+/// right isosceles triangle across its hypotenuse is 0.25, an equilateral one 0.43): a strip
+/// such as the rim of a thin panel, the wall of a hole through a slab, or a step on a relief.
+const CREASE_NARROW: f64 = 0.3;
+/// At aggressive targets a sharp crease beside a narrow face weighs up to this many times
+/// more (see `narrow_gain`). Such a crease is the outline of a thin part; the strip across
+/// barely prices a vertex sliding inward in the wide face's plane, so once the output's
+/// triangles are many times wider than the strip only the crease plane keeps the outline
+/// from sinking. Fast mode prices only these creases (see `fast.rs`) and kept such outlines,
+/// the Duck's eye for one, at 3% where this mode lost them.
+const CREASE_NARROW_GAIN: f64 = 1.5;
+/// `CREASE_NARROW_GAIN` applies in full at targets of this share of the input triangles or
+/// fewer, and not at all from `NARROW_RAMP_END` up (linear in the log of the share between):
+/// at moderate targets thin parts keep their outlines anyway, and pinning them harder only
+/// starves the rest (rendered PSNR over the corpus: −0.07 dB at 10% against +0.32 at 3%).
+const NARROW_RAMP_FULL: f64 = 0.03;
+const NARROW_RAMP_END: f64 = 0.1;
+
+/// Weight factor for sharp creases beside narrow faces at a target of `share` of the input
+/// triangles (see `CREASE_NARROW_GAIN`).
+fn narrow_gain(share: f64) -> f64 {
+    if share >= NARROW_RAMP_END {
+        return 1.0;
+    }
+    let t = ((NARROW_RAMP_END / share.max(1e-9)).ln() / (NARROW_RAMP_END / NARROW_RAMP_FULL).ln())
+        .clamp(0.0, 1.0);
+    1.0 + (CREASE_NARROW_GAIN - 1.0) * t
+}
 /// The normal term grows with the area a wedge stands for (see `State::cost_attr`) up to this
 /// many average input triangles. Past it, at aggressive targets, the growth made normals
 /// outbid the shape: dense smooth meshes (the dragon, the watch) kept the shading of a few
@@ -1374,15 +1402,25 @@ impl<'a> State<'a> {
         // 1 + silhouette_weight × (mean of that fraction over its edges).
         let sil_beta = opts.silhouette_weight as f64;
         let adj = Adjacency::new(&pairs, &counts);
+        let narrow_gain = {
+            let live = tri_alive.iter().filter(|&&a| a).count().max(1);
+            match (opts.target_triangles, opts.target_ratio) {
+                (Some(t), _) => narrow_gain(t as f64 / live as f64),
+                (None, Some(r)) => narrow_gain(r as f64),
+                (None, None) => 1.0,
+            }
+        };
         // The same pass weighs each edge's crease, (1 − cos dihedral) / 2: 0 where the surface
         // is flat, 1 where it folds back on itself (see CREASE_WEIGHT).
-        let edge_terms: Vec<(f64, [f64; 3])> = {
-            let fnorm: Vec<DVec3> = tpos
+        // And whether the face across is narrow (see CREASE_NARROW).
+        let edge_terms: Vec<(f64, [f64; 3], [bool; 3])> = {
+            let fnorm: Vec<(DVec3, f64)> = tpos
                 .par_iter()
                 .with_min_len(1024)
                 .map(|p| {
                     let p = p.map(|v| pos[v as usize]);
-                    (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero()
+                    let n = (p[1] - p[0]).cross(p[2] - p[0]);
+                    (n.normalize_or_zero(), n.length() * 0.5)
                 })
                 .collect();
             // Faces across each edge, found through the position-to-triangle lists.
@@ -1392,12 +1430,13 @@ impl<'a> State<'a> {
                 .with_min_len(1024)
                 .map(|t| {
                     let mut crease = [0.0; 3];
+                    let mut narrow = [false; 3];
                     if !tri_alive[t] {
-                        return (1.0, crease);
+                        return (1.0, crease, narrow);
                     }
                     let p = tpos[t];
                     let mut acc = 0.0;
-                    for (i, k) in crease.iter_mut().enumerate() {
+                    for (i, (k, nw)) in crease.iter_mut().zip(&mut narrow).enumerate() {
                         let (a, b) = (p[i], p[(i + 1) % 3]);
                         let (mut n, mut other) = (0usize, 0u32);
                         for &g in adj.get(a) {
@@ -1409,14 +1448,17 @@ impl<'a> State<'a> {
                             }
                         }
                         acc += if n == 2 {
-                            let c = fnorm[t].dot(fnorm[other as usize]).clamp(-1.0, 1.0);
+                            let (fo, ao) = fnorm[other as usize];
+                            let c = fnorm[t].0.dot(fo).clamp(-1.0, 1.0);
                             *k = (1.0 - c) * 0.5;
+                            let l2 = (pos[b as usize] - pos[a as usize]).length_squared();
+                            *nw = ao < CREASE_NARROW * l2;
                             c.acos() / std::f64::consts::PI
                         } else {
                             1.0
                         };
                     }
-                    (1.0 + sil_beta * acc / 3.0, crease)
+                    (1.0 + sil_beta * acc / 3.0, crease, narrow)
                 })
                 .collect()
         };
@@ -1444,7 +1486,7 @@ impl<'a> State<'a> {
                 return None;
             }
             let nn = n / (2.0 * area);
-            let (sil, crease) = edge_terms[t];
+            let (sil, crease, narrow) = edge_terms[t];
             let plane = Quadric::plane(nn, -nn.dot(a), area * sil);
             let mut border = [None; 3];
             for (i, slot) in border.iter_mut().enumerate() {
@@ -1452,6 +1494,8 @@ impl<'a> State<'a> {
                 let is_border = bnbr[e0 as usize].contains(&e1v);
                 let w = if is_border {
                     opts.border_weight as f64
+                } else if narrow[i] && crease[i] >= CREASE_GENTLE {
+                    CREASE_WEIGHT * narrow_gain * crease[i]
                 } else {
                     CREASE_WEIGHT * crease[i]
                 };
@@ -2692,6 +2736,24 @@ impl<'a> State<'a> {
         (accepted * 0.25) as f32
     }
 
+    /// Deletes the cheapest part (removal error at most `limit`, world units) once collapses
+    /// have stalled above `target`: preferably one that lands no further below the target than
+    /// the count now is above it, else any, since stopping above the target is the worse miss.
+    /// Returns the triangles removed.
+    fn delete_stalled_part(
+        &mut self,
+        limit: f32,
+        alive: usize,
+        target: usize,
+        cand: &mut [Option<Candidate>],
+    ) -> usize {
+        let floor = target.saturating_sub(alive - target);
+        match self.delete_parts(limit, 1, alive, floor, cand) {
+            0 if floor > 0 => self.delete_parts(limit, 1, alive, 0, cand),
+            n => n,
+        }
+    }
+
     /// Deletes whole parts whose removal error is at most `threshold` (world units), cheapest
     /// first, never taking the live triangle count below `floor`. Returns the triangles
     /// removed.
@@ -3372,9 +3434,8 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
         if list.is_empty() {
             // Nothing left to collapse: only part deletion can still serve the target.
             if let Some(t) = target.filter(|&t| st.parts.is_some() && alive_tris > t) {
-                let floor = t.saturating_sub(alive_tris - t);
                 let limit = st.stall_part_limit(worst_geom2);
-                let n = st.delete_parts(limit, 1, alive_tris, floor, &mut cand);
+                let n = st.delete_stalled_part(limit, alive_tris, t, &mut cand);
                 if n > 0 {
                     alive_tris -= n;
                     continue;
@@ -3745,9 +3806,8 @@ fn run_batched(st: &mut State, target: Option<usize>) -> (usize, f64, usize) {
             // Collapses are stuck above the target: delete the cheapest part and go on.
             if let Some(t) = target.filter(|&t| stall >= 3 && st.parts.is_some() && alive_tris > t)
             {
-                let floor = t.saturating_sub(alive_tris - t);
                 let limit = st.stall_part_limit(worst_geom2);
-                let n = st.delete_parts(limit, 1, alive_tris, floor, &mut cand);
+                let n = st.delete_stalled_part(limit, alive_tris, t, &mut cand);
                 if n > 0 {
                     alive_tris -= n;
                     stall = 0;

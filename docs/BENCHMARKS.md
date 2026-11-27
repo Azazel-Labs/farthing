@@ -1483,6 +1483,55 @@ against 29.63 / 24.56 with them. `bench-compare rtexport` takes `MIX_FAST=<mesh 
 (those meshes reduced by fast mode) and `UV0_MESH=<mesh indices>` (reduced without UVs, UVs
 copied back) to find which mesh of a scene a gap comes from.
 
+### The default reducer at least as good as fast mode (v24)
+
+After fast mode gained its gradient attribute cost and narrow-face crease planes, it rendered
+closer to the source than the default on 7 of 22 cases (5 seeds). Causes, found by reducing
+one mesh of a scene with fast mode (`MIX_FAST`) and by close-up renders of a region
+(`bench-compare rtexport` takes `CLIP=x,y,z,r`: only triangles with their centroid within r of
+the point are kept, in the source too, and `farthing-poc-engine score` takes `SCORE_REF=<glb>`
+to score against that clipped source with the asset's textures):
+
+- Duck and helmet at 3% (126 and 464 triangles), and the gap fast mode's planes open on
+  Avocado and Fox at 10%: thin parts (the Duck's eye, the helmet's beak) lose their outline.
+  The face across such an outline is a narrow strip, which barely prices a vertex sliding
+  inward. With its crease planes off, fast mode drops 0.3 to 1.0 dB on these cases and on
+  the watch at 3%.
+- Watch at 10%: only the carbon-fiber band (mesh 1). Its base color UVs tile (−1.2 to 4.4),
+  and the UV term spends the band's outline: 178 border positions kept against 257 in fast
+  mode. With UVs and normals off the band renders at 23.9 dB close up, against 21.2 now and
+  23.4 in fast mode; no tear level, growth cap or gutter setting closes it.
+- Corset at 10%: the relief disks on the neck and shoulders lose rim vertices (3 of 16 on one
+  ring against 5 in fast mode) and their outlines turn lopsided. It answers to the UV weight
+  (0.25: Corset +0.21 dB in one run, Avocado −1.43 over five seeds), not to crease weights.
+
+Changed: at targets under 10% of the input, a sharp crease beside a narrow face (area under
+0.3 × edge length²) weighs up to 1.5 times more, in full from 3% down (linear in the log of
+the target share between). Every such boost tried also at 10% cost there (−0.04 to −0.17 dB),
+so the gain ramps in only where it pays. Stalled reductions now delete the cheapest part even
+when that lands further below the target than the count was above it, instead of stopping
+above the target. Not timed: the change adds one area test per edge at setup.
+
+| rendered PSNR, dB (5 seeds) | 10%: before | now | fast | 3%: before | now | fast |
+|---|---|---|---|---|---|---|
+| Avocado | 28.74 | 28.74 | 28.89 | 23.19 | 24.64 | 22.50 |
+| BoomBox | 24.08 | 24.08 | 23.88 | 20.28 | 21.01 | 19.83 |
+| CarConcept | 27.55 | 27.55 | 27.48 | 21.98 | 22.27 | 20.20 |
+| ChronographWatch | 21.44 | 21.44 | 21.65 | 16.16 | 16.03 | 16.38 |
+| Corset | 30.10 | 30.10 | 30.71 | 25.91 | 25.87 | 23.99 |
+| DamagedHelmet | 20.17 | 20.17 | 19.76 | 15.24 | 15.30 | 15.56 |
+| DragonAttenuation | 29.76 | 29.76 | 29.50 | 24.97 | 24.96 | 24.85 |
+| Duck | 22.07 | 22.07 | 21.32 | 16.56 | 16.92 | 16.80 |
+| Fox | 18.72 | 18.72 | 18.82 | 15.07 | 15.55 | 15.04 |
+| Lantern | 29.49 | 29.49 | 28.71 | 24.98 | 24.81 | 24.71 |
+| WaterBottle | 32.25 | 32.25 | 31.86 | 24.13 | 24.60 | 23.55 |
+| mean | 25.85 | 25.85 | 25.69 | 20.77 | 21.09 | 20.31 |
+
+Cases behind fast mode: 7 (1.86 dB in all) before, 6 (1.68 dB) now. Between the two ratios
+the means also rise: 22.88 → 22.98 dB at 5% (behind fast 2 → 1) and 19.16 → 19.33 at 2%
+(behind 4 → 3; the Duck at 84 triangles drops 0.55). Still behind: Corset, watch, Avocado and
+Fox at 10% (0.11 to 0.61 dB), watch and helmet at 3% (0.34 and 0.26).
+
 ### v14: the dragon's error is in the reduction
 
 v12 left the dragon at 1.39% Hausdorff against baby_shark's 0.87%, and adaptive (octree)
