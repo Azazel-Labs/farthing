@@ -323,9 +323,7 @@ pub(crate) fn simplify_fast(
     let mut st = St {
         uvs: nd..nd + uv_dims,
         same_uv2: SAME_UV2 * uw * uw,
-        // Callers that lock vertices (the cluster builder) rebuild their triangles from
-        // `source_vertex` and need every output vertex to be an exact copy.
-        carry: uv_dims > 0 && opts.locked_vertices.is_none(),
+        carry: uv_dims > 0 && !opts.exact_vertices,
         pos,
         tris,
         tp,
@@ -1223,16 +1221,16 @@ mod tests {
     }
 
     #[test]
-    fn locked_vertices_keep_output_vertices_exact_copies() {
-        // With locks (none set here) every output vertex is its source vertex unchanged, as
-        // callers that rebuild triangles from `source_vertex` need.
+    fn exact_vertices_keep_output_vertices_exact_copies() {
+        // Every output vertex is its source vertex unchanged, as callers that rebuild
+        // triangles from `source_vertex` need.
         let m = island_cube(4);
         let r = simplify(
             &m,
             &SimplifyOptions {
                 target_triangles: Some(8),
                 target_ratio: None,
-                locked_vertices: Some(vec![false; m.vertex_count()]),
+                exact_vertices: true,
                 ..opts(1.0)
             },
         )

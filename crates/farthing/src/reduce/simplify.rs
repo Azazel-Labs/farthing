@@ -121,6 +121,12 @@ pub struct SimplifyOptions {
     /// Per-vertex lock flags (modular seams, user locks).
     #[serde(skip)]
     pub locked_vertices: Option<Vec<bool>>,
+    /// Every output vertex stands where its [`SimplifyResult::source_vertex`] does: no wedge
+    /// is carried across a UV seam to a new position (it takes the target's nearest wedge
+    /// instead). For callers that rebuild triangles from the input's vertex buffer, such as
+    /// the cluster DAG builder. Ignored in realtime mode, whose output always moves.
+    #[serde(skip)]
+    pub exact_vertices: bool,
     /// Delete whole connected parts (batched order, with a triangle target): a part goes once
     /// removing it moves the surface (to same-facing geometry) less than a quarter of the
     /// deviation the collapses already accepted, and, if collapses stall above the target
@@ -240,6 +246,7 @@ impl Default for SimplifyOptions {
             min_face_dot: 0.2,
             vertex_importance: None,
             locked_vertices: None,
+            exact_vertices: false,
             remove_parts: true,
             transparent_materials: Vec::new(),
             part_protection: default_part_protection(),
@@ -279,8 +286,9 @@ pub struct SimplifyResult {
     /// position may be moved along the normal and its normal is a mean over merged vertices.
     /// A vertex carried across a UV seam keeps its attributes but stands at the position (with
     /// the skin weights and morph position deltas) of the vertex it moved onto: in the default
-    /// mode wherever a seam wedge has no partner on the vertex it collapses onto, locked
-    /// vertices or not; in fast mode only with UVs weighted and no `locked_vertices`.
+    /// mode wherever a seam wedge has no partner on the vertex it collapses onto, in fast mode
+    /// only with UVs weighted. With [`SimplifyOptions::exact_vertices`] every output vertex
+    /// stands where its source does, in both modes.
     pub source_vertex: Vec<u32>,
 }
 
@@ -675,6 +683,9 @@ struct State<'a> {
     /// Heap key is a lower bound only; re-rank before collapsing.
     dirty: Vec<bool>,
     strict: bool,
+    /// A wedge no triangle joins to q may slide onto q keeping its attributes (off with
+    /// [`SimplifyOptions::exact_vertices`]).
+    slides: bool,
     /// Set once collapses stall: vertices with many wedges become collapse sources too.
     relaxed: bool,
     /// Where the source UV islands lie, when islands may spill into the gutter (see
@@ -1629,6 +1640,7 @@ impl<'a> State<'a> {
             avg_area,
             dirty: vec![false; np],
             strict: opts.seams == SeamMode::Strict,
+            slides: !opts.exact_vertices,
             relaxed: false,
             fp,
             isle,
@@ -1840,7 +1852,9 @@ impl<'a> State<'a> {
             // another island (q has no wedge of pw's island, or it would be partnered).
             let (en, eo, w) = self.attr_eval_m(pw, &m, &h, pw);
             let eo = self.uv_capped(eo, w);
-            let mut best: Option<(f64, u32, f64)> = Some((en + eo, pw, 0.0));
+            // Without slides the wedge takes q's nearest wedge, unless q has none.
+            let mut best: Option<(f64, u32, f64)> =
+                (self.slides || q_wedges.is_empty()).then_some((en + eo, pw, 0.0));
             for &qw in &q_wedges {
                 let (en, eo, w) = self.attr_eval_m(pw, &m, &h, qw);
                 // No tear if qw is on pw's UV island: pw has the UVs of a wedge of p that
@@ -4768,6 +4782,43 @@ pub(crate) mod tests {
         }
         let open = edges.values().filter(|&&n| n == 1).count();
         assert_eq!(open, 0, "{open} open edges");
+    }
+
+    #[test]
+    fn exact_vertices_keep_output_vertices_exact_copies() {
+        // Seam wedges would slide here; with `exact_vertices` every output vertex must stand
+        // where its source does, as the cluster DAG builder needs.
+        let m = with_islands(
+            &uv_sphere(32, 16),
+            |c| u32::from(c.x > 0.3) + 2 * u32::from(c.y > -0.2) + 4 * u32::from(c.z > 0.1),
+            |p| Vec2::new(p.x + p.z, p.y + p.z) * 0.25 + 0.5,
+        );
+        let run = |exact_vertices| {
+            simplify(
+                &m,
+                &SimplifyOptions {
+                    target_triangles: Some(120),
+                    exact_vertices,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+        let moved = |r: &SimplifyResult| {
+            (0..r.mesh.vertex_count())
+                .filter(|&v| r.mesh.positions[v] != m.positions[r.source_vertex[v] as usize])
+                .count()
+        };
+        assert!(
+            moved(&run(false)) > 0,
+            "nothing slid: the test no longer tests anything"
+        );
+        let r = run(true);
+        r.mesh.validate().unwrap();
+        assert_eq!(moved(&r), 0);
+        for (v, &s) in r.source_vertex.iter().enumerate() {
+            assert_eq!(r.mesh.uvs[0][v], m.uvs[0][s as usize]);
+        }
     }
 
     #[test]

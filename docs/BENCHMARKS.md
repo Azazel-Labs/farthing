@@ -1648,6 +1648,22 @@ What the numbers say:
   reducer's own work (collapse costs with attribute quadrics, link and flip checks), plus
   cluster growth. Peak heap on 22 threads fell too, from 36.3 MB to 30.7 MB on the dragon.
 
+### Cracks from slid wedges (v24)
+
+The DAG builder rebuilds each simplified group's triangles from `source_vertex`, indexing the
+source mesh's vertices. The default reducer slides a seam wedge with no partner onto the
+vertex it collapses onto, so the rebuilt triangle put that corner back at its input position
+while its neighbors stood at the target: about half the group reductions opened cracks (1,683
+extra open edges over the helmet's 63 groups, 316 over the Corset's 78). Groups are now
+reduced with `exact_vertices`, which turns slides (and fast mode's carry) off: no extra open
+edges. The measured-error table needs more triangles where the cracked DAG had looked
+cheaper, because the sampled distance does not see cracks:
+
+| triangles for mean error at most 0.25 / 0.5 / 1 / 2 px | before (cracked) | now |
+|---|---|---|
+| DamagedHelmet | 5231 / 3885 / 2962 / 1940 | 7273 / 4393 / 2967 / 2967 |
+| Corset | 3305 / 1650 / 1140 / 634 | 4333 / 1651 / 1140 / 629 |
+
 ### Packed GPU format (v17)
 
 `farthing::cluster::gpu` (CLI: `farthing clusters --gpu out.fcld`) packs a DAG into flat

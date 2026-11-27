@@ -919,6 +919,8 @@ impl Ctx<'_> {
             target_ratio: None,
             target_triangles: Some(tc / 2),
             locked_vertices: Some(locked),
+            // Triangles are rebuilt from the source's vertices below.
+            exact_vertices: true,
             cluster_threshold: 0,
             ..self.opts.simplify.clone()
         };
