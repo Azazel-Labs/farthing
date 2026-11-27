@@ -6,7 +6,7 @@ members = ["crates/farthing", "crates/farthing-cli"]
 exclude = ["engine-poc", "bench-compare", "demo-web"]
 
 [workspace.package]
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 license = "MIT-0"
 rust-version = "1.96"
@@ -36,7 +36,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 naga = { version = "30", features = ["wgsl-in"] }
 snugly = { version = "0.2.0", features = ["serde"] }
-farthing = { path = "crates/farthing", version = "0.20.0" }
+farthing = { path = "crates/farthing", version = "0.21.0" }
 
 [profile.dev]
 opt-level = 1
