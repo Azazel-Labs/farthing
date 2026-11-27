@@ -54,9 +54,12 @@ const CLUSTERS_PER_TRI: f32 = 0.55;
 /// Extra clusters at small targets: the budget is scaled by 1 + this / (target + 8).
 const SMALL_TARGET: f32 = 24.0;
 /// A mesh of at most `RETRY_MAX_TRIS` triangles that ends below `RETRY_BELOW` of its target
-/// is reduced again with more clusters, up to `RETRIES` times.
+/// is reduced again with more clusters, up to `RETRIES` times. At 0.75, a small open mesh
+/// whose flange cuts lift the first pass to 76-81% of target kept that count and lost the
+/// border samples its neighbors share: CarConcept's seats at 3% widened the scene's mean
+/// crack from 0.87% to 1.20% of the diagonal.
 const RETRY_MAX_TRIS: usize = 20_000;
-const RETRY_BELOW: f32 = 0.75;
+const RETRY_BELOW: f32 = 0.8;
 const RETRIES: usize = 2;
 /// Cost factor of a collapse that removes a folded triangle, so the tail takes folds out
 /// before anything else.
