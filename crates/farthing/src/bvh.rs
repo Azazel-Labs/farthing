@@ -4,7 +4,7 @@
 //! closest-point queries (Ericson, *Real-Time Collision Detection*, §5.1.5).
 
 use crate::math::Aabb;
-use glam::Vec3;
+use glam::{Vec3, Vec3A};
 
 #[derive(Clone, Copy, Debug)]
 struct Node {
@@ -70,15 +70,21 @@ impl Bvh {
                 triangles,
             };
         }
-        let centroids: Vec<Vec3> = triangles
+        let centroids: Vec<Vec3A> = triangles
             .par_iter()
             .with_min_len(4096)
-            .map(|t| (t[0] + t[1] + t[2]) / 3.0)
+            .map(|t| Vec3A::from((t[0] + t[1] + t[2]) / 3.0))
             .collect();
-        let tri_bounds: Vec<Aabb> = triangles
+        let tri_bounds: Vec<Box3> = triangles
             .par_iter()
             .with_min_len(4096)
-            .map(|t| Aabb::from_points(t.iter()))
+            .map(|t| {
+                let mut b = Box3::EMPTY;
+                for &p in t {
+                    b.extend(Vec3A::from(p));
+                }
+                b
+            })
             .collect();
         let axis = |a: usize| centroids.iter().map(|c| c[a]).collect::<Vec<f32>>();
         let ctx = Build {
@@ -499,17 +505,65 @@ pub fn closest_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, Vec3) {
     (a + ab * v + ac * w, Vec3::new(1.0 - v - w, v, w))
 }
 
+/// A box for the build, in SIMD lanes (min and max are exact, so the boxes, and the tree,
+/// are the ones [`Aabb`] would give).
+#[derive(Clone, Copy)]
+struct Box3 {
+    min: Vec3A,
+    max: Vec3A,
+}
+
+impl Box3 {
+    const EMPTY: Box3 = Box3 {
+        min: Vec3A::splat(f32::INFINITY),
+        max: Vec3A::splat(f32::NEG_INFINITY),
+    };
+
+    #[inline]
+    fn extend(&mut self, p: Vec3A) {
+        self.min = self.min.min(p);
+        self.max = self.max.max(p);
+    }
+
+    #[inline]
+    fn union(&self, o: &Box3) -> Box3 {
+        Box3 {
+            min: self.min.min(o.min),
+            max: self.max.max(o.max),
+        }
+    }
+
+    fn aabb(&self) -> Aabb {
+        Aabb {
+            min: self.min.into(),
+            max: self.max.into(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.aabb().is_empty()
+    }
+
+    fn surface_area(&self) -> f32 {
+        self.aabb().surface_area()
+    }
+
+    fn largest_axis(&self) -> usize {
+        self.aabb().largest_axis()
+    }
+}
+
 /// Inputs shared by every part of a build.
 struct Build<'a> {
-    centroids: &'a [Vec3],
+    centroids: &'a [Vec3A],
     /// The centroids' x, y and z apart, for binning along one axis.
     axes: [&'a [f32]; 3],
-    bounds: &'a [Aabb],
+    bounds: &'a [Box3],
 }
 
 /// Bounds of a node's triangles and of their centroids, when its parent's bins already gave
 /// them (min and max are exact, so they equal what the node would gather itself).
-type Known = Option<(Aabb, Aabb)>;
+type Known = Option<(Box3, Box3)>;
 
 /// Below this many triangles a subtree is built on one thread.
 const PAR_BUILD: usize = 8192;
@@ -523,11 +577,11 @@ impl Build<'_> {
         order: &mut [u32],
         known: Known,
         bins: &mut Vec<u8>,
-    ) -> (Aabb, Option<(usize, Known, Known)>) {
+    ) -> (Box3, Option<(usize, Known, Known)>) {
         let count = order.len();
         let (bounds, cb) = known.unwrap_or_else(|| {
-            let mut bounds = Aabb::EMPTY;
-            let mut cb = Aabb::EMPTY;
+            let mut bounds = Box3::EMPTY;
+            let mut cb = Box3::EMPTY;
             for &t in order.iter() {
                 bounds = bounds.union(&self.bounds[t as usize]);
                 cb.extend(self.centroids[t as usize]);
@@ -546,8 +600,8 @@ impl Build<'_> {
         let scale = BINS as f32 / (hi - lo);
         let along = self.axes[axis];
         let bin_of = |t: u32| (((along[t as usize] - lo) * scale) as usize).min(BINS - 1);
-        let mut bin_bounds = [Aabb::EMPTY; BINS];
-        let mut bin_cb = [Aabb::EMPTY; BINS];
+        let mut bin_bounds = [Box3::EMPTY; BINS];
+        let mut bin_cb = [Box3::EMPTY; BINS];
         let mut bin_count = [0usize; BINS];
         bins.clear();
         for &t in order.iter() {
@@ -560,7 +614,7 @@ impl Build<'_> {
         // Sweep for the cheapest split plane.
         let mut left_area = [0.0f32; BINS];
         let mut left_n = [0usize; BINS];
-        let (mut acc, mut accn) = (Aabb::EMPTY, 0usize);
+        let (mut acc, mut accn) = (Box3::EMPTY, 0usize);
         for i in 0..BINS {
             acc = acc.union(&bin_bounds[i]);
             accn += bin_count[i];
@@ -572,7 +626,7 @@ impl Build<'_> {
             left_n[i] = accn;
         }
         let (mut best_cost, mut best_split) = (f32::INFINITY, 0usize);
-        let (mut racc, mut raccn) = (Aabb::EMPTY, 0usize);
+        let (mut racc, mut raccn) = (Box3::EMPTY, 0usize);
         for i in (1..BINS).rev() {
             racc = racc.union(&bin_bounds[i]);
             raccn += bin_count[i];
@@ -605,7 +659,7 @@ impl Build<'_> {
             return (bounds, Some((count / 2, None, None)));
         }
         let side = |r: std::ops::Range<usize>| {
-            let (mut b, mut c) = (Aabb::EMPTY, Aabb::EMPTY);
+            let (mut b, mut c) = (Box3::EMPTY, Box3::EMPTY);
             for i in r {
                 b = b.union(&bin_bounds[i]);
                 c = c.union(&bin_cb[i]);
@@ -627,8 +681,8 @@ impl Build<'_> {
         }
         let (bounds, split) = self.split(order, known, &mut Vec::new());
         let leaf = Node {
-            min: bounds.min,
-            max: bounds.max,
+            min: bounds.min.into(),
+            max: bounds.max.into(),
             first: base,
             count: order.len() as u32,
         };
@@ -680,8 +734,8 @@ impl Build<'_> {
         while let Some((ni, known)) = stack.pop() {
             let (first, count) = (nodes[ni].first as usize, nodes[ni].count as usize);
             let (bounds, split) = self.split(&mut order[first..first + count], known, &mut bins);
-            nodes[ni].min = bounds.min;
-            nodes[ni].max = bounds.max;
+            nodes[ni].min = bounds.min.into();
+            nodes[ni].max = bounds.max.into();
             let Some((mid, kl, kr)) = split else { continue };
             let left = nodes.len();
             nodes.push(Node {
