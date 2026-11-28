@@ -1009,29 +1009,27 @@ fn carry_uvs(
                 if d == Vec3::ZERO {
                     return;
                 }
+                // Twice the area, and twice the area times the gradient: a corner's hat
+                // function has gradient n × (opposite edge) / |n|², so over the triangle the
+                // area-weighted gradient of u is n̂ × Σ uᵢ eᵢ / 2.
                 let (mut gu, mut gv, mut area) = (Vec3::ZERO, Vec3::ZERO, 0.0);
                 let (mut lo, mut hi) = (Vec2::INFINITY, Vec2::NEG_INFINITY);
                 for &t in run(slot[v] as usize) {
                     let t = mesh.triangle(t as u32 as usize);
                     let x = t.map(|i| mesh.positions[i as usize]);
                     let n = (x[1] - x[0]).cross(x[2] - x[0]);
-                    let a2 = n.length_squared();
-                    if a2 <= 0.0 {
+                    let a = n.length();
+                    if a <= 0.0 {
                         continue;
                     }
-                    // The gradients of the triangle's three hat functions.
-                    let h = [
-                        n.cross(x[2] - x[1]) / a2,
-                        n.cross(x[0] - x[2]) / a2,
-                        n.cross(x[1] - x[0]) / a2,
-                    ];
-                    let a = a2.sqrt() * 0.5;
+                    let n = n / a;
+                    let e = [x[2] - x[1], x[0] - x[2], x[1] - x[0]];
                     let u = t.map(|i| set[i as usize]);
                     for w in u {
                         (lo, hi) = (lo.min(w), hi.max(w));
                     }
-                    gu += (h[0] * u[0].x + h[1] * u[1].x + h[2] * u[2].x) * a;
-                    gv += (h[0] * u[0].y + h[1] * u[1].y + h[2] * u[2].y) * a;
+                    gu += n.cross(e[0] * u[0].x + e[1] * u[1].x + e[2] * u[2].x);
+                    gv += n.cross(e[0] * u[0].y + e[1] * u[1].y + e[2] * u[2].y);
                     area += a;
                 }
                 if area > 0.0 {
