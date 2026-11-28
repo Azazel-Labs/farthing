@@ -144,6 +144,21 @@ fn plane(n: Vec3, d: f32, w: f32) -> [f32; 10] {
     ]
 }
 
+/// The deepest octree level whose cell holds both Morton codes (`DEPTH` when equal).
+#[inline]
+fn common_level(a: u32, b: u32) -> usize {
+    let x = a ^ b;
+    if x == 0 {
+        DEPTH as usize
+    } else {
+        ((3 * DEPTH - 1 - (31 - x.leading_zeros())) / 3) as usize
+    }
+}
+
+/// Counts by octree level: index `l` holds the items whose codes part at level `l` (they
+/// share a cell at level `l` but not at `l + 1`); `DEPTH` holds those that never part.
+type Levels = [u32; DEPTH as usize + 1];
+
 #[inline]
 fn qeval(a: &[f64], x: f64, y: f64, z: f64) -> f64 {
     let e = a[0] * x * x
@@ -842,6 +857,10 @@ pub(crate) fn simplify_realtime(
     r
 }
 
+thread_local! {
+    static STAGE2: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn reduce_with(
     mesh: &Mesh,
     opts: &SimplifyOptions,
@@ -853,11 +872,25 @@ fn reduce_with(
     // land under the target, where the tail has nothing to add. A small mesh that comes out
     // short goes again with the budget scaled by the shortfall; a large one is rarely short
     // by much and is not worth a second pass.
-    let mut per_tri = CLUSTERS_PER_TRI;
+    let mut per_tri = std::env::var("RT_PER_TRI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(CLUSTERS_PER_TRI);
     let mut r = realtime_pass(mesh, opts, target, per_tri, s)?;
     let Some(t) = target else {
         return Ok(r);
     };
+    if let Some(aim) = std::env::var("RT_AIM")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        let st2 = STAGE2.with(|c| c.get()) as f32;
+        let ratio = st2 / t.max(1) as f32;
+        if ratio < aim && st2 < mesh.triangle_count() as f32 {
+            per_tri *= (aim / ratio.max(0.1)).min(3.0);
+            r = realtime_pass(mesh, opts, target, per_tri, s)?;
+        }
+    }
     for _ in 0..RETRIES {
         let got = r.mesh.triangle_count();
         if mesh.triangle_count() > RETRY_MAX_TRIS
@@ -1172,18 +1205,29 @@ fn realtime_pass(
     if s.spill.len() < nch {
         s.spill.resize_with(nch, Vec::new);
     }
-    let parts: Vec<(f64, usize)> = vs
+    let parts: Vec<(f64, usize, Levels, Levels)> = vs
         .par_chunks_mut(csize)
         .zip(s.spill[..nch].par_iter_mut())
         .enumerate()
         .map(|(k, (own, spill))| {
             let lo = (k * csize) as u32;
             let (mut total, mut live) = (0f64, 0usize);
+            let (mut sides, mut faces) = (Levels::default(), Levels::default());
             spill.clear();
             for &([a, b, c], _) in chunk_tris(k) {
                 if a == b || b == c || a == c {
                     continue;
                 }
+                let (ca, cb, cc) = (code(a as usize), code(b as usize), code(c as usize));
+                let l = [
+                    common_level(ca, cb),
+                    common_level(cb, cc),
+                    common_level(cc, ca),
+                ];
+                for x in l {
+                    sides[x] += 1;
+                }
+                faces[l[0].min(l[1]).min(l[2])] += 1;
                 let (pa, pb, pc) = (spos[a as usize], spos[b as usize], spos[c as usize]);
                 let mut h = (pb - pa).cross(pc - pa) * 0.5;
                 let mut area = h.length();
@@ -1208,13 +1252,18 @@ fn realtime_pass(
                     }
                 }
             }
-            (total, live)
+            (total, live, sides, faces)
         })
         .collect();
     let (mut total_area, mut live) = (0f64, 0usize);
-    for ((t, l), spill) in parts.into_iter().zip(&s.spill[..nch]) {
+    let (mut sides, mut faces) = (Levels::default(), Levels::default());
+    for ((t, l, si, fa), spill) in parts.into_iter().zip(&s.spill[..nch]) {
         total_area += t;
         live += l;
+        for x in 0..=DEPTH as usize {
+            sides[x] += si[x];
+            faces[x] += fa[x];
+        }
         for (v, d) in spill {
             vs[*v as usize].add(d);
         }
@@ -1337,34 +1386,110 @@ fn realtime_pass(
     // border has one fewer, and at a small target most clusters are on a border (a disc of
     // four clusters is two triangles), so small targets get more clusters per triangle; the
     // extra fades out by a few hundred triangles.
-    let k_target = target.map(|t| {
-        let small = 1.0 + SMALL_TARGET / (t as f32 + 8.0);
-        ((t as f32 * per_tri * small).ceil() as usize).max(4)
-    });
-    let fine_level = {
-        const NL: usize = DEPTH as usize + 1;
-        // Counted over blocks with a plain loop each (integer sums, so in any order).
-        let first_split = (0..nv.div_ceil(PAR_MIN))
-            .into_par_iter()
-            .map(|b| {
-                let mut h = [0usize; NL];
-                for r in (b * PAR_MIN).max(1)..((b + 1) * PAR_MIN).min(nv) {
-                    let x = code(r) ^ code(r - 1);
-                    if x != 0 {
-                        h[((3 * DEPTH - 1 - (31 - x.leading_zeros())) / 3) as usize] += 1;
+    const NL: usize = DEPTH as usize + 1;
+    // Consecutive ranks by the level they part at: cells at each level, over every vertex and
+    // over open-border vertices alone (a block's first and last of those are stitched after),
+    // and open-border edges by the level their ends part at. Counted over blocks with a plain
+    // loop each (integer sums, so in any order).
+    let blocks: Vec<(Levels, Levels, Levels, Option<(u32, u32)>)> = (0..nv.div_ceil(PAR_MIN))
+        .into_par_iter()
+        .map(|b| {
+            let (mut h, mut bh, mut be) = (Levels::default(), Levels::default(), Levels::default());
+            let mut ends: Option<(u32, u32)> = None;
+            for r in b * PAR_MIN..((b + 1) * PAR_MIN).min(nv) {
+                let c = code(r);
+                if r > 0 {
+                    h[common_level(code(r - 1), c)] += 1;
+                }
+                if let Some(e) = borders.get(r).filter(|e| **e != NONE) {
+                    for &x in e {
+                        be[common_level(c, code(x as usize))] += 1;
                     }
                 }
-                h
-            })
-            .reduce(
-                || [0usize; NL],
-                |mut a, b| {
-                    for i in 0..NL {
-                        a[i] += b[i];
-                    }
-                    a
-                },
+                if at_border(r) {
+                    ends = Some(match ends {
+                        None => (c, c),
+                        Some((f, l)) => {
+                            bh[common_level(l, c)] += 1;
+                            (f, c)
+                        }
+                    });
+                }
+            }
+            (h, bh, be, ends)
+        })
+        .collect();
+    let (mut first_split, mut bsplit, mut bsides) =
+        (Levels::default(), Levels::default(), Levels::default());
+    let mut last_border: Option<u32> = None;
+    for (h, bh, be, ends) in &blocks {
+        for x in 0..NL {
+            first_split[x] += h[x];
+            bsplit[x] += bh[x];
+            bsides[x] += be[x];
+        }
+        if let Some((f, l)) = *ends {
+            if let Some(p) = last_border {
+                bsplit[common_level(p, f)] += 1;
+            }
+            last_border = Some(l);
+        }
+    }
+    // Cells and stage-two triangles for a uniform cut at level `l`, by Euler's formula. Each
+    // cell's piece of a sheet becomes a cluster, and a cell's pieces number its vertices less
+    // its edges plus its triangles (when each is a disc); summed over cells that is the
+    // surface's own count plus the edges and less the triangles the cut crosses. A surface of
+    // V vertices, E edges, F triangles and b border edges has F = 2V - 2(V - E + F) - b, and
+    // V - E + F is the same before and after; so the clusters' triangles are twice the edges
+    // crossed (counted from both sides, a border edge from its one side and its border) less
+    // twice the triangles crossed, less one per border cluster. Several sheets in one cell and
+    // open borders, which the plain two triangles per cluster ignore, are both in it.
+    let stage_two = |l: usize| -> (f32, f32) {
+        let below = |h: &Levels| h[..l].iter().map(|&x| x as f32).sum::<f32>();
+        let cells = 1.0 + below(&first_split);
+        let bcells = last_border.is_some() as u32 as f32 + below(&bsplit);
+        let tris = below(&sides) + below(&bsides) * 0.5 - 2.0 * below(&faces) - bcells;
+        (cells, tris)
+    };
+    // Stage-two triangles per cell at about `k` cells, between the two uniform levels around.
+    let per_cell = |k: f32| -> f32 {
+        let ratio = |l: usize| {
+            let (c, t) = stage_two(l);
+            (t / c).clamp(0.5, 8.0)
+        };
+        let Some(l) = (0..NL).find(|&l| stage_two(l).0 >= k) else {
+            return ratio(NL - 1);
+        };
+        if l == 0 {
+            return ratio(0);
+        }
+        let (c0, c1) = (stage_two(l - 1).0, stage_two(l).0);
+        let f = ((k / c0).ln() / (c1 / c0).ln()).clamp(0.0, 1.0);
+        ratio(l - 1) * (1.0 - f) + ratio(l) * f
+    };
+    let aim: Option<f32> = std::env::var("RT_AIM2").ok().and_then(|v| v.parse().ok());
+    let k_target = target.map(|t| {
+        let small = 1.0 + SMALL_TARGET / (t as f32 + 8.0);
+        let plain = ((t as f32 * per_tri * small).ceil() as usize).max(4);
+        if prof {
+            eprintln!(
+                "  budget: plain {plain} cells, {:.0} triangles expected",
+                plain as f32 * per_cell(plain as f32)
             );
+        }
+        let Some(aim) = aim else {
+            return plain;
+        };
+        let mut k = plain as f32;
+        for _ in 0..3 {
+            k = aim * t as f32 / per_cell(k);
+        }
+        if prof {
+            eprintln!("  budget: aimed {k:.0} cells");
+        }
+        plain.max(k.ceil() as usize)
+    });
+    let fine_level = {
         let want = k_target.unwrap_or(nv / 8).saturating_mul(FINE_PER_CLUSTER);
         let mut cells = 1;
         let mut level = DEPTH;
@@ -1373,7 +1498,7 @@ fn realtime_pass(
                 level = l as u32;
                 break;
             }
-            cells += n;
+            cells += n as usize;
         }
         level
     };
@@ -2313,6 +2438,10 @@ fn realtime_pass(
     }
 
     let alive_count = tw.len();
+    STAGE2.with(|c| c.set(alive_count));
+    if prof {
+        eprintln!("  stage two: {nc} clusters, {alive_count} triangles, target {target:?}");
+    }
     let mut st = Tail {
         cpos,
         cq,

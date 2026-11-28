@@ -312,7 +312,12 @@ pub fn rtcrack_mode(args: &[String]) {
                 let share = m.triangle_count() as f64 / input.max(1) as f64;
                 let target = ((total as f64 * share).round() as usize).max(4);
                 let opts = SimplifyOptions {
-                    quality: Quality::Realtime,
+                    // CRACK_QUALITY=best or fast: that reducer instead, for comparison.
+                    quality: match std::env::var("CRACK_QUALITY").as_deref() {
+                        Ok("best") => Quality::Best,
+                        Ok("fast") => Quality::Fast,
+                        _ => Quality::Realtime,
+                    },
                     ..crate::lf_opts(target)
                 };
                 let r = simplify(&m, &opts).unwrap().mesh;

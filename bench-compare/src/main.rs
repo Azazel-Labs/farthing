@@ -1391,6 +1391,43 @@ fn rtmesh_mode(args: &[String]) {
     }
 }
 
+/// `rtgeo <assets...>`: geometric error of the realtime reducer with every mesh of each asset
+/// as one, reduced to `RT_TARGET` (default 3000) triangles, untimed.
+fn rtgeo_mode(assets: &[String]) {
+    let target: usize = std::env::var("RT_TARGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3000);
+    for path in assets {
+        let m = load(path);
+        let r = simplify(
+            &m,
+            &SimplifyOptions {
+                target_triangles: Some(target),
+                quality: farthing::reduce::Quality::Realtime,
+                ..lf_opts_env()
+            },
+        )
+        .unwrap()
+        .mesh;
+        let d = surface_distance(&m, &r, 40000);
+        let (_, u90, nd) = attribute_error(&m, &r);
+        println!(
+            "{:<18} {:>7} tris {:>6} hausd% {:>7.3} mean% {:>8.4} uv p90 {:>8.5} n deg {:>6.2}",
+            std::path::Path::new(path)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy(),
+            m.triangle_count(),
+            r.triangle_count(),
+            d.relative_hausdorff * 100.0,
+            d.relative_mean * 100.0,
+            u90,
+            nd
+        );
+    }
+}
+
 /// `rtsolo <asset> <ratio> <out_dir> [min_tris]`: one GLB per mesh (of at least `min_tris`
 /// triangles) and reducer, with only that mesh reduced, to find which meshes carry the
 /// rendered error.
@@ -1715,7 +1752,11 @@ fn realtime_mode(assets: &[String]) {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::hash::DefaultHasher::new();
                 format!("{r:?}").hash(&mut h);
-                println!("hash {name} {} {:016x}", label.replace(' ', "_"), h.finish());
+                println!(
+                    "hash {name} {} {:016x}",
+                    label.replace(' ', "_"),
+                    h.finish()
+                );
             }
             let d = surface_distance(&m, &r, 40000);
             let (_, u90, nd) = attribute_error(&m, &r);
@@ -1792,6 +1833,7 @@ fn main() {
         Some("rtcrack") => crack_diag::rtcrack_mode(&args[1..]),
         Some("rtmesh") => rtmesh_mode(&args[1..]),
         Some("rtsolo") => rtsolo_mode(&args[1..]),
+        Some("rtgeo") => rtgeo_mode(&args[1..]),
         Some("remesh") => remesh_mode(&args[1..]),
         Some("rmdiag") => rmdiag_mode(&args[1..]),
         Some("pack") => pack_bench::pack_mode(&args[1..]),
