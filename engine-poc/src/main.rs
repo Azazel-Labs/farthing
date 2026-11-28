@@ -639,11 +639,14 @@ fn layered_mode() -> Result<()> {
 
 fn score_mode(args: &[String]) -> Result<()> {
     let mut engine = Engine::new()?;
-    // SCORE_MIPS=1: textures mipmapped and sampled trilinearly, so charts mapped densely for
-    // their size on screen do not alias; SCORE_MIPS=2, 4, 8 or 16 adds anisotropic filtering
-    // up to that ratio. Unset or 0: the top level only (the scores in the docs).
+    // Textures are mipmapped and sampled with anisotropic filtering up to 16 (SCORE_MIPS=16,
+    // the default), as an engine would, so charts mapped densely for their size on screen do
+    // not alias. SCORE_MIPS=1 is trilinear only, and 2, 4 or 8 lower the anisotropy.
+    // SCORE_MIPS=0 reads the top level only, as the scores in the docs before the v24
+    // section "Scores with mipmapped textures" were made.
     match std::env::var("SCORE_MIPS").ok().as_deref() {
-        None | Some("" | "0") => {}
+        Some("0") => {}
+        None | Some("") => engine.enable_mipmaps(16),
         Some(v) => match v.parse::<u16>() {
             Ok(n @ (1 | 2 | 4 | 8 | 16)) => engine.enable_mipmaps(n),
             _ => anyhow::bail!("SCORE_MIPS must be 0, 1, 2, 4, 8 or 16, not {v:?}"),

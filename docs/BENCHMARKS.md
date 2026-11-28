@@ -1733,6 +1733,42 @@ visibility rays 4.8%; on the car, visibility rays rise to 8%. No single line is 
 The cluster phase is unbalanced (7 car and 5 dragon clusters on 4 threads), but the cluster
 split sets the output, so balancing it is a change in output, not in speed.
 
+### Scores with mipmapped textures (v24)
+
+The image score sampled base-color textures from their top level only, so a chart mapped
+densely for its size on screen aliased in both the reference and the reduced render, and a
+sub-pixel UV drift on a minified, high-contrast texture flipped whole pixels. No engine draws
+textures that way. `farthing-poc-engine score` now builds a full mip chain (2×2 box, averaged
+in linear light) and samples it with the UV derivatives and anisotropic filtering up to 16.
+`SCORE_MIPS=0` gives the old scores, and `SCORE_MIPS=1` trilinear only. The scores in this
+document before this section were made with the top level only. The same exported files,
+scored both ways (5 seeds for the default and fast reducers, one run for the others):
+
+| mean, dB | 10%: top level | mipmapped | 3%: top level | mipmapped |
+|---|---|---|---|---|
+| default | 25.99 | 26.38 | 21.12 | 21.32 |
+| fast | 25.69 | 26.09 | 20.31 | 20.52 |
+| realtime | 24.87 | 25.23 | 20.67 | 20.86 |
+| meshopt-style (`mo_perm`) | 24.01 | 24.51 | 19.47 | 19.71 |
+
+The order of the methods holds at both ratios, and the default's lead over fast barely moves
+(0.30 → 0.29 dB at 10%, 0.81 → 0.80 at 3%). Every method gains most on BoomBox (+1.4 to
++1.9 dB at 10%), the helmet and the Corset. Seed-to-seed spread does not shrink (default 10%:
+standard deviation 0.073 → 0.078 dB; each seed's offset correlates 0.996 between the two
+scorings), so the spread is in the reductions, and five seeds are still needed. Trilinear alone
+blurs grazing views and moves BoomBox and Lantern a few tenths from the anisotropic score;
+anisotropy 4 and 16 agree within 0.01 dB.
+
+One comparison changes. The default's lead on DragonAttenuation was an artifact: the cloth
+backdrop's checker texture aliased, so the small UV drift of fast, realtime and meshopt on the
+floor cost full-contrast pixels. Mipmapped, those gain 0.7 to 1.0 dB and the default 0.2 to
+0.4, and the default goes from +0.26 / +0.11 dB ahead of fast to 0.18 / 0.18 behind (at 3%
+realtime also passes it). Lantern at 3% goes from 0.11 ahead to 0.02 behind. The Corset gap
+stays (−0.61 → −0.65 dB at 10%): the chain aliasing had cost every method the same.
+Cases where the default trails fast, mipmapped: Corset 10% −0.65, DragonAttenuation 10% −0.18
+and 3% −0.18, Avocado 10% −0.15, Fox 10% −0.10, the watch 3% −0.30, the helmet 3% −0.24,
+Lantern 3% −0.02.
+
 ### v14: the dragon's error is in the reduction
 
 v12 left the dragon at 1.39% Hausdorff against baby_shark's 0.87%, and adaptive (octree)
