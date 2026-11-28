@@ -1790,6 +1790,53 @@ Cases where the default trails fast, mipmapped: Corset 10% −0.65, DragonAttenu
 and 3% −0.18, Avocado 10% −0.15, Fox 10% −0.10, the watch 3% −0.30, the helmet 3% −0.24,
 Lantern 3% −0.02.
 
+### The default reducer: dense meshes in two passes (v24)
+
+DragonAttenuation's gap to fast mode is all in its 91,216-triangle scan; the default's cloth
+backdrop is the better one. On the scan alone (mipmapped, 5 seeds) the default scores
+20.48 / 16.08 dB at 10% / 3% against fast's 21.09 / 16.79, yet with every attribute weight at
+0 the default's geometry beats fast's (20.99 / 16.42 against 20.61 / 15.93). Single-term
+changes to the normal and UV terms (growth caps, spread off, slide, tear and spill prices,
+error counted from the wedge's own position) close part of the gap on the scan and lose more
+on the small textured assets (see the dead ends).
+
+What closed it is a restart. A vertex's quadrics sum every plane and attribute sample it
+absorbed; on a dense scan, many collapses deep, that history outweighs the surface the vertex
+now stands for. Reduced to 1.3 × the target and then reduced again from that result, with
+quadrics built from the faces then present, the scan alone goes to 21.19 / 16.59, and with
+geometry only to 21.26 / 16.83. Meshes reduced cluster-parallel already get a fresh final
+pass (the dragon as one mesh with clusters off: 30.03 / 25.26 dB, with them 30.77 / 25.54),
+so the cluster split costs nothing there. Restarting every mesh helps the car, the watch and
+the helmet but costs the small textured meshes up to 1.5 dB (BoomBox, WaterBottle, Avocado,
+Corset), so only meshes from 32,768 triangles (one cluster) up to the cluster threshold
+restart: in the corpus, the dragon's two meshes and the watch's largest.
+
+Mipmapped, 5 seeds, the 11 assets:
+
+| mean, dB | 10% | 3% |
+|---|---|---|
+| default, before | 26.378 | 21.324 |
+| default, two passes | 26.442 | 21.371 |
+| fast | 26.090 | 20.517 |
+
+| asset | 10%: before | now | fast | 3%: before | now | fast |
+|---|---|---|---|---|---|---|
+| DragonAttenuation | 29.97 | 30.66 | 30.15 | 25.32 | 25.81 | 25.50 |
+| ChronographWatch | 22.20 | 22.22 | 21.79 | 16.13 | 16.15 | 16.43 |
+
+Every other asset is unchanged (all their meshes are smaller). The watch as one mesh (100,002 triangles, under the
+threshold) goes from 23.30 / 17.74 to 23.52 / 18.52 (3 seeds). Output is the same at one
+thread and many.
+
+`best=10000` in the Bench workflow (watch, car and dragon flattened), 12 rounds, Linux: watch
+313.1 → 332.2 ms (1.061; as one mesh it now restarts, the second pass on 13,000 triangles),
+car 571.4 → 565.9 (0.990) and dragon 328.8 → 327.2 (0.995), both above the threshold and
+unchanged in output; sum 1.010.
+
+Cases where the default still trails fast, mipmapped: Corset 10% −0.64, Avocado 10% −0.14,
+Fox 10% −0.10, the watch 3% −0.28, the helmet 3% −0.24, Lantern 3% −0.02. The dragon's scan
+alone still trails at 3% (16.59 against 16.79), but the scene leads.
+
 ### v14: the dragon's error is in the reduction
 
 v12 left the dragon at 1.39% Hausdorff against baby_shark's 0.87%, and adaptive (octree)
