@@ -109,7 +109,8 @@ pub struct SimplifyOptions {
     /// Meshes with at least this many triangles are reduced cluster-parallel: fixed-size spatial
     /// clusters are reduced concurrently with their borders locked, then one exact pass cleans
     /// up the borders. The cluster layout depends only on the mesh, so output is identical on
-    /// any number of threads. 0 disables.
+    /// any number of threads. 0 disables. Smaller meshes of at least 32,768 triangles reduce
+    /// in two passes instead, the second starting fresh from the first's result.
     pub cluster_threshold: usize,
     /// Collapse ordering (batched rounds or exact greedy).
     pub collapse_order: CollapseOrder,
@@ -4598,10 +4599,91 @@ fn simplify_top(mesh: &Mesh, opts: &SimplifyOptions) -> Result<SimplifyResult> {
         crate::reduce::parts::remap_orphans(mesh, &mut r);
         return Ok(r);
     }
-    let (mut r, _) = simplify_frame(mesh, opts, None, PartsMode::Top, None, None)?;
+    let mut r = match restart_target(mesh, opts) {
+        Some(mid) => simplify_restarted(mesh, opts, mid)?,
+        None => simplify_frame(mesh, opts, None, PartsMode::Top, None, None)?.0,
+    };
     // Vertices of removed parts map onto the remaining surface.
     crate::reduce::parts::remap_orphans(mesh, &mut r);
     Ok(r)
+}
+
+/// How far past the target the first pass of a restarted reduction stops (see
+/// [`restart_target`]).
+const RESTART_SLACK: f64 = 1.3;
+
+/// Where a dense mesh's first pass stops, if it is reduced in two. A vertex's quadrics sum
+/// every plane and attribute sample it absorbed, and on a dense mesh, many collapses deep,
+/// that history outweighs the surface the vertex now stands for: a fresh pass over the
+/// first pass's result, with quadrics built from the faces then present, places the last
+/// collapses better (DragonAttenuation, a 91,216-triangle scan and 43,779-triangle cloth,
+/// +0.7 dB at 10% and +0.5 dB at 3%; the watch as one mesh +0.2 / +0.8). Small textured
+/// meshes lose texture fidelity from the restart (BoomBox -0.9 / -1.5 dB), and meshes
+/// reduced cluster-parallel already get it from their final pass, so only meshes from one
+/// cluster's size up to the cluster threshold restart.
+fn restart_target(mesh: &Mesh, opts: &SimplifyOptions) -> Option<usize> {
+    let tc = mesh.triangle_count();
+    let clustered =
+        opts.cluster_threshold > 0 && tc >= opts.cluster_threshold.max(2 * CLUSTER_TRIS);
+    let ratio_ok = opts.target_ratio.is_none_or(|r| (0.0..=1.0).contains(&r));
+    if tc < CLUSTER_TRIS
+        || clustered
+        || !ratio_ok
+        || opts.max_error.is_some()
+        || opts.symmetry != Symmetry::Off
+    {
+        return None;
+    }
+    let target = resolve_target(tc, opts)?;
+    let mid = (target as f64 * RESTART_SLACK) as usize;
+    (mid < tc).then_some(mid)
+}
+
+/// A reduction to `mid` triangles, then a fresh one from that result to the target.
+fn simplify_restarted(mesh: &Mesh, opts: &SimplifyOptions, mid: usize) -> Result<SimplifyResult> {
+    let first_opts = SimplifyOptions {
+        target_ratio: None,
+        target_triangles: Some(mid),
+        ..opts.clone()
+    };
+    let (a, _) = simplify_frame(mesh, &first_opts, None, PartsMode::Top, None, None)?;
+    let src = &a.source_vertex;
+    let second_opts = SimplifyOptions {
+        target_ratio: None,
+        target_triangles: resolve_target(mesh.triangle_count(), opts),
+        locked_vertices: opts.locked_vertices.as_ref().map(|l| {
+            src.iter()
+                .map(|&s| l.get(s as usize).copied().unwrap_or(false))
+                .collect()
+        }),
+        vertex_importance: opts.vertex_importance.as_ref().map(|imp| {
+            src.iter()
+                .map(|&s| imp.get(s as usize).copied().unwrap_or(1.0))
+                .collect()
+        }),
+        ..opts.clone()
+    };
+    let (b, _) = simplify_frame(&a.mesh, &second_opts, None, PartsMode::Top, None, None)?;
+    // The second pass's deviation is from the first pass's surface: the two add up.
+    let error = a.error + b.error;
+    let nv = a.mesh.vertex_count();
+    Ok(SimplifyResult {
+        vertex_remap: a
+            .vertex_remap
+            .iter()
+            .map(|&v| match v {
+                v if (v as usize) < nv => b.vertex_remap[v as usize],
+                // Removed with a part: the caller points it at the remaining surface.
+                _ => u32::MAX,
+            })
+            .collect(),
+        source_vertex: b.source_vertex.iter().map(|&v| src[v as usize]).collect(),
+        mesh: b.mesh,
+        error,
+        relative_error: error / mesh.bounds().diagonal().max(1e-12),
+        collapses: a.collapses + b.collapses,
+        symmetry_plane: None,
+    })
 }
 
 /// Whether a reduction may delete whole parts (see [`SimplifyOptions::remove_parts`]).
@@ -5187,6 +5269,38 @@ pub(crate) mod tests {
         }
         let open = edges.values().filter(|&&n| n == 1).count();
         assert_eq!(open, 0, "{open} open edges");
+    }
+
+    #[test]
+    fn restarted_reduction_composes_both_passes() {
+        // A mesh above a cluster's size and below the cluster threshold reduces in two passes:
+        // the result must map every input vertex and name exact source copies.
+        let m = with_islands(
+            &uv_sphere(264, 128),
+            |c| u32::from(c.x > 0.3) + 2 * u32::from(c.y > -0.2) + 4 * u32::from(c.z > 0.1),
+            |p| Vec2::new(p.x + p.z, p.y + p.z) * 0.25 + 0.5,
+        );
+        let opts = SimplifyOptions {
+            target_triangles: Some(3000),
+            cluster_threshold: 0,
+            exact_vertices: true,
+            ..Default::default()
+        };
+        assert!(restart_target(&m, &opts).is_some());
+        let r = simplify(&m, &opts).unwrap();
+        r.mesh.validate().unwrap();
+        assert!(r.mesh.triangle_count() <= 3000);
+        assert_eq!(r.vertex_remap.len(), m.vertex_count());
+        assert!(
+            r.vertex_remap
+                .iter()
+                .all(|&v| (v as usize) < r.mesh.vertex_count())
+        );
+        for (i, &s) in r.source_vertex.iter().enumerate() {
+            assert_eq!(r.mesh.positions[i], m.positions[s as usize]);
+            assert_eq!(r.mesh.uvs[0][i], m.uvs[0][s as usize]);
+        }
+        assert!(r.error > 0.0 && r.relative_error > 0.0);
     }
 
     #[test]
