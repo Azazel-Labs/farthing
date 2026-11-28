@@ -784,6 +784,7 @@ scratch! {
     wout: Vec<u32>,
     srcs: Vec<u32>,
     cluster_out: Vec<u32>,
+    rout: Vec<u32>,
     normal_parts: Vec<Vec<Vec3>>,
     uv: UvCarry,
 }
@@ -2426,11 +2427,15 @@ fn realtime_pass(
     let (mut wremap, mut cremap) = (wremap, cremap);
     ends(&mut wremap);
     ends(&mut cremap);
-    let vertex_remap = (0..nv)
+    // Each rank's output vertex, worked out once in rank order (the order its wedge and
+    // cluster arrays are laid out in) for both the remap and the normals: its wedge's, or
+    // failing that, marked with the top bit, its cluster's (0 if neither).
+    const BY_CLUSTER: u32 = 1 << 31;
+    let mut rout: Vec<u32> = reuse(std::mem::take(&mut s.rout), nv);
+    (0..nv)
         .into_par_iter()
         .with_min_len(PAR_MIN)
-        .map(|v| {
-            let r = rank[v] as usize;
+        .map(|r| {
             let root = parent[r] as usize;
             if wid[root] != u32::MAX {
                 let o = wout[wremap[wid[root] as usize] as usize];
@@ -2439,8 +2444,13 @@ fn realtime_pass(
                 }
             }
             let o = cluster_out[cremap[cid[r] as usize] as usize];
-            if o != u32::MAX { o } else { 0 }
+            BY_CLUSTER | if o != u32::MAX { o } else { 0 }
         })
+        .collect_into_vec(&mut rout);
+    let vertex_remap = (0..nv)
+        .into_par_iter()
+        .with_min_len(PAR_MIN)
+        .map(|v| rout[rank[v] as usize] & !BY_CLUSTER)
         .collect();
     // Each output vertex stands for every input vertex merged into its wedge: its normal is
     // their area-weighted mean, not the one member's the other attributes are copied from.
@@ -2458,12 +2468,9 @@ fn realtime_pass(
             sum.clear();
             sum.resize(n_out, Vec3::ZERO);
             for r in k * span..((k + 1) * span).min(nv) {
-                let root = parent[r] as usize;
-                if wid[root] != u32::MAX {
-                    let o = wout[wremap[wid[root] as usize] as usize];
-                    if o != u32::MAX {
-                        sum[o as usize] += src[vert(r) as usize] * vs[r].area;
-                    }
+                let o = rout[r];
+                if o & BY_CLUSTER == 0 {
+                    sum[o as usize] += src[vert(r) as usize] * vs[r].area;
                 }
             }
         });
@@ -2509,8 +2516,8 @@ fn realtime_pass(
         (warea, attr, locked, side, sdeg, cbord);
     (s.soff, s.slen, s.scap, s.star_pool) = (soff, slen, scap, pool);
     (s.parent, s.cid, s.wbest, s.warea_v, s.rep, s.wid) = (parent, cid, wbest, warea_v, rep, wid);
-    (s.wsrc, s.wc, s.tmat, s.wout, s.srcs, s.cluster_out) =
-        (wsrc, wc, tmat, wout, srcs, cluster_out);
+    (s.wsrc, s.wc, s.tmat, s.wout, s.srcs, s.cluster_out, s.rout) =
+        (wsrc, wc, tmat, wout, srcs, cluster_out, rout);
     let rel = worst1.max(worst2 as f64).sqrt() as f32;
     lap("output");
     Ok(SimplifyResult {
