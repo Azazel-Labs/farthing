@@ -1431,6 +1431,27 @@ mesh at 10%: watch 16.6 → 17.7, car 31.4 → 34.5, dragon 14.3 → 15.5 ms. Me
 triangles or more find and carry their sources on the pool; smaller ones stay on the calling
 thread, which the car's 97 meshes need (on the pool they cost 43.6 → 50.1 ms).
 
+### Realtime: three passes trimmed, 95% of the time (v24)
+
+Output is byte-identical (all 11 assets at 10% and 3%, and the flattened watch, car and dragon
+at 10,000 and 3,000 triangles, at 1, 4 and the default thread count). 3,000-triangle target on
+the merged scene, 4 threads, 12 rounds, same run against the previous main:
+
+| runner | watch | car | dragon | sum |
+|---|---|---|---|---|
+| Linux | 10.54 → 9.97 ms | 13.82 → 13.21 | 10.02 → 9.43 | 0.949 |
+| Windows | 18.98 → 18.02 | 24.60 → 23.62 | 18.06 → 17.02 | 0.952 |
+
+| change | watch | car | dragon | sum |
+|---|---|---|---|---|
+| UV carry sums worked out once per source in one pass over the triangles, on another thread beside the serial tail (meshes of 65,536 triangles or more; smaller ones after the tail, for moved sources only) | 0.954 | 0.950 | 0.953 | 0.952 |
+| Tail neighbors found by epoch marks instead of a list search; the mean squared distance divided out only where `max_error` needs it | 0.978 | 0.990 | 0.977 | 0.982 |
+| Each rank's output vertex worked out once for the remap and the normals | 0.996 | 0.989 | 0.983 | 0.990 |
+
+This takes back the UV carry's cost. Phases after, on the watch: the serial tail 2.62 ms (the
+largest), clusters 1.77, faces 1.27, Morton codes 0.94, output 0.65 (was 0.98). Mesh by mesh
+at 10% on Linux: watch 17.93 → 17.00 ms, car 34.75 → 32.59, dragon 16.20 → 14.34.
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
