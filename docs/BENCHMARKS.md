@@ -1401,6 +1401,36 @@ Output is identical at 1, 3 and 16 threads.
 The watch does not change. Time per mesh on a hosted runner (3% of each mesh, 3 alternating
 rounds): car 33.8 → 34.1 ms (about 1%, the seats' second pass), watch and dragon unchanged.
 
+### Realtime: UVs carried with their vertex (v24)
+
+An output vertex takes its attributes from one input vertex, its wedge's member nearest the
+representative, but stands at the cluster's position. On merged layers and at long
+open-border clusters that source lies up to 5% of the diagonal away, and the texture slid with
+it: the helmet's stretched brown triangles are recess texture dragged onto the shell. Each UV
+set is now moved by the source's surface gradient (the area-weighted mean over its input
+triangles) times the move, and held to the UV box of those triangles. Without the box, a vertex
+moved past the end of a chart reads texture from beyond it: the lantern's post went white at
+the top and base, −4.2 dB. Geometry is unchanged, and so is the sealed share of shared borders
+(car 41.4 / 21.5%, watch 42.6 / 17.2% at 10% / 3%). Output is identical at 1, 3 and 22 threads.
+
+| rendered PSNR, dB | 10%: before | now | 3%: before | now |
+|---|---|---|---|---|
+| Avocado | 28.04 | 28.14 | 24.88 | 24.93 |
+| BoomBox | 23.38 | 23.38 | 19.48 | 19.51 |
+| DamagedHelmet | 17.26 | 17.54 | 14.90 | 14.92 |
+| Fox | 18.23 | 18.37 | 16.10 | 16.18 |
+| Lantern | 28.66 | 28.91 | 24.20 | 24.19 |
+| other six | within 0.02 | | within 0.02 | |
+| mean of 11 | 24.80 | 24.87 | 20.65 | 20.67 |
+
+On the helmet the brown wedge above the visor's left side shrinks to a sliver and the shell
+around it reads white again; the sawtooth along the dome's right rim is geometry and stays.
+Time on a hosted runner (3,000-triangle target on the merged scene, 4 threads): watch 9.78 →
+10.29 ms, car 13.02 → 13.71, dragon 9.14 → 9.72 (the output pass +0.4 to +0.5 ms). Mesh by
+mesh at 10%: watch 16.6 → 17.7, car 31.4 → 34.5, dragon 14.3 → 15.5 ms. Meshes of 65,536
+triangles or more find and carry their sources on the pool; smaller ones stay on the calling
+thread, which the car's 97 meshes need (on the pool they cost 43.6 → 50.1 ms).
+
 ### Fast: wedges carried across UV seams (v24)
 
 When p moved onto q, a wedge of p that no triangle joins to q was mapped to the q wedge with
