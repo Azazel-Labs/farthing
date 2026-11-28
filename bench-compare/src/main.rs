@@ -71,6 +71,7 @@ pub fn peak() -> usize {
 
 mod cluster_bench;
 mod crack_diag;
+mod partmix;
 
 fn load(path: &str) -> Mesh {
     let mut scene = farthing::io::load(path).expect("load");
@@ -1785,6 +1786,8 @@ fn main() {
         Some("parts") => parts_mode(&args[1..]),
         Some("export") => export_mode(&args[1..]),
         Some("rtexport") => rtexport_mode(&args[1..]),
+        Some("partmix") => partmix::partmix_mode(&args[1..], lf_opts),
+        Some("uvdens") => partmix::uvdens_mode(&args[1..]),
         Some("rtscene") => rtscene_mode(&args[1..]),
         Some("rtcrack") => crack_diag::rtcrack_mode(&args[1..]),
         Some("rtmesh") => rtmesh_mode(&args[1..]),
