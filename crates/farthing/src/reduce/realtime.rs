@@ -879,6 +879,10 @@ const UV_BLOCK: usize = 16384;
 /// Output vertices per parallel job in [`carry_uvs`].
 const UV_OUT_MIN: usize = 64;
 
+/// Input triangles from which [`carry_uvs`] runs its passes on the pool: below this, handing
+/// them out costs more than the work (a scene of many small meshes pays it on every one).
+const UV_PAR_TRIS: usize = 4 * UV_BLOCK;
+
 /// Moves each output vertex's UVs with it. A vertex takes its attributes from one input
 /// vertex (its wedge's source) but stands at its cluster's position, which can lie well away
 /// from that source (across a merged layer or at the end of a long cluster), so the texture
@@ -916,15 +920,16 @@ fn carry_uvs(
         }
     }
     if moved > 0 {
-        // The input triangles at each moved source, found in fixed blocks in parallel.
+        // The input triangles at each moved source, found in fixed blocks.
         let nt = mesh.triangle_count();
+        let par = nt >= UV_PAR_TRIS;
         let blocks = nt.div_ceil(UV_BLOCK);
         let mut found_all = std::mem::take(found_buf);
         if found_all.len() < blocks {
             found_all.resize_with(blocks, Vec::new);
         }
         let found = &mut found_all[..blocks];
-        found.par_iter_mut().enumerate().for_each(|(b, f)| {
+        let scan = |(b, f): (usize, &mut Vec<(u32, u32)>)| {
             f.clear();
             let first = b * UV_BLOCK;
             let tris = &mesh.indices[3 * first..3 * (first + UV_BLOCK).min(nt)];
@@ -936,18 +941,28 @@ fn carry_uvs(
                     }
                 }
             }
-        });
-        // Bucketed by slot: counted, summed to each slot's start, and placed in parallel,
+        };
+        if par {
+            found.par_iter_mut().enumerate().for_each(scan);
+        } else {
+            found.iter_mut().enumerate().for_each(scan);
+        }
+        // Bucketed by slot: counted, summed to each slot's start, and placed,
         // each placement advancing its slot's start, so slot `k`'s run ends up at
         // `start[k - 1]..start[k]`. A run is then sorted into triangle order, so the sums
         // below add up the same way at any thread count.
         let mut start: Vec<AtomicU32> = recycle(std::mem::take(start_buf), AtomicU32::new);
         start.extend((0..moved).map(|_| AtomicU32::new(0)));
-        found.par_iter().for_each(|f| {
+        let count = |f: &Vec<(u32, u32)>| {
             for &(k, _) in f {
                 start[k as usize].fetch_add(1, Relaxed);
             }
-        });
+        };
+        if par {
+            found.par_iter().for_each(count);
+        } else {
+            found.iter().for_each(count);
+        }
         let mut total = 0;
         for k in &mut start {
             let n = *k.get_mut();
@@ -955,66 +970,84 @@ fn carry_uvs(
             total += n;
         }
         let mut tris: Vec<AtomicU64> = recycle(std::mem::take(tris_buf), AtomicU64::new);
-        (0..total)
-            .into_par_iter()
-            .with_min_len(PAR_MIN)
-            .map(|_| AtomicU64::new(0))
-            .collect_into_vec(&mut tris);
-        found.par_iter().for_each(|f| {
+        if par {
+            (0..total)
+                .into_par_iter()
+                .with_min_len(PAR_MIN)
+                .map(|_| AtomicU64::new(0))
+                .collect_into_vec(&mut tris);
+        } else {
+            tris.extend((0..total).map(|_| AtomicU64::new(0)));
+        }
+        let place = |f: &Vec<(u32, u32)>| {
             for &(k, t) in f {
                 let i = start[k as usize].fetch_add(1, Relaxed);
                 tris[i as usize].store(((k as u64) << 32) | t as u64, Relaxed);
             }
-        });
+        };
+        if par {
+            found.par_iter().for_each(place);
+        } else {
+            found.iter().for_each(place);
+        }
         let mut tris: Vec<u64> = tris.into_iter().map(AtomicU64::into_inner).collect();
-        tris.par_chunk_by_mut(|a, b| a >> 32 == b >> 32)
-            .for_each(|r| r.sort_unstable());
+        let same = |a: &u64, b: &u64| a >> 32 == b >> 32;
+        if par {
+            tris.par_chunk_by_mut(same).for_each(<[u64]>::sort_unstable);
+        } else {
+            tris.chunk_by_mut(same).for_each(<[u64]>::sort_unstable);
+        }
         let start: Vec<u32> = start.into_iter().map(AtomicU32::into_inner).collect();
         let run = |k: usize| {
             let lo = if k == 0 { 0 } else { start[k - 1] as usize };
             &tris[lo..start[k] as usize]
         };
         for (set, uvs) in mesh.uvs.iter().zip(out.uvs.iter_mut()) {
-            // Few outputs, each a handful of scattered reads: split finely.
-            uvs.par_iter_mut()
-                .with_min_len(UV_OUT_MIN)
-                .enumerate()
-                .for_each(|(o, uv)| {
-                    let v = source_vertex[o] as usize;
-                    let d = out.positions[o] - mesh.positions[v];
-                    if d == Vec3::ZERO {
-                        return;
+            let carry = |(o, uv): (usize, &mut Vec2)| {
+                let v = source_vertex[o] as usize;
+                let d = out.positions[o] - mesh.positions[v];
+                if d == Vec3::ZERO {
+                    return;
+                }
+                let (mut gu, mut gv, mut area) = (Vec3::ZERO, Vec3::ZERO, 0.0);
+                let (mut lo, mut hi) = (Vec2::INFINITY, Vec2::NEG_INFINITY);
+                for &t in run(slot[v] as usize) {
+                    let t = mesh.triangle(t as u32 as usize);
+                    let x = t.map(|i| mesh.positions[i as usize]);
+                    let n = (x[1] - x[0]).cross(x[2] - x[0]);
+                    let a2 = n.length_squared();
+                    if a2 <= 0.0 {
+                        continue;
                     }
-                    let (mut gu, mut gv, mut area) = (Vec3::ZERO, Vec3::ZERO, 0.0);
-                    let (mut lo, mut hi) = (Vec2::INFINITY, Vec2::NEG_INFINITY);
-                    for &t in run(slot[v] as usize) {
-                        let t = mesh.triangle(t as u32 as usize);
-                        let x = t.map(|i| mesh.positions[i as usize]);
-                        let n = (x[1] - x[0]).cross(x[2] - x[0]);
-                        let a2 = n.length_squared();
-                        if a2 <= 0.0 {
-                            continue;
-                        }
-                        // The gradients of the triangle's three hat functions.
-                        let h = [
-                            n.cross(x[2] - x[1]) / a2,
-                            n.cross(x[0] - x[2]) / a2,
-                            n.cross(x[1] - x[0]) / a2,
-                        ];
-                        let a = a2.sqrt() * 0.5;
-                        let u = t.map(|i| set[i as usize]);
-                        for w in u {
-                            (lo, hi) = (lo.min(w), hi.max(w));
-                        }
-                        gu += (h[0] * u[0].x + h[1] * u[1].x + h[2] * u[2].x) * a;
-                        gv += (h[0] * u[0].y + h[1] * u[1].y + h[2] * u[2].y) * a;
-                        area += a;
+                    // The gradients of the triangle's three hat functions.
+                    let h = [
+                        n.cross(x[2] - x[1]) / a2,
+                        n.cross(x[0] - x[2]) / a2,
+                        n.cross(x[1] - x[0]) / a2,
+                    ];
+                    let a = a2.sqrt() * 0.5;
+                    let u = t.map(|i| set[i as usize]);
+                    for w in u {
+                        (lo, hi) = (lo.min(w), hi.max(w));
                     }
-                    if area > 0.0 {
-                        let step = Vec2::new((gu / area).dot(d), (gv / area).dot(d));
-                        *uv = (set[v] + step).clamp(lo, hi);
-                    }
-                });
+                    gu += (h[0] * u[0].x + h[1] * u[1].x + h[2] * u[2].x) * a;
+                    gv += (h[0] * u[0].y + h[1] * u[1].y + h[2] * u[2].y) * a;
+                    area += a;
+                }
+                if area > 0.0 {
+                    let step = Vec2::new((gu / area).dot(d), (gv / area).dot(d));
+                    *uv = (set[v] + step).clamp(lo, hi);
+                }
+            };
+            if par {
+                // Few outputs, each a handful of scattered reads: split finely.
+                uvs.par_iter_mut()
+                    .with_min_len(UV_OUT_MIN)
+                    .enumerate()
+                    .for_each(carry);
+            } else {
+                uvs.iter_mut().enumerate().for_each(carry);
+            }
         }
         *start_buf = start;
         *tris_buf = tris;
