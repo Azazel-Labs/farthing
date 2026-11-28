@@ -3,7 +3,8 @@
 #   - the web demo (demo-web/) is deployed to GitHub Pages;
 #   - if the version in Cargo.toml isn't on crates.io yet, farthing and farthing-cli are published
 #     there, and the version is tagged vX.Y.Z with a GitHub release carrying CLI binaries.
-# To release: bump `version` in [workspace.package] and merge to main. Release notes are generated
+# To release: raise the version with scripts/bump.sh patch|minor|major|X.Y.Z (it also moves the
+# path dependency on farthing and every lockfile) and merge to main. Release notes are generated
 # from the commits and PRs since the previous tag. Needs the secret CARGO_REGISTRY_TOKEN, and
 # Settings -> Pages -> Source: GitHub Actions.
 name: CI
