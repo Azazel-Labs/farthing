@@ -778,10 +778,11 @@ scratch! {
     srcs: Vec<u32>,
     cluster_out: Vec<u32>,
     normal_parts: Vec<Vec<Vec3>>,
+    uv_mark: Vec<u64>,
     uv_slot: Vec<u32>,
     uv_found: Vec<Vec<(u32, u32)>>,
     uv_start: Vec<u32>,
-    uv_tris: Vec<u32>,
+    uv_tris: Vec<u64>,
 }
 
 thread_local! {
@@ -875,6 +876,9 @@ fn reduce_with(
 /// order their finds are merged in never depend on the thread count.
 const UV_BLOCK: usize = 16384;
 
+/// Output vertices per parallel job in [`carry_uvs`].
+const UV_OUT_MIN: usize = 64;
+
 /// Moves each output vertex's UVs with it. A vertex takes its attributes from one input
 /// vertex (its wedge's source) but stands at its cluster's position, which can lie well away
 /// from that source (across a merged layer or at the end of a long cluster), so the texture
@@ -883,70 +887,97 @@ const UV_BLOCK: usize = 16384;
 /// of those triangles so it never runs off the end of a chart. Vertices at their source's
 /// position keep its UVs as they are.
 ///
-/// The buffers are the scratch's `uv_slot`, `uv_start`, `uv_tris` and `uv_found`.
+/// The buffers are the scratch's `uv_mark`, `uv_slot`, `uv_start`, `uv_tris` and `uv_found`.
 fn carry_uvs(
     mesh: &Mesh,
     source_vertex: &[u32],
     out: &mut Mesh,
-    [slot_buf, start_buf, tris_buf]: [&mut Vec<u32>; 3],
-    found_buf: &mut Vec<Vec<(u32, u32)>>,
+    (mark_buf, slot_buf, start_buf): (&mut Vec<u64>, &mut Vec<u32>, &mut Vec<u32>),
+    (tris_buf, found_buf): (&mut Vec<u64>, &mut Vec<Vec<(u32, u32)>>),
 ) {
     if mesh.uvs.is_empty() {
         return;
     }
-    // A slot per source vertex that moved.
-    let mut slot = filled(std::mem::take(slot_buf), mesh.vertex_count(), u32::MAX);
+    // A bit and a slot per source vertex that moved. A slot is read only where its bit is
+    // set, which is only where this call wrote it, so the slot array is never cleared.
+    let nv = mesh.vertex_count();
+    let mut mark = filled(std::mem::take(mark_buf), nv.div_ceil(64), 0u64);
+    let mut slot = std::mem::take(slot_buf);
+    if slot.len() < nv {
+        slot.resize(nv, 0);
+    }
     let mut moved = 0usize;
     for (o, &v) in source_vertex.iter().enumerate() {
-        if out.positions[o] != mesh.positions[v as usize] && slot[v as usize] == u32::MAX {
-            slot[v as usize] = moved as u32;
+        let (v, bit) = (v as usize, 1u64 << (v % 64));
+        if out.positions[o] != mesh.positions[v] && mark[v / 64] & bit == 0 {
+            mark[v / 64] |= bit;
+            slot[v] = moved as u32;
             moved += 1;
         }
     }
     if moved > 0 {
-        // The input triangles at each moved source, in triangle order: found in fixed blocks
-        // in parallel, then bucketed by slot in block order.
+        // The input triangles at each moved source, found in fixed blocks in parallel.
         let nt = mesh.triangle_count();
         let blocks = nt.div_ceil(UV_BLOCK);
-        let mut found = std::mem::take(found_buf);
-        if found.len() < blocks {
-            found.resize_with(blocks, Vec::new);
+        let mut found_all = std::mem::take(found_buf);
+        if found_all.len() < blocks {
+            found_all.resize_with(blocks, Vec::new);
         }
-        found[..blocks]
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(b, f)| {
-                f.clear();
-                for t in b * UV_BLOCK..((b + 1) * UV_BLOCK).min(nt) {
-                    for v in mesh.triangle(t) {
-                        let k = slot[v as usize];
-                        if k != u32::MAX {
-                            f.push((k, t as u32));
-                        }
+        let found = &mut found_all[..blocks];
+        found.par_iter_mut().enumerate().for_each(|(b, f)| {
+            f.clear();
+            let first = b * UV_BLOCK;
+            let tris = &mesh.indices[3 * first..3 * (first + UV_BLOCK).min(nt)];
+            for (t, c) in tris.chunks_exact(3).enumerate() {
+                for &v in c {
+                    let v = v as usize;
+                    if mark[v / 64] >> (v % 64) & 1 != 0 {
+                        f.push((slot[v], (first + t) as u32));
                     }
                 }
-            });
-        // Counted into `start[k + 1]`, summed to each slot's start, then advanced past its
-        // triangles while filling: slot `k`'s run ends up at `start[k - 1]..start[k]`.
-        let mut start = filled(std::mem::take(start_buf), moved + 1, 0u32);
-        for &(k, _) in found[..blocks].iter().flatten() {
-            start[k as usize + 1] += 1;
+            }
+        });
+        // Bucketed by slot: counted, summed to each slot's start, and placed in parallel,
+        // each placement advancing its slot's start, so slot `k`'s run ends up at
+        // `start[k - 1]..start[k]`. A run is then sorted into triangle order, so the sums
+        // below add up the same way at any thread count.
+        let mut start: Vec<AtomicU32> = recycle(std::mem::take(start_buf), AtomicU32::new);
+        start.extend((0..moved).map(|_| AtomicU32::new(0)));
+        found.par_iter().for_each(|f| {
+            for &(k, _) in f {
+                start[k as usize].fetch_add(1, Relaxed);
+            }
+        });
+        let mut total = 0;
+        for k in &mut start {
+            let n = *k.get_mut();
+            *k.get_mut() = total;
+            total += n;
         }
-        for k in 0..moved {
-            start[k + 1] += start[k];
-        }
-        let mut tris = filled(std::mem::take(tris_buf), start[moved] as usize, 0u32);
-        for &(k, t) in found[..blocks].iter().flatten() {
-            tris[start[k as usize] as usize] = t;
-            start[k as usize] += 1;
-        }
+        let mut tris: Vec<AtomicU64> = recycle(std::mem::take(tris_buf), AtomicU64::new);
+        (0..total)
+            .into_par_iter()
+            .with_min_len(PAR_MIN)
+            .map(|_| AtomicU64::new(0))
+            .collect_into_vec(&mut tris);
+        found.par_iter().for_each(|f| {
+            for &(k, t) in f {
+                let i = start[k as usize].fetch_add(1, Relaxed);
+                tris[i as usize].store(((k as u64) << 32) | t as u64, Relaxed);
+            }
+        });
+        let mut tris: Vec<u64> = tris.into_iter().map(AtomicU64::into_inner).collect();
+        tris.par_chunk_by_mut(|a, b| a >> 32 == b >> 32)
+            .for_each(|r| r.sort_unstable());
+        let start: Vec<u32> = start.into_iter().map(AtomicU32::into_inner).collect();
         let run = |k: usize| {
             let lo = if k == 0 { 0 } else { start[k - 1] as usize };
             &tris[lo..start[k] as usize]
         };
         for (set, uvs) in mesh.uvs.iter().zip(out.uvs.iter_mut()) {
+            // Few outputs, each a handful of scattered reads: split finely.
             uvs.par_iter_mut()
-                .with_min_len(PAR_MIN)
+                .with_min_len(UV_OUT_MIN)
                 .enumerate()
                 .for_each(|(o, uv)| {
                     let v = source_vertex[o] as usize;
@@ -957,7 +988,7 @@ fn carry_uvs(
                     let (mut gu, mut gv, mut area) = (Vec3::ZERO, Vec3::ZERO, 0.0);
                     let (mut lo, mut hi) = (Vec2::INFINITY, Vec2::NEG_INFINITY);
                     for &t in run(slot[v] as usize) {
-                        let t = mesh.triangle(t as usize);
+                        let t = mesh.triangle(t as u32 as usize);
                         let x = t.map(|i| mesh.positions[i as usize]);
                         let n = (x[1] - x[0]).cross(x[2] - x[0]);
                         let a2 = n.length_squared();
@@ -985,10 +1016,11 @@ fn carry_uvs(
                     }
                 });
         }
-        *found_buf = found;
         *start_buf = start;
         *tris_buf = tris;
+        *found_buf = found_all;
     }
+    *mark_buf = mark;
     *slot_buf = slot;
 }
 
@@ -2337,8 +2369,8 @@ fn realtime_pass(
         mesh,
         &source_vertex,
         &mut out,
-        [&mut s.uv_slot, &mut s.uv_start, &mut s.uv_tris],
-        &mut s.uv_found,
+        (&mut s.uv_mark, &mut s.uv_slot, &mut s.uv_start),
+        (&mut s.uv_tris, &mut s.uv_found),
     );
     out.indices = indices;
     out.material_ids = material_ids;
