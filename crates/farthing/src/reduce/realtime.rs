@@ -164,6 +164,12 @@ fn qeval_v(a: &[f64], p: Vec3) -> f64 {
     qeval(a, p.x as f64, p.y as f64, p.z as f64)
 }
 
+/// A collapse's mean squared distance: its quadric's error `raw` over the quadric's trace.
+#[inline]
+fn g2_of(raw: f64, q: &[f64]) -> f32 {
+    (raw / (q[0] + q[4] + q[7]).max(1e-30)) as f32
+}
+
 /// The leading eigenvector of a symmetric 3x3 matrix (xx, xy, xz, yy, yz, zz) and its
 /// eigenvalue, by power iteration from the column of the largest diagonal entry.
 fn lead_eig(m: &[f64; 6]) -> Option<([f64; 3], f64)> {
@@ -2906,12 +2912,15 @@ impl Tail {
         if self.locked[p as usize] {
             return None;
         }
-        // A star has a handful of neighbors: a short scan, with no marks over all clusters
-        // (which every job of the parallel first pass would have to allocate).
+        // Neighbors in the order first met, each once (marked).
         s.nbr.clear();
+        s.epoch += 1;
+        let e = s.epoch;
+        s.mark[p as usize] = e;
         for k in &s.loc {
             for &x in &k.c {
-                if x != p && !s.nbr.contains(&x) {
+                if s.mark[x as usize] != e {
+                    s.mark[x as usize] = e;
                     s.nbr.push(x);
                 }
             }
@@ -2929,22 +2938,42 @@ impl Tail {
                 *a += b;
             }
             let raw = qeval_v(&qq, self.cpos[q as usize]);
-            let g2 = (raw / (qq[0] + qq[4] + qq[7]).max(1e-30)) as f32;
-            if max_err2.is_some_and(|m| g2 > m) {
-                continue;
-            }
+            // The mean squared distance is only needed against a bound here; otherwise it is
+            // worked out for the one candidate returned.
+            let g2 = match max_err2 {
+                Some(m) => {
+                    let g2 = g2_of(raw, &qq);
+                    if g2 > m {
+                        continue;
+                    }
+                    g2
+                }
+                None => f32::NAN,
+            };
             // A collapse that takes a fold out goes ahead of every ordinary one.
             let fixes = any_fold && s.loc.iter().any(|k| k.fold && k.c.contains(&q));
             let g = (raw / self.avg_area) as f32;
             s.cand
                 .push((if fixes { g * FOLD_BIAS } else { g }, q, g2, fixes));
         }
+        // The returned candidate's mean squared distance, as above.
+        let with_g2 = |(c, q, g2): (f32, u32, f32)| {
+            if max_err2.is_some() {
+                return (c, q, g2);
+            }
+            let mut qq = self.cq[q as usize];
+            for (a, b) in qq.iter_mut().zip(qp) {
+                *a += b;
+            }
+            (c, q, g2_of(qeval_v(&qq, self.cpos[q as usize]), &qq))
+        };
         if !exact {
             return s
                 .cand
                 .iter()
                 .map(|c| (c.0, c.1, c.2))
-                .min_by(|a, b| a.0.total_cmp(&b.0));
+                .min_by(|a, b| a.0.total_cmp(&b.0))
+                .map(with_g2);
         }
         // Cheapest geometry first; the attribute cost only adds, so stop once geometry alone
         // costs more than the best found.
@@ -2978,7 +3007,7 @@ impl Tail {
                 best = Some((c, q, g2));
             }
         }
-        best
+        best.map(with_g2)
     }
 
     /// Moves p onto q; returns the triangles removed.
@@ -3076,7 +3105,7 @@ impl Tail {
             .into_par_iter()
             .with_min_len(64)
             .map_init(
-                || Scratch::new(0),
+                || Scratch::new(self.cpos.len()),
                 |s, p| {
                     if !self.movable(p) {
                         return None;
