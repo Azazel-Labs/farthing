@@ -13,7 +13,7 @@ struct Draw {
 
 struct Material {
     kind: u32,        // 0 = world-space checker, 1 = procedural marble + bump, 2 = textured
-    flags: u32,       // bit 0: has normal map
+    flags: u32,       // bit 0: has normal map; bit 1: mipmapped (sample with UV derivatives)
     scale: f32,
     cutoff: f32,      // alpha-test threshold (0 = opaque)
     color_a: vec4<f32>,
@@ -76,7 +76,16 @@ struct MatOut {
     normal: vec3<f32>,
 };
 
-fn eval_material(p: vec3<f32>, n_in: vec3<f32>, uv: vec2<f32>, t_in: vec4<f32>) -> MatOut {
+// Textured materials: the top level only, or with the screen-space UV derivatives `duv`
+// (d/dx in xy, d/dy in zw) when the material is mipmapped (`Engine::enable_mipmaps`).
+fn sample_tex(t: texture_2d<f32>, uv: vec2<f32>, duv: vec4<f32>) -> vec4<f32> {
+    if ((mat.flags & 2u) != 0u) {
+        return textureSampleGrad(t, samp, uv, duv.xy, duv.zw);
+    }
+    return textureSampleLevel(t, samp, uv, 0.0);
+}
+
+fn eval_material(p: vec3<f32>, n_in: vec3<f32>, uv: vec2<f32>, t_in: vec4<f32>, duv: vec4<f32>) -> MatOut {
     var o: MatOut;
     let n = normalize(n_in);
     o.normal = n;
@@ -95,9 +104,9 @@ fn eval_material(p: vec3<f32>, n_in: vec3<f32>, uv: vec2<f32>, t_in: vec4<f32>) 
         let gt = g - n * dot(g, n);
         o.normal = normalize(n - gt * 0.015);
     } else {
-        o.albedo = textureSampleLevel(base_tex, samp, uv, 0.0) * mat.factor;
+        o.albedo = sample_tex(base_tex, uv, duv) * mat.factor;
         if ((mat.flags & 1u) != 0u) {
-            let ts = textureSampleLevel(normal_tex, samp, uv, 0.0).xyz * 2.0 - 1.0;
+            let ts = sample_tex(normal_tex, uv, duv).xyz * 2.0 - 1.0;
             let t = normalize(t_in.xyz - n * dot(t_in.xyz, n));
             let b = cross(n, t) * t_in.w;
             o.normal = normalize(t * ts.x + b * ts.y + n * ts.z);
@@ -148,6 +157,8 @@ fn shade(albedo: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_scene(i: VOut, @builtin(front_facing) ff: bool) -> FOut {
+    // Taken before any discard, in uniform control flow.
+    let duv = vec4<f32>(dpdx(i.uv), dpdy(i.uv));
     if (draw.lit.y > 0.5) {
         // Second layer: the nearest front face behind the first layer's surface.
         let pd = textureLoad(peel_depth, vec2<i32>(i.clip.xy), 0);
@@ -155,7 +166,7 @@ fn fs_scene(i: VOut, @builtin(front_facing) ff: bool) -> FOut {
     }
     var n = normalize(i.n);
     if (!ff) { n = -n; }
-    let m = eval_material(i.wpos, n, i.uv, i.t);
+    let m = eval_material(i.wpos, n, i.uv, i.t, duv);
     if (m.albedo.a < mat.cutoff) { discard; }
     var c = m.albedo.rgb;
     if (draw.lit.x > 0.5) { c = shade(c, m.normal); }
@@ -188,7 +199,8 @@ fn fs_bake(@builtin(position) fc: vec4<f32>) -> BakeOut {
     let n = textureLoad(in_nrm, c, 0).xyz;
     let uv = textureLoad(in_uv, c, 0);
     let t = textureLoad(in_tan, c, 0);
-    let m = eval_material(p.xyz, n, uv.xy, t);
+    // No screen footprint: zero derivatives read the top level.
+    let m = eval_material(p.xyz, n, uv.xy, t, vec4<f32>(0.0));
     var o: BakeOut;
     o.albedo = vec4<f32>(m.albedo.rgb, m.albedo.a);
     o.normal = vec4<f32>(m.normal, 1.0);

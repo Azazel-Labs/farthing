@@ -639,6 +639,16 @@ fn layered_mode() -> Result<()> {
 
 fn score_mode(args: &[String]) -> Result<()> {
     let mut engine = Engine::new()?;
+    // SCORE_MIPS=1: textures mipmapped and sampled trilinearly, so charts mapped densely for
+    // their size on screen do not alias; SCORE_MIPS=2, 4, 8 or 16 adds anisotropic filtering
+    // up to that ratio. Unset or 0: the top level only (the scores in the docs).
+    match std::env::var("SCORE_MIPS").ok().as_deref() {
+        None | Some("" | "0") => {}
+        Some(v) => match v.parse::<u16>() {
+            Ok(n @ (1 | 2 | 4 | 8 | 16)) => engine.enable_mipmaps(n),
+            _ => anyhow::bail!("SCORE_MIPS must be 0, 1, 2, 4, 8 or 16, not {v:?}"),
+        },
+    }
     let mut original = load_gltf_into_engine(&mut engine, &args[0])?;
     // SCORE_REF=<glb>: render that scene as the reference and frame the views on it (a region
     // clipped from the asset, see `bench-compare rtexport` CLIP), materials from the asset.

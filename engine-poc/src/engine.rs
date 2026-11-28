@@ -108,6 +108,9 @@ pub struct Engine {
     bake_pipeline: wgpu::RenderPipeline,
     imp_pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
+    /// Set by [`Engine::enable_mipmaps`]: textured materials added after it get a mip chain
+    /// and this sampler, and draws pick their level from screen-space UV derivatives.
+    mip_sampler: Option<wgpu::Sampler>,
     white: wgpu::TextureView,
     no_peel: wgpu::TextureView,
 }
@@ -345,13 +348,43 @@ impl Engine {
             bake_pipeline,
             imp_pipeline,
             sampler,
+            mip_sampler: None,
             white,
             no_peel,
         })
     }
 
+    /// Textured materials added from now on are uploaded with a full mip chain (box filtered
+    /// in linear light) and drawn with trilinear filtering, the level chosen from the UV
+    /// derivatives; `max_anisotropy` above 1 (2, 4, 8 or 16) adds anisotropic filtering. By
+    /// default a texture has only its top level, so a chart squeezed below one texel per pixel
+    /// aliases. Bakes still read the top level.
+    pub fn enable_mipmaps(&mut self, max_anisotropy: u16) {
+        self.mip_sampler = Some(self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mipmapped"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: max_anisotropy.max(1),
+            ..Default::default()
+        }));
+    }
+
     fn upload_rgba8(&self, img: &Image, srgb: bool) -> wgpu::TextureView {
         upload_rgba8(&self.device, &self.queue, img, srgb)
+    }
+
+    /// [`Engine::upload_rgba8`] with the mip chain when mipmaps are enabled.
+    fn upload_material_texture(&self, img: &Image, srgb: bool) -> wgpu::TextureView {
+        upload_rgba8_levels(
+            &self.device,
+            &self.queue,
+            img,
+            srgb,
+            self.mip_sampler.is_some(),
+        )
     }
 }
 
@@ -401,6 +434,17 @@ fn upload_rgba8(
     img: &Image,
     srgb: bool,
 ) -> wgpu::TextureView {
+    upload_rgba8_levels(device, queue, img, srgb, false)
+}
+
+/// Uploads `img` as RGBA8, with the mip chain below it if `mips`.
+fn upload_rgba8_levels(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &Image,
+    srgb: bool,
+    mips: bool,
+) -> wgpu::TextureView {
     let mut data = Vec::with_capacity(img.pixels.len() * 4);
     for p in &img.pixels {
         let rgb = if srgb {
@@ -427,31 +471,45 @@ fn upload_rgba8(
         height: img.height,
         depth_or_array_layers: 1,
     };
+    let levels = if mips {
+        crate::viewer::mip_chain(img.width, img.height, &data, srgb)
+    } else {
+        Vec::new()
+    };
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
         size,
-        mip_level_count: 1,
+        mip_level_count: 1 + levels.len() as u32,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &data,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(img.width * 4),
-            rows_per_image: Some(img.height),
-        },
-        size,
-    );
+    for (level, (w, h, px)) in std::iter::once((img.width, img.height, &data[..]))
+        .chain(levels.iter().map(|(w, h, d)| (*w, *h, &d[..])))
+        .enumerate()
+    {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: level as u32,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            px,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     tex.create_view(&Default::default())
 }
 
@@ -574,14 +632,15 @@ impl Engine {
             } => (
                 MatU {
                     kind: 2,
-                    flags: normal.is_some() as u32,
+                    // Bit 1: sample with derivatives (mipmapped), see `enable_mipmaps`.
+                    flags: normal.is_some() as u32 | (self.mip_sampler.is_some() as u32) << 1,
                     scale: 1.0,
                     cutoff: *cutoff,
                     color_a: [0.0; 4],
                     color_b: [0.0; 4],
                     factor: factor.to_array(),
                 },
-                Some(self.upload_rgba8(base, true)),
+                Some(self.upload_material_texture(base, true)),
                 normal.as_ref().map(|n| {
                     let enc = Image {
                         width: n.width,
@@ -592,9 +651,13 @@ impl Engine {
                             .map(|p| (p.truncate() * 0.5 + 0.5).extend(1.0))
                             .collect(),
                     };
-                    self.upload_rgba8(&enc, false)
+                    self.upload_material_texture(&enc, false)
                 }),
             ),
+        };
+        let sampler = match (&def, &self.mip_sampler) {
+            (MaterialDef::Textured { .. }, Some(s)) => s,
+            _ => &self.sampler,
         };
         let ubuf = self.uniform(&u);
         let base = base.as_ref().unwrap_or(&self.white);
@@ -617,7 +680,7 @@ impl Engine {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],
         });

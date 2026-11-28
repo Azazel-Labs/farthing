@@ -415,7 +415,12 @@ fn linear_to_srgb(l: f32) -> u8 {
 
 /// The mip chain below an RGBA8 image, each level a 2×2 box filter of the last (edge texels
 /// repeated for odd sizes). sRGB color is averaged in linear light.
-fn mip_chain(width: u32, height: u32, rgba: &[u8], srgb: bool) -> Vec<(u32, u32, Vec<u8>)> {
+pub(crate) fn mip_chain(
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    srgb: bool,
+) -> Vec<(u32, u32, Vec<u8>)> {
     let lut: Vec<f32> = (0..=255u8)
         .map(|c| {
             if srgb {
