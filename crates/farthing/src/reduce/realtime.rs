@@ -647,6 +647,7 @@ plain_held!(
     Pre,
     Option<Thin>,
     (u32, u32, u32),
+    UvGrad,
 );
 
 impl<T: Held> Held for Vec<T> {
@@ -778,11 +779,7 @@ scratch! {
     srcs: Vec<u32>,
     cluster_out: Vec<u32>,
     normal_parts: Vec<Vec<Vec3>>,
-    uv_mark: Vec<u64>,
-    uv_slot: Vec<u32>,
-    uv_found: Vec<Vec<(u32, u32)>>,
-    uv_start: Vec<u32>,
-    uv_tris: Vec<u64>,
+    uv: UvCarry,
 }
 
 thread_local! {
@@ -872,16 +869,29 @@ fn reduce_with(
     Ok(r)
 }
 
-/// Triangles per block of the parallel scan in [`carry_uvs`]: fixed, so the blocks and the
-/// order their finds are merged in never depend on the thread count.
-const UV_BLOCK: usize = 16384;
+/// Input triangles from which the UV carry works out its sums on the pool, beside the collapse
+/// tail: below this, handing them out costs more than the work (a scene of many small meshes
+/// pays it on every one).
+const UV_BESIDE_TRIS: usize = 65536;
 
-/// Output vertices per parallel job in [`carry_uvs`].
-const UV_OUT_MIN: usize = 64;
+/// One source vertex's sums for one UV set over its input triangles: twice the area-weighted
+/// gradients of u and v, and the UV box of those triangles.
+#[derive(Clone, Copy)]
+struct UvGrad {
+    gu: Vec3,
+    gv: Vec3,
+    lo: Vec2,
+    hi: Vec2,
+}
 
-/// Input triangles from which [`carry_uvs`] runs its passes on the pool: below this, handing
-/// them out costs more than the work (a scene of many small meshes pays it on every one).
-const UV_PAR_TRIS: usize = 4 * UV_BLOCK;
+impl UvGrad {
+    const EMPTY: UvGrad = UvGrad {
+        gu: Vec3::ZERO,
+        gv: Vec3::ZERO,
+        lo: Vec2::INFINITY,
+        hi: Vec2::NEG_INFINITY,
+    };
+}
 
 /// Moves each output vertex's UVs with it. A vertex takes its attributes from one input
 /// vertex (its wedge's source) but stands at its cluster's position, which can lie well away
@@ -891,168 +901,136 @@ const UV_PAR_TRIS: usize = 4 * UV_BLOCK;
 /// of those triangles so it never runs off the end of a chart. Vertices at their source's
 /// position keep its UVs as they are.
 ///
-/// The buffers are the scratch's `uv_mark`, `uv_slot`, `uv_start`, `uv_tris` and `uv_found`.
-fn carry_uvs(
-    mesh: &Mesh,
-    source_vertex: &[u32],
-    out: &mut Mesh,
-    (mark_buf, slot_buf, start_buf): (&mut Vec<u64>, &mut Vec<u32>, &mut Vec<u32>),
-    (tris_buf, found_buf): (&mut Vec<u64>, &mut Vec<Vec<(u32, u32)>>),
-) {
-    if mesh.uvs.is_empty() {
-        return;
+/// The sums at a source don't depend on where it ends up, only the move does: a large mesh
+/// works them out for every wedge's source on the pool while the collapse tail runs, a small
+/// one for the sources that moved, after. Either way a source's triangles are added up in
+/// index order, so the result is the same.
+#[derive(Default)]
+struct UvCarry {
+    /// A bit per input vertex whose sums are wanted.
+    mark: Vec<u64>,
+    /// Each marked vertex's slot. A slot is read only where its bit is set, which is only
+    /// where this call wrote it, so the array is never cleared.
+    slot: Vec<u32>,
+    /// Slots in use.
+    used: usize,
+    /// Per slot: twice the area of its triangles, and a [`UvGrad`] per UV set.
+    area: Vec<f32>,
+    grad: Vec<UvGrad>,
+}
+
+impl Held for UvCarry {
+    fn held(&self) -> (usize, usize) {
+        let parts = [
+            self.mark.held(),
+            self.slot.held(),
+            self.area.held(),
+            self.grad.held(),
+        ];
+        parts
+            .iter()
+            .fold((0, 0), |(c, l), (pc, pl)| (c + pc, l + pl))
     }
-    // A bit and a slot per source vertex that moved. A slot is read only where its bit is
-    // set, which is only where this call wrote it, so the slot array is never cleared.
-    let nv = mesh.vertex_count();
-    let mut mark = filled(std::mem::take(mark_buf), nv.div_ceil(64), 0u64);
-    let mut slot = std::mem::take(slot_buf);
-    if slot.len() < nv {
-        slot.resize(nv, 0);
+}
+
+/// Twice the area, the unit normal and the edges opposite each corner of input triangle `t`,
+/// or None when it has no area.
+#[inline]
+fn uv_tri(mesh: &Mesh, t: &[u32]) -> Option<(f32, Vec3, [Vec3; 3])> {
+    let x = [t[0], t[1], t[2]].map(|i| mesh.positions[i as usize]);
+    let n = (x[1] - x[0]).cross(x[2] - x[0]);
+    let a = n.length();
+    if a <= 0.0 {
+        return None;
     }
-    let mut moved = 0usize;
-    for (o, &v) in source_vertex.iter().enumerate() {
-        let (v, bit) = (v as usize, 1u64 << (v % 64));
-        if out.positions[o] != mesh.positions[v] && mark[v / 64] & bit == 0 {
-            mark[v / 64] |= bit;
-            slot[v] = moved as u32;
-            moved += 1;
-        }
+    Some((a, n / a, [x[2] - x[1], x[0] - x[2], x[1] - x[0]]))
+}
+
+/// Adds one triangle to a source's sums for one UV set: a corner's hat function has gradient
+/// n × (opposite edge) / |n|², so over the triangle the area-weighted gradient of u is
+/// n̂ × Σ uᵢ eᵢ / 2.
+#[inline]
+fn uv_add(g: &mut UvGrad, n: Vec3, e: &[Vec3; 3], u: [Vec2; 3]) {
+    for w in u {
+        (g.lo, g.hi) = (g.lo.min(w), g.hi.max(w));
     }
-    if moved > 0 {
-        // The input triangles at each moved source, found in fixed blocks.
-        let nt = mesh.triangle_count();
-        let par = nt >= UV_PAR_TRIS;
-        let blocks = nt.div_ceil(UV_BLOCK);
-        let mut found_all = std::mem::take(found_buf);
-        if found_all.len() < blocks {
-            found_all.resize_with(blocks, Vec::new);
+    g.gu += n.cross(e[0] * u[0].x + e[1] * u[1].x + e[2] * u[2].x);
+    g.gv += n.cross(e[0] * u[0].y + e[1] * u[1].y + e[2] * u[2].y);
+}
+
+impl UvCarry {
+    /// Marks each distinct vertex of `sources` and gives it a slot.
+    fn mark(&mut self, nv: usize, sources: impl Iterator<Item = u32>) {
+        self.mark.clear();
+        self.mark.resize(nv.div_ceil(64), 0);
+        if self.slot.len() < nv {
+            self.slot.resize(nv, 0);
         }
-        let found = &mut found_all[..blocks];
-        let scan = |(b, f): (usize, &mut Vec<(u32, u32)>)| {
-            f.clear();
-            let first = b * UV_BLOCK;
-            let tris = &mesh.indices[3 * first..3 * (first + UV_BLOCK).min(nt)];
-            for (t, c) in tris.chunks_exact(3).enumerate() {
-                for &v in c {
-                    let v = v as usize;
-                    if mark[v / 64] >> (v % 64) & 1 != 0 {
-                        f.push((slot[v], (first + t) as u32));
-                    }
-                }
+        let mut used = 0usize;
+        for v in sources {
+            let (v, bit) = (v as usize, 1u64 << (v % 64));
+            if self.mark[v / 64] & bit == 0 {
+                self.mark[v / 64] |= bit;
+                self.slot[v] = used as u32;
+                used += 1;
             }
-        };
-        if par {
-            found.par_iter_mut().enumerate().for_each(scan);
-        } else {
-            found.iter_mut().enumerate().for_each(scan);
         }
-        // Bucketed by slot: counted, summed to each slot's start, and placed,
-        // each placement advancing its slot's start, so slot `k`'s run ends up at
-        // `start[k - 1]..start[k]`. A run is then sorted into triangle order, so the sums
-        // below add up the same way at any thread count.
-        let mut start: Vec<AtomicU32> = recycle(std::mem::take(start_buf), AtomicU32::new);
-        start.extend((0..moved).map(|_| AtomicU32::new(0)));
-        let count = |f: &Vec<(u32, u32)>| {
-            for &(k, _) in f {
-                start[k as usize].fetch_add(1, Relaxed);
+        self.used = used;
+    }
+
+    /// The marked vertices' sums in one pass over the triangles in index order.
+    fn sums_serial(&mut self, mesh: &Mesh) {
+        let ns = mesh.uvs.len();
+        let (mark, slot) = (&self.mark, &self.slot);
+        self.area.clear();
+        self.area.resize(self.used, 0.0);
+        self.grad.clear();
+        self.grad.resize(self.used * ns, UvGrad::EMPTY);
+        let is = |v: u32| mark[v as usize / 64] >> (v % 64) & 1 != 0;
+        for t in mesh.indices.chunks_exact(3) {
+            if !(is(t[0]) || is(t[1]) || is(t[2])) {
+                continue;
             }
-        };
-        if par {
-            found.par_iter().for_each(count);
-        } else {
-            found.iter().for_each(count);
-        }
-        let mut total = 0;
-        for k in &mut start {
-            let n = *k.get_mut();
-            *k.get_mut() = total;
-            total += n;
-        }
-        let mut tris: Vec<AtomicU64> = recycle(std::mem::take(tris_buf), AtomicU64::new);
-        if par {
-            (0..total)
-                .into_par_iter()
-                .with_min_len(PAR_MIN)
-                .map(|_| AtomicU64::new(0))
-                .collect_into_vec(&mut tris);
-        } else {
-            tris.extend((0..total).map(|_| AtomicU64::new(0)));
-        }
-        let place = |f: &Vec<(u32, u32)>| {
-            for &(k, t) in f {
-                let i = start[k as usize].fetch_add(1, Relaxed);
-                tris[i as usize].store(((k as u64) << 32) | t as u64, Relaxed);
-            }
-        };
-        if par {
-            found.par_iter().for_each(place);
-        } else {
-            found.iter().for_each(place);
-        }
-        let mut tris: Vec<u64> = tris.into_iter().map(AtomicU64::into_inner).collect();
-        let same = |a: &u64, b: &u64| a >> 32 == b >> 32;
-        if par {
-            tris.par_chunk_by_mut(same).for_each(<[u64]>::sort_unstable);
-        } else {
-            tris.chunk_by_mut(same).for_each(<[u64]>::sort_unstable);
-        }
-        let start: Vec<u32> = start.into_iter().map(AtomicU32::into_inner).collect();
-        let run = |k: usize| {
-            let lo = if k == 0 { 0 } else { start[k - 1] as usize };
-            &tris[lo..start[k] as usize]
-        };
-        for (set, uvs) in mesh.uvs.iter().zip(out.uvs.iter_mut()) {
-            let carry = |(o, uv): (usize, &mut Vec2)| {
-                let v = source_vertex[o] as usize;
-                let d = out.positions[o] - mesh.positions[v];
-                if d == Vec3::ZERO {
-                    return;
-                }
-                // Twice the area, and twice the area times the gradient: a corner's hat
-                // function has gradient n × (opposite edge) / |n|², so over the triangle the
-                // area-weighted gradient of u is n̂ × Σ uᵢ eᵢ / 2.
-                let (mut gu, mut gv, mut area) = (Vec3::ZERO, Vec3::ZERO, 0.0);
-                let (mut lo, mut hi) = (Vec2::INFINITY, Vec2::NEG_INFINITY);
-                for &t in run(slot[v] as usize) {
-                    let t = mesh.triangle(t as u32 as usize);
-                    let x = t.map(|i| mesh.positions[i as usize]);
-                    let n = (x[1] - x[0]).cross(x[2] - x[0]);
-                    let a = n.length();
-                    if a <= 0.0 {
-                        continue;
-                    }
-                    let n = n / a;
-                    let e = [x[2] - x[1], x[0] - x[2], x[1] - x[0]];
-                    let u = t.map(|i| set[i as usize]);
-                    for w in u {
-                        (lo, hi) = (lo.min(w), hi.max(w));
-                    }
-                    gu += n.cross(e[0] * u[0].x + e[1] * u[1].x + e[2] * u[2].x);
-                    gv += n.cross(e[0] * u[0].y + e[1] * u[1].y + e[2] * u[2].y);
-                    area += a;
-                }
-                if area > 0.0 {
-                    let step = Vec2::new((gu / area).dot(d), (gv / area).dot(d));
-                    *uv = (set[v] + step).clamp(lo, hi);
-                }
+            let Some((a, n, e)) = uv_tri(mesh, t) else {
+                continue;
             };
-            if par {
-                // Few outputs, each a handful of scattered reads: split finely.
-                uvs.par_iter_mut()
-                    .with_min_len(UV_OUT_MIN)
-                    .enumerate()
-                    .for_each(carry);
-            } else {
-                uvs.iter_mut().enumerate().for_each(carry);
+            for &v in t {
+                if !is(v) {
+                    continue;
+                }
+                let k = slot[v as usize] as usize;
+                for (g, set) in self.grad[k * ns..(k + 1) * ns].iter_mut().zip(&mesh.uvs) {
+                    uv_add(g, n, &e, [t[0], t[1], t[2]].map(|i| set[i as usize]));
+                }
+                self.area[k] += a;
             }
         }
-        *start_buf = start;
-        *tris_buf = tris;
-        *found_buf = found_all;
     }
-    *mark_buf = mark;
-    *slot_buf = slot;
+
+    /// Each output vertex that stands away from its source moved by its source's gradients
+    /// (every such source must be marked and summed).
+    fn apply(&self, mesh: &Mesh, source_vertex: &[u32], out: &mut Mesh) {
+        let ns = mesh.uvs.len();
+        for (o, &v) in source_vertex.iter().enumerate() {
+            let v = v as usize;
+            let d = out.positions[o] - mesh.positions[v];
+            if d == Vec3::ZERO || self.mark[v / 64] >> (v % 64) & 1 == 0 {
+                continue;
+            }
+            let k = self.slot[v] as usize;
+            let area = self.area[k];
+            if area > 0.0 {
+                for ((g, set), uvs) in self.grad[k * ns..(k + 1) * ns]
+                    .iter()
+                    .zip(&mesh.uvs)
+                    .zip(out.uvs.iter_mut())
+                {
+                    let step = Vec2::new((g.gu / area).dot(d), (g.gv / area).dot(d));
+                    uvs[o] = (set[v] + step).clamp(g.lo, g.hi);
+                }
+            }
+        }
+    }
 }
 
 /// One realtime reduction with `per_tri` stage-one clusters per target triangle.
@@ -2354,8 +2332,26 @@ fn realtime_pass(
     st.classify_edges();
     lap("attrs");
     let max_err2 = opts.max_error.map(|e| (e * inv) * (e * inv));
-    let (collapses, worst2, wremap, cremap) = st.run(target, max_err2, opts.min_face_dot);
-    let moved = st.relax(&cremap, opts.min_face_dot);
+    let first = st.first_costs(max_err2);
+    let tail = || {
+        let (collapses, worst2, wremap, cremap) =
+            st.run(first, target, max_err2, opts.min_face_dot);
+        let moved = st.relax(&cremap, opts.min_face_dot);
+        (collapses, worst2, wremap, cremap, moved)
+    };
+    // A large mesh's UV sums at every wedge's source, on another thread beside the serial tail
+    // (after the tail's parallel first pass, which would otherwise wait on them).
+    let uv_beside = !mesh.uvs.is_empty() && nt >= UV_BESIDE_TRIS;
+    let (collapses, worst2, wremap, cremap, moved) = if uv_beside {
+        let uv = &mut s.uv;
+        rayon::join(tail, || {
+            uv.mark(nv, wsrc.iter().copied());
+            uv.sums_serial(mesh);
+        })
+        .0
+    } else {
+        tail()
+    };
     lap("tail");
 
     // Output: one vertex per wedge still used, at its cluster's representative position.
@@ -2396,13 +2392,18 @@ fn realtime_pass(
             mesh.positions[rep[c] as usize]
         };
     }
-    carry_uvs(
-        mesh,
-        &source_vertex,
-        &mut out,
-        (&mut s.uv_mark, &mut s.uv_slot, &mut s.uv_start),
-        (&mut s.uv_tris, &mut s.uv_found),
-    );
+    if !mesh.uvs.is_empty() {
+        if !uv_beside {
+            let moved = source_vertex
+                .iter()
+                .enumerate()
+                .filter(|&(o, &v)| out.positions[o] != mesh.positions[v as usize])
+                .map(|(_, &v)| v);
+            s.uv.mark(nv, moved);
+            s.uv.sums_serial(mesh);
+        }
+        s.uv.apply(mesh, &source_vertex, &mut out);
+    }
     out.indices = indices;
     out.material_ids = material_ids;
 
@@ -3067,10 +3068,32 @@ impl Tail {
         removed
     }
 
-    /// Collapses in greedy order down to `target`; returns (collapses, worst mean squared
-    /// distance, wedge remap chain, cluster remap chain).
+    /// Each cluster's first exact best, in parallel (they only read the state), so a
+    /// cluster's first turn at the top mostly holds. (Lower bounds here and exact costs on
+    /// demand were measured slower: that moves parallel work into the serial loop.)
+    fn first_costs(&self, max_err2: Option<f32>) -> Vec<Option<(f32, u32, f32)>> {
+        (0..self.cpos.len() as u32)
+            .into_par_iter()
+            .with_min_len(64)
+            .map_init(
+                || Scratch::new(0),
+                |s, p| {
+                    if !self.movable(p) {
+                        return None;
+                    }
+                    self.gather(p, &mut s.loc);
+                    self.best(p, max_err2, true, s)
+                },
+            )
+            .collect()
+    }
+
+    /// Collapses in greedy order down to `target`, from the first costs of
+    /// [`first_costs`](Self::first_costs); returns (collapses, worst mean squared distance,
+    /// wedge remap chain, cluster remap chain).
     fn run(
         &mut self,
+        mut cache: Vec<Option<(f32, u32, f32)>>,
         target: Option<usize>,
         max_err2: Option<f32>,
         min_dot: f32,
@@ -3089,27 +3112,9 @@ impl Tail {
         let mut gone = vec![false; nc];
         let mut map = Vec::new();
         let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::with_capacity(nc);
-        // First costs exact, in parallel (they only read the state), so a cluster's first
-        // turn at the top mostly holds. (Lower bounds here and exact costs on demand were
-        // measured slower: that moves parallel work into the serial loop.)
-        //
         // A cluster's exact best is kept with the collapse count it was found at, and stands
         // while no collapse since has changed what it reads (`dirty`): its triangles, its
         // neighbors' quadrics, its wedges' areas and its constraint sides.
-        let mut cache: Vec<Option<(f32, u32, f32)>> = (0..nc as u32)
-            .into_par_iter()
-            .with_min_len(64)
-            .map_init(
-                || Scratch::new(0),
-                |s, p| {
-                    if !self.movable(p) {
-                        return None;
-                    }
-                    self.gather(p, &mut s.loc);
-                    self.best(p, max_err2, true, s)
-                },
-            )
-            .collect();
         let mut cache_at = vec![0u32; nc];
         let mut dirty = vec![0u32; nc];
         let mut done = 0u32;
